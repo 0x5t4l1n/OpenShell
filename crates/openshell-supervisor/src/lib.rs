@@ -619,6 +619,8 @@ pub async fn run_network_proxy(
         workspace_rx,
         &upstream_proxy_args,
         additional_ca_bundle.as_deref(),
+        // No isolation boundary is attached, so mediated policy DNS is off.
+        openshell_supervisor_network::run::PolicyDnsIpv6Egress::Disabled,
         Some(&tls_dir.path),
         None,
         #[cfg(target_os = "linux")]
@@ -686,6 +688,7 @@ pub async fn run_sandbox(
     ocsf_schema_version: Arc<std::sync::Mutex<String>>,
     upstream_proxy_args: openshell_supervisor_network::upstream_proxy::UpstreamProxyArgs,
     additional_ca_bundle: Option<String>,
+    policy_dns_ipv6_egress: openshell_supervisor_network::run::PolicyDnsIpv6Egress,
     backend_descriptor: openshell_isolation_interface::contract::BackendDescriptor,
     auth_bundle: openshell_core::jwt::SupervisorAuthBundle,
     admitted_isolation_backend: Option<String>,
@@ -712,6 +715,7 @@ pub async fn run_sandbox(
             ocsf_schema_version,
             upstream_proxy_args,
             additional_ca_bundle,
+            policy_dns_ipv6_egress,
             backend_descriptor,
             auth_bundle,
             admitted_isolation_backend,
@@ -740,6 +744,7 @@ pub struct SandboxRunConfig {
     pub ocsf_schema_version: Arc<std::sync::Mutex<String>>,
     pub upstream_proxy_args: openshell_supervisor_network::upstream_proxy::UpstreamProxyArgs,
     pub additional_ca_bundle: Option<String>,
+    pub policy_dns_ipv6_egress: openshell_supervisor_network::run::PolicyDnsIpv6Egress,
     pub backend_descriptor: openshell_isolation_interface::contract::BackendDescriptor,
     pub auth_bundle: openshell_core::jwt::SupervisorAuthBundle,
     pub admitted_isolation_backend: Option<String>,
@@ -771,6 +776,7 @@ pub async fn run_sandbox_with_backend(
         ocsf_schema_version,
         upstream_proxy_args,
         additional_ca_bundle,
+        policy_dns_ipv6_egress,
         backend_descriptor,
         auth_bundle,
         admitted_isolation_backend,
@@ -1119,6 +1125,7 @@ pub async fn run_sandbox_with_backend(
             workspace_rx.clone(),
             &upstream_proxy_args,
             additional_ca_bundle.as_deref(),
+            policy_dns_ipv6_egress,
             None,
             remote_host_gateway_ip,
             #[cfg(target_os = "linux")]
