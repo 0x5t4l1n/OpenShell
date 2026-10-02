@@ -121,14 +121,12 @@ enum ReadinessEndpoint {
     Tcp(u16),
 }
 
-#[cfg(unix)]
 enum ReadinessListener {
     #[cfg(unix)]
     Unix(tokio::net::UnixListener),
     Tcp(tokio::net::TcpListener),
 }
 
-#[cfg(unix)]
 impl ReadinessEndpoint {
     fn prepare(&self) -> Result<()> {
         match self {
@@ -177,7 +175,6 @@ impl ReadinessEndpoint {
 }
 
 /// Falls back to IPv4 when the network namespace has IPv6 disabled.
-#[cfg(unix)]
 fn bind_readiness_tcp(port: u16) -> std::io::Result<std::net::TcpListener> {
     use socket2::{Domain, Socket, Type};
 
@@ -196,7 +193,6 @@ fn bind_readiness_tcp(port: u16) -> std::io::Result<std::net::TcpListener> {
         .or_else(|_| bind(Domain::IPV4, (std::net::Ipv4Addr::UNSPECIFIED, port).into()))
 }
 
-#[cfg(unix)]
 impl ReadinessListener {
     async fn accept(&self) -> std::io::Result<()> {
         match self {
@@ -207,13 +203,11 @@ impl ReadinessListener {
     }
 }
 
-#[cfg(unix)]
 struct ControlReadiness {
     task: tokio::task::JoinHandle<()>,
     endpoint: ReadinessEndpoint,
 }
 
-#[cfg(unix)]
 impl ControlReadiness {
     fn start(
         endpoint: ReadinessEndpoint,
@@ -339,21 +333,6 @@ impl Drop for ControlReadiness {
     fn drop(&mut self) {
         self.task.abort();
         self.endpoint.remove();
-    }
-}
-
-#[cfg(not(unix))]
-struct ControlReadiness;
-
-#[cfg(not(unix))]
-impl ControlReadiness {
-    fn start(
-        _endpoint: ReadinessEndpoint,
-        _session_readiness: Option<tokio::sync::watch::Receiver<bool>>,
-    ) -> Result<Self> {
-        Err(miette::miette!(
-            "supervisor readiness sockets require a Unix host"
-        ))
     }
 }
 
@@ -5347,7 +5326,6 @@ mod tests {
         .expect("replacement session restores readiness socket");
     }
 
-    #[cfg(unix)]
     #[test]
     fn tcp_readiness_listener_accepts_ipv4_regardless_of_bindv6only() {
         let port = std::net::TcpListener::bind("127.0.0.1:0")
@@ -5368,7 +5346,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[cfg(unix)]
     async fn tcp_control_readiness_tracks_supervisor_session() {
         let port = std::net::TcpListener::bind("127.0.0.1:0")
             .and_then(|reserved| reserved.local_addr())
