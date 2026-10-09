@@ -5146,13 +5146,6 @@ pub(super) async fn handle_report_policy_status(
     )
     .await?;
 
-    info!(
-        sandbox_id = %req.sandbox_id,
-        version = req.version,
-        status = %status_str,
-        "ReportPolicyStatus: sandbox reported policy load result"
-    );
-
     Ok(Response::new(ReportPolicyStatusResponse {}))
 }
 
@@ -5243,6 +5236,10 @@ pub async fn record_policy_apply_result(
         state.sandbox_index.update_from_sandbox(&updated);
         state.sandbox_watch_bus.notify(sandbox_id);
     }
+    info!(
+        sandbox_id,
+        version, status, source, "sandbox reported policy load result"
+    );
     Ok(())
 }
 
