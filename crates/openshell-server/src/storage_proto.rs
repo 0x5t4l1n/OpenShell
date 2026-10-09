@@ -145,11 +145,9 @@ mod tests {
     // profile credentials reachable from stored policies and provider profiles.
     // Legacy payloads decode empty owners; the gateway rebuilds their authority
     // from effective policy rather than trusting persisted owner stamps.
-    // The HTTP middleware protocol the gateway describes adds a field to the
-    // public-only SupervisorMiddlewareService, which sandbox config responses
-    // compute on demand.
+    // Operator credential export adds four public messages and no durable types.
     const PUBLIC_RPC_SCHEMA_SHA256: &str =
-        "0f483f4283ad9a0ef232c5d61faff8ff807ce6222a62fabeca22b3b7c0344eac";
+        "5ae8334d9f6212a00c38ba965ff62e567d2846b15f4df8faf85954023da542e7";
     const DURABLE_SCHEMA_SHA256: &str =
         "5281143e2825539af6148785c91f9df67f654eb74d215f57940af9314867a55f";
     const PUBLIC_DURABLE_OVERLAP_SHA256: &str =
