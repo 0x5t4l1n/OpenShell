@@ -133,19 +133,23 @@ assert_linux_package_method() {
   fi
 }
 
-assert_linux_package_method "deb is the default despite snap" "" "" 1 1 1 deb
-assert_linux_package_method "rpm is the default despite snap" "" "" 1 0 1 rpm
-assert_linux_package_method "dev uses deb despite snap" "" dev 1 1 1 deb
-assert_linux_package_method "snap is opt-in" snap "" 1 1 1 snap
-assert_linux_package_method "snap opt-in with dev" snap dev 1 1 1 snap
+assert_linux_package_method "snap takes precedence over deb and rpm" "" "" 1 1 1 snap
+assert_linux_package_method "snap takes precedence over rpm" "" "" 1 0 1 snap
+assert_linux_package_method "dev uses snap" "" dev 1 1 1 snap
+assert_linux_package_method "explicit snap" snap "" 1 1 1 snap
+assert_linux_package_method "explicit snap with dev" snap dev 1 1 1 snap
+assert_linux_package_method "explicit snap wins with pinned stable" snap v1.2.3 1 1 1 snap
 assert_linux_package_method "explicit deb" deb "" installed 0 1 deb
 assert_linux_package_method "explicit rpm" rpm "" 1 1 1 rpm
 assert_linux_package_method "existing snap install keeps refreshing" "" "" installed 1 1 snap
 assert_linux_package_method "existing snap install keeps refreshing dev" "" dev installed 1 1 snap
 assert_linux_package_method "pre uses deb despite existing snap" "" pre installed 1 1 deb
+assert_linux_package_method "pre uses rpm despite snap" "" pre 1 0 1 rpm
 assert_linux_package_method "numbered prerelease uses deb despite existing snap" "" v0.1.0-pre.3 installed 1 1 deb
+assert_linux_package_method "pinned stable uses deb despite snap" "" v1.2.3 1 1 1 deb
 assert_linux_package_method "pinned stable uses rpm despite existing snap" "" v1.2.3 installed 0 1 rpm
 assert_linux_package_method "deb is selected without snap" "" "" 0 1 1 deb
+assert_linux_package_method "dev uses deb without snap" "" dev 0 1 1 deb
 assert_linux_package_method "rpm is selected without snap or deb" "" "" 0 0 1 rpm
 
 if (OPENSHELL_INSTALL_METHOD=flatpak linux_package_method) >"$out" 2>"$err"; then
