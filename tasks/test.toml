@@ -143,8 +143,8 @@ run = "OPENSHELL_TEST_CONTAINER_ENGINE=podman e2e/with-podman-gateway.sh cargo t
 description = "Build the Docker E2E workload fixture"
 run = "CONTAINER_ENGINE=docker bash tasks/scripts/e2e-build-workload.sh"
 
-["e2e:middleware-http-v2"]
-description = "Run the v2 HTTP hooks content-guard middleware example against the current gateway and Docker supervisor"
+["e2e:middleware-http-session"]
+description = "Run the HTTP session hooks content-guard middleware example against the current gateway and Docker supervisor"
 run = """
 #!/usr/bin/env bash
 set -euo pipefail
@@ -156,7 +156,7 @@ cargo build --locked --manifest-path examples/supervisor-middleware-content-guar
 export OPENSHELL_E2E_CONTENT_GUARD_BIN="${TARGET_DIR}/debug/supervisor-middleware-content-guard"
 export OPENSHELL_E2E_REQUIRE_MIDDLEWARE=1
 exec e2e/with-docker-gateway.sh cargo test --manifest-path e2e/rust/Cargo.toml \
-  --features e2e-docker --test supervisor_middleware_http_v2 -- --nocapture
+  --features e2e-docker --test supervisor_middleware_http_session -- --nocapture
 """
 
 ["e2e:websocket-conformance"]
