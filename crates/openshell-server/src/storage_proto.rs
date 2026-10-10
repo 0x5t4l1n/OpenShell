@@ -154,7 +154,7 @@ mod tests {
     // ConfigApplyOutcome gains AWAITING_COMPONENT, which is reachable from
     // stored operations but never recorded on one: it is not terminal.
     const PUBLIC_RPC_SCHEMA_SHA256: &str =
-        "205d1e08acdeea8a124079fa0708c52c16e751973e38686f110debd1960932e0";
+        "16489623cb0f6117c0279ea3a7a3b4653d2b51ddaf4a51e5a0d69324578555a8";
     const DURABLE_SCHEMA_SHA256: &str =
         "d7486389350bf6469ea50b37533ae4c8e578e755cfe786897ea212c9d608bd6b";
     const PUBLIC_DURABLE_OVERLAP_SHA256: &str =
