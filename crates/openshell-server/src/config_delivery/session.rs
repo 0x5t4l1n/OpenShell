@@ -28,6 +28,7 @@ use tonic::Status;
 use tracing::{debug, warn};
 use uuid::Uuid;
 
+use super::result_writer::{self, PolicyResult};
 use super::{
     ConfigComponentKind, ConfigComponents, ConfigSlots, DeliveryDisposition,
     MAX_SUPERVISOR_CONFIG_MESSAGE_BYTES, SupervisorConfigMessage,
@@ -434,6 +435,12 @@ impl ConfigSessionState {
         delivery_state.last_acknowledged_fingerprint = Some(fingerprint.clone());
         true
     }
+
+    /// Forget the acknowledged snapshot of `component`, so the next delivery
+    /// is sent even if unchanged.
+    fn reopen(&mut self, component: ConfigComponentKind) {
+        self.component_mut(component).last_acknowledged_fingerprint = None;
+    }
 }
 
 impl SupervisorSessionRegistry {
@@ -547,6 +554,22 @@ impl SupervisorSessionRegistry {
             outgoing.send();
         }
         acknowledged
+    }
+
+    /// Let reconciliation redeliver an acknowledged snapshot whose result was
+    /// never persisted, so the supervisor reports the result again. The
+    /// supervisor answers an unchanged snapshot as a duplicate.
+    pub(super) fn reopen_config_component(
+        &self,
+        sandbox_id: &str,
+        session_id: &str,
+        component: ConfigComponentKind,
+    ) {
+        self.with_config_session(sandbox_id, session_id, |config| {
+            if let Some(config) = config {
+                config.reopen(component);
+            }
+        });
     }
 
     /// Components whose last update the session's supervisor failed to
@@ -930,7 +953,8 @@ pub async fn handle_config_update_result(session: &AcceptedSession, result: &Con
         );
         registry.finalize_config_update(sandbox_id, session_id, &completed, false)
     } else if let Some(component_result) = result.result.as_ref()
-        && let Err(error) = record_component_apply_result(state, sandbox_id, component_result).await
+        && let Err(error) =
+            record_or_queue_component_result(state, sandbox_id, session_id, component_result).await
     {
         warn!(
             sandbox_id,
@@ -966,6 +990,24 @@ pub async fn handle_config_update_result(session: &AcceptedSession, result: &Con
     }
 }
 
+/// Record a live update's result. A running workload's results are queued
+/// for the result writer, so a fleet-wide fanout does not queue every
+/// session on the compute sandbox lock ahead of user mutations.
+async fn record_or_queue_component_result(
+    state: &Arc<ServerState>,
+    sandbox_id: &str,
+    session_id: &str,
+    result: &ConfigComponentApplyResult,
+) -> Result<(), Status> {
+    if !state.supervisor_sessions.is_runtime_ready(sandbox_id) {
+        return record_component_apply_result(state, sandbox_id, result).await;
+    }
+    if let Some(policy) = component_policy_result(sandbox_id, result)? {
+        result_writer::queue_policy_result(state, sandbox_id, session_id, policy);
+    }
+    Ok(())
+}
+
 #[derive(Debug, PartialEq, Eq)]
 enum AdmissionAck {
     /// Persisted and sent to the supervisor.
@@ -987,7 +1029,6 @@ async fn persist_and_ack_admission(
         sandbox_id,
         session_id,
         instance_id,
-        tx,
         ..
     } = session;
     if !state
@@ -1003,6 +1044,13 @@ async fn persist_and_ack_admission(
             failure_target.take();
             return AdmissionAck::Failed;
         }
+    }
+    // A running workload's admission no longer gates startup. Acknowledge it
+    // now and let the result writer persist it, so a fanout does not queue
+    // every session on the compute sandbox lock ahead of user mutations.
+    if state.supervisor_sessions.is_runtime_ready(sandbox_id) {
+        result_writer::queue_admission(state, sandbox_id, session_id, instance_id, admission);
+        return send_admission(session, admission).await;
     }
     // Accepted admission lets a pending workload start, so it must name the
     // current generation, as a polling startup report must. A running
@@ -1036,7 +1084,15 @@ async fn persist_and_ack_admission(
         warn!(sandbox_id, session_id, error = %error, "failed to persist supervisor configuration admission");
         return AdmissionAck::Failed;
     }
-    if tx
+    send_admission(session, admission).await
+}
+
+async fn send_admission(
+    session: &AcceptedSession,
+    admission: &SandboxConfigurationAdmission,
+) -> AdmissionAck {
+    if session
+        .tx
         .send(GatewayMessage {
             payload: Some(gateway_message::Payload::ConfigurationAdmission(
                 admission.clone(),
@@ -1047,7 +1103,10 @@ async fn persist_and_ack_admission(
     {
         return AdmissionAck::Failed;
     }
-    state.telemetry.sandbox_session_connected(sandbox_id);
+    session
+        .state
+        .telemetry
+        .sandbox_session_connected(&session.sandbox_id);
     AdmissionAck::Acknowledged
 }
 
@@ -1088,6 +1147,26 @@ async fn record_component_apply_result(
     sandbox_id: &str,
     result: &ConfigComponentApplyResult,
 ) -> Result<(), Status> {
+    let Some(policy) = component_policy_result(sandbox_id, result)? else {
+        return Ok(());
+    };
+    crate::grpc::policy::record_policy_apply_result(
+        state,
+        sandbox_id,
+        policy.version,
+        policy.loaded,
+        policy.error.as_deref(),
+        "stream",
+    )
+    .await
+}
+
+/// Count and log a component result, and return the sandbox policy load
+/// result it settles, if any.
+fn component_policy_result(
+    sandbox_id: &str,
+    result: &ConfigComponentApplyResult,
+) -> Result<Option<PolicyResult>, Status> {
     let component = ConfigComponent::try_from(result.component).unwrap_or_default();
     let outcome = ConfigApplyOutcome::try_from(result.outcome).unwrap_or_default();
     counter!(
@@ -1115,7 +1194,7 @@ async fn record_component_apply_result(
         );
     }
     if component != ConfigComponent::SandboxConfig {
-        return Ok(());
+        return Ok(None);
     }
     let Some(config_snapshot_revision::Component::SandboxConfig(revision)) = result
         .requested_revision
@@ -1129,7 +1208,7 @@ async fn record_component_apply_result(
     if PolicySource::try_from(revision.policy_source).unwrap_or_default() != PolicySource::Sandbox
         || revision.policy_version == 0
     {
-        return Ok(());
+        return Ok(None);
     }
     // Degraded enforces the policy with only built-in middleware.
     let loaded = matches!(
@@ -1143,20 +1222,16 @@ async fn record_component_apply_result(
         ConfigApplyOutcome::FailedRetainedLastKnownGood | ConfigApplyOutcome::FailedClosed
     );
     if !loaded && !failed {
-        return Ok(());
+        return Ok(None);
     }
-    crate::grpc::policy::record_policy_apply_result(
-        state,
-        sandbox_id,
-        revision.policy_version,
+    Ok(Some(PolicyResult {
+        version: revision.policy_version,
         loaded,
-        result
+        error: result
             .failure
             .as_ref()
-            .map(|failure| failure.message.as_str()),
-        "stream",
-    )
-    .await
+            .map(|failure| failure.message.clone()),
+    }))
 }
 
 // ---------------------------------------------------------------------------
@@ -2188,6 +2263,318 @@ mod tests {
         assert!(expected.validate_results(&results[..1]).is_err());
         results[1].requested_revision = Some(ConfigSnapshotRevision::default());
         assert!(expected.validate_results(&results).is_err());
+    }
+
+    /// A sandbox configuration that settles sandbox policy version 3.
+    fn sandbox_policy_snapshot() -> SandboxConfigSnapshot {
+        SandboxConfigSnapshot {
+            configuration_instance_id: "configuration-1".into(),
+            configuration_admitted: true,
+            config_revision: 7,
+            version: 3,
+            policy_hash: "policy-hash".into(),
+            provider_env_revision: 5,
+            policy_source: PolicySource::Sandbox.into(),
+            ..Default::default()
+        }
+    }
+
+    async fn put_sandbox_policy_revision(state: &Arc<ServerState>, sandbox_id: &str) {
+        use crate::policy_store::PolicyStoreExt as _;
+
+        state
+            .store
+            .put_policy_revision(
+                "policy-3",
+                sandbox_id,
+                "default",
+                3,
+                &SandboxPolicy::default().encode_to_vec(),
+                "policy-hash",
+            )
+            .await
+            .unwrap();
+    }
+
+    /// Register `session-1` as the push session of a running workload.
+    fn register_running_push_session(
+        state: &Arc<ServerState>,
+        sandbox_id: &str,
+        tx: &mpsc::Sender<GatewayMessage>,
+    ) -> Arc<ConfigSlots> {
+        let (shutdown_tx, _shutdown_rx) = oneshot::channel();
+        let slots = Arc::new(ConfigSlots::default());
+        state.supervisor_sessions.register_with_mode(
+            sandbox_id.into(),
+            "session-1".into(),
+            tx.clone(),
+            shutdown_tx,
+            SessionMode::Push(Arc::clone(&slots)),
+        );
+        assert!(
+            state
+                .supervisor_sessions
+                .mark_runtime_ready_for_test(sandbox_id, "session-1")
+        );
+        slots
+    }
+
+    /// Deliver `snapshot` to `session-1` and return the supervisor's result
+    /// for the update it receives.
+    fn deliver_and_report(
+        state: &Arc<ServerState>,
+        sandbox_id: &str,
+        slots: &ConfigSlots,
+        snapshot: &SandboxConfigSnapshot,
+        outcome: ConfigApplyOutcome,
+    ) -> ConfigUpdateResult {
+        let message = SupervisorConfigMessage::SandboxConfig(Box::new(snapshot.clone()));
+        assert_eq!(
+            state
+                .supervisor_sessions
+                .deliver_config(sandbox_id, "session-1", message.clone()),
+            DeliveryDisposition::Queued
+        );
+        let Some(gateway_message::Payload::ConfigUpdate(update)) =
+            slots.take_for_test().expect("update").payload
+        else {
+            panic!("expected config update");
+        };
+        let revision = config_message_revision(&message);
+        ConfigUpdateResult {
+            update_id: update.update_id,
+            component_sequence: update.component_sequence,
+            result: Some(ConfigComponentApplyResult {
+                component: ConfigComponent::SandboxConfig.into(),
+                requested_revision: Some(revision.clone()),
+                applied_revision: Some(revision),
+                outcome: outcome.into(),
+                ..Default::default()
+            }),
+            admission: Some(expected_configuration_admission(snapshot)),
+        }
+    }
+
+    /// Push a sandbox policy update to a running workload and return the
+    /// supervisor's result for it.
+    async fn running_push_session_result(
+        state: &Arc<ServerState>,
+        sandbox_id: &str,
+        tx: &mpsc::Sender<GatewayMessage>,
+    ) -> (ConfigUpdateResult, SandboxConfigurationAdmission) {
+        put_sandbox_policy_revision(state, sandbox_id).await;
+        let slots = register_running_push_session(state, sandbox_id, tx);
+        let snapshot = sandbox_policy_snapshot();
+        let result = deliver_and_report(
+            state,
+            sandbox_id,
+            &slots,
+            &snapshot,
+            ConfigApplyOutcome::Applied,
+        );
+        (result, expected_configuration_admission(&snapshot))
+    }
+
+    async fn wait_for_result_writer(state: &Arc<ServerState>) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !state.config_delivery.results.is_idle() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("result writer drains");
+    }
+
+    #[tokio::test]
+    async fn running_workload_results_are_acknowledged_without_the_sandbox_lock() {
+        use crate::policy_store::PolicyStoreExt as _;
+
+        let sandbox_id = "sb-running-result";
+        let state = push_state_with_sandbox(sandbox_id).await;
+        let (tx, mut rx) = mpsc::channel(4);
+        let (result, admission) = running_push_session_result(&state, sandbox_id, &tx).await;
+
+        // A user mutation holding the sandbox lock must not hold up the
+        // supervisor's acknowledgement.
+        let guard = state.compute.sandbox_sync_guard().await.unwrap();
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            handle_config_update_result(&accepted_session(&state, sandbox_id, tx.clone()), &result),
+        )
+        .await
+        .expect("result is acknowledged while the sandbox lock is held");
+        let Some(gateway_message::Payload::ConfigurationAdmission(sent)) =
+            rx.recv().await.expect("admission").payload
+        else {
+            panic!("expected configuration admission");
+        };
+        assert_eq!(sent, admission);
+        drop(guard);
+
+        wait_for_result_writer(&state).await;
+        let sandbox = state
+            .store
+            .get_message::<Sandbox>(sandbox_id)
+            .await
+            .unwrap()
+            .expect("sandbox");
+        assert_eq!(
+            sandbox
+                .status
+                .as_ref()
+                .and_then(|status| status.configuration_admission.as_ref()),
+            Some(&admission)
+        );
+        let policy = state
+            .store
+            .get_policy_by_version(sandbox_id, 3)
+            .await
+            .unwrap()
+            .expect("policy revision");
+        assert_eq!(policy.status, "loaded");
+    }
+
+    #[tokio::test]
+    async fn result_writer_skips_admissions_from_replaced_sessions() {
+        let sandbox_id = "sb-replaced-result";
+        let state = push_state_with_sandbox(sandbox_id).await;
+        let (tx, _rx) = mpsc::channel(4);
+        let (_, admission) = running_push_session_result(&state, sandbox_id, &tx).await;
+
+        result_writer::queue_admission(&state, sandbox_id, "session-0", "instance-0", &admission);
+        wait_for_result_writer(&state).await;
+
+        let sandbox = state
+            .store
+            .get_message::<Sandbox>(sandbox_id)
+            .await
+            .unwrap()
+            .expect("sandbox");
+        assert!(
+            sandbox
+                .status
+                .as_ref()
+                .and_then(|status| status.configuration_admission.as_ref())
+                .is_none(),
+            "an admission from a replaced session must not be persisted"
+        );
+    }
+
+    /// Fail every update of the named record type, as a database outage
+    /// would.
+    const FAIL_POLICY_RECORD_WRITES: &str = r#"
+CREATE TRIGGER fail_result_writes BEFORE UPDATE ON "objects"
+WHEN OLD."object_type" = 'sandbox_policy'
+BEGIN SELECT RAISE(ABORT, 'database unavailable'); END;
+"#;
+    const FAIL_SANDBOX_RECORD_WRITES: &str = r#"
+CREATE TRIGGER fail_result_writes BEFORE UPDATE ON "objects"
+WHEN OLD."object_type" = 'sandbox'
+BEGIN SELECT RAISE(ABORT, 'database unavailable'); END;
+"#;
+    const RESTORE_RESULT_WRITES: &str = "DROP TRIGGER fail_result_writes;";
+
+    /// A running workload applies `snapshot` while `failing_writes` makes
+    /// every attempt to persist its result fail. Once writes recover,
+    /// reconciliation must redeliver the unchanged snapshot so the supervisor
+    /// reports the result again.
+    async fn reconcile_after_result_writes_fail(
+        state: &Arc<ServerState>,
+        sandbox_id: &str,
+        snapshot: &SandboxConfigSnapshot,
+        failing_writes: &'static str,
+    ) {
+        let (tx, _rx) = mpsc::channel(4);
+        let slots = register_running_push_session(state, sandbox_id, &tx);
+        let session = accepted_session(state, sandbox_id, tx);
+
+        state.store.execute_for_test(failing_writes).await;
+        let applied = deliver_and_report(
+            state,
+            sandbox_id,
+            &slots,
+            snapshot,
+            ConfigApplyOutcome::Applied,
+        );
+        handle_config_update_result(&session, &applied).await;
+        wait_for_result_writer(state).await;
+        state.store.execute_for_test(RESTORE_RESULT_WRITES).await;
+
+        // The supervisor already applied the snapshot and reports a duplicate.
+        let duplicate = deliver_and_report(
+            state,
+            sandbox_id,
+            &slots,
+            snapshot,
+            ConfigApplyOutcome::IgnoredDuplicate,
+        );
+        handle_config_update_result(&session, &duplicate).await;
+        wait_for_result_writer(state).await;
+    }
+
+    #[tokio::test]
+    async fn reconciliation_recovers_a_dropped_policy_result() {
+        use crate::policy_store::PolicyStoreExt as _;
+
+        let sandbox_id = "sb-dropped-policy-result";
+        let state = push_state_with_sandbox(sandbox_id).await;
+        put_sandbox_policy_revision(&state, sandbox_id).await;
+
+        reconcile_after_result_writes_fail(
+            &state,
+            sandbox_id,
+            &sandbox_policy_snapshot(),
+            FAIL_POLICY_RECORD_WRITES,
+        )
+        .await;
+
+        let policy = state
+            .store
+            .get_policy_by_version(sandbox_id, 3)
+            .await
+            .unwrap()
+            .expect("policy revision");
+        assert_eq!(policy.status, "loaded");
+        let sandbox = state
+            .store
+            .get_message::<Sandbox>(sandbox_id)
+            .await
+            .unwrap()
+            .expect("sandbox");
+        assert_eq!(sandbox.current_policy_version(), 3);
+    }
+
+    #[tokio::test]
+    async fn reconciliation_recovers_a_dropped_admission() {
+        let sandbox_id = "sb-dropped-admission";
+        let state = push_state_with_sandbox(sandbox_id).await;
+        // No sandbox policy, so the admission is the only result to persist.
+        let snapshot = SandboxConfigSnapshot {
+            policy_source: PolicySource::Unspecified.into(),
+            ..sandbox_policy_snapshot()
+        };
+
+        reconcile_after_result_writes_fail(
+            &state,
+            sandbox_id,
+            &snapshot,
+            FAIL_SANDBOX_RECORD_WRITES,
+        )
+        .await;
+
+        let sandbox = state
+            .store
+            .get_message::<Sandbox>(sandbox_id)
+            .await
+            .unwrap()
+            .expect("sandbox");
+        assert_eq!(
+            sandbox
+                .status
+                .as_ref()
+                .and_then(|status| status.configuration_admission.as_ref()),
+            Some(&expected_configuration_admission(&snapshot))
+        );
     }
 
     #[tokio::test]

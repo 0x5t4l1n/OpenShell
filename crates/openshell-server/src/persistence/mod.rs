@@ -1434,6 +1434,14 @@ impl Store {
             Self::Postgres(_) => unreachable!("tests use SQLite"),
         }
     }
+
+    /// Runs raw SQL against the test database.
+    pub(crate) async fn execute_for_test(&self, sql: &'static str) {
+        match self {
+            Self::Sqlite(store) => store.execute_for_test(sql).await,
+            Self::Postgres(_) => unreachable!("tests use SQLite"),
+        }
+    }
 }
 
 #[cfg(test)]

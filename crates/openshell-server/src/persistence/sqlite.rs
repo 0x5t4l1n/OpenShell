@@ -201,6 +201,15 @@ impl SqliteStore {
         self.close().await;
     }
 
+    /// Runs raw SQL against the test database.
+    #[cfg(test)]
+    pub(crate) async fn execute_for_test(&self, sql: &'static str) {
+        sqlx::raw_sql(sql)
+            .execute(&self.pool)
+            .await
+            .expect("test SQL");
+    }
+
     pub fn max_connections(&self) -> u32 {
         self.pool.options().get_max_connections()
     }
