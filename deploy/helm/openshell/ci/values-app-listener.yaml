@@ -2,14 +2,15 @@
 # SPDX-License-Identifier: Apache-2.0
 
 # Local opt-in. Create the openshell-app-tls Secret before creating sandboxes.
-# This does not create Services or change the gateway listener.
+# The driver creates headless supervisor Services; gateway service URLs are unchanged.
 gatewayConfig:
   openshell.gateway:
     supervisor_app_service_domain: svc.openshell.internal
-    supervisor_app_address_template: "{sandbox}-ingress.openshell.svc.cluster.local:443"
+    supervisor_app_address_template: "os-app-{sandbox_id}.openshell.svc.cluster.local:8443"
   openshell.drivers.kubernetes:
     sandbox_runtime:
       app_listener:
         port: 8443
         service_domain: svc.openshell.internal
         tls_secret_name: openshell-app-tls
+        create_service: true

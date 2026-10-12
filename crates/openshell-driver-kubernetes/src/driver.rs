@@ -15,8 +15,8 @@ use crate::lifecycle::LifecycleGates;
 use crate::sandbox_runtime::{
     BOUNDARY_CERTIFICATE_PATH, BOUNDARY_CONFIG_PATH, BOUNDARY_PRIVATE_KEY_PATH, ClientTlsMaterial,
     SUPERVISOR_TERMINATION_GRACE_PERIOD_SECONDS, SandboxRuntimeNames, SupervisorClientTls,
-    boundary_service, generate_proxy_ca_material, image_pull_secret_copy, sandbox_bootstrap_secret,
-    sandbox_owner_reference as sandbox_runtime_sandbox_owner_reference,
+    app_service, boundary_service, generate_proxy_ca_material, image_pull_secret_copy,
+    sandbox_bootstrap_secret, sandbox_owner_reference as sandbox_runtime_sandbox_owner_reference,
     supervisor_bootstrap_secret, supervisor_pod, workload_fence,
 };
 use futures::{Stream, StreamExt, TryStreamExt};
@@ -143,6 +143,37 @@ fn boundary_service_authority(
         "{}.{}.svc:{boundary_port}",
         names.boundary_service, namespace
     )
+}
+
+fn validate_app_service(existing: &Service, desired: &Service) -> Result<(), String> {
+    let valid = existing.metadata.deletion_timestamp.is_none()
+        && existing.metadata.owner_references == desired.metadata.owner_references
+        && existing
+            .spec
+            .as_ref()
+            .zip(desired.spec.as_ref())
+            .is_some_and(|(actual, wanted)| {
+                actual.type_.as_deref().unwrap_or("ClusterIP") == "ClusterIP"
+                    && actual.cluster_ip.as_deref() == Some("None")
+                    && actual.selector == wanted.selector
+                    && actual
+                        .ports
+                        .as_ref()
+                        .zip(wanted.ports.as_ref())
+                        .is_some_and(|(actual, wanted)| {
+                            actual.len() == 1
+                                && actual[0].port == wanted[0].port
+                                && actual[0].target_port == wanted[0].target_port
+                                && actual[0].protocol == wanted[0].protocol
+                        })
+                    && !actual.publish_not_ready_addresses.unwrap_or(false)
+                    && actual.external_ips.as_ref().is_none_or(Vec::is_empty)
+            });
+    if valid {
+        Ok(())
+    } else {
+        Err("app Service conflicts with sandbox ownership or supervisor routing; refusing to adopt it".into())
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -2511,6 +2542,8 @@ impl KubernetesComputeDriver {
             &sandbox_api.resource.api_version,
             false,
         );
+        self.ensure_app_service(namespace, &sandbox.id, dependent_owner.clone())
+            .await?;
         let services: Api<Service> = Api::namespaced(self.client.clone(), namespace);
         let service = services
             .create(
@@ -3327,6 +3360,17 @@ impl KubernetesComputeDriver {
         }
 
         let names = SandboxRuntimeNames::for_generation(sandbox_id, generation.as_str());
+        self.ensure_app_service(
+            &namespace,
+            sandbox_id,
+            sandbox_runtime_sandbox_owner_reference(
+                cr_name,
+                cr_uid,
+                &sandbox_api.resource.api_version,
+                false,
+            ),
+        )
+        .await?;
         self.create_sandbox_runtime_fence(&namespace, &names)
             .await?;
         let mut stale_generations = sandbox_runtime_generation(&object).as_slice().to_vec();
@@ -3580,6 +3624,48 @@ impl KubernetesComputeDriver {
             stop_timeout,
             phase,
         ))
+    }
+
+    async fn ensure_app_service(
+        &self,
+        namespace: &str,
+        sandbox_id: &str,
+        owner: OwnerReference,
+    ) -> Result<(), KubernetesDriverError> {
+        let Some(app) = self
+            .config
+            .sandbox_runtime
+            .app_listener
+            .as_ref()
+            .filter(|app| app.create_service)
+        else {
+            return Ok(());
+        };
+        let desired = app_service(
+            namespace,
+            &SandboxRuntimeNames::new(sandbox_id),
+            sandbox_id,
+            app.port,
+            owner,
+        );
+        let services = Api::<Service>::namespaced(self.client.clone(), namespace);
+        let name = desired.metadata.name.as_deref().expect("app Service name");
+        let existing = match services
+            .get_opt(name)
+            .await
+            .map_err(KubernetesDriverError::from_kube)?
+        {
+            Some(existing) => existing,
+            None => match services.create(&PostParams::default(), &desired).await {
+                Ok(_) => return Ok(()),
+                Err(KubeError::Api(error)) if error.code == 409 => services
+                    .get(name)
+                    .await
+                    .map_err(KubernetesDriverError::from_kube)?,
+                Err(error) => return Err(KubernetesDriverError::from_kube(error)),
+            },
+        };
+        validate_app_service(&existing, &desired).map_err(KubernetesDriverError::Precondition)
     }
 
     async fn delete_sandbox_runtime_supervisor_pod(
@@ -4064,6 +4150,7 @@ impl KubernetesComputeDriver {
                     namespace,
                     desired_running,
                     sandbox_runtime_generation(&object).as_slice(),
+                    &object,
                 )
                 .await
             {
@@ -4391,11 +4478,38 @@ impl KubernetesComputeDriver {
         namespace: &str,
         desired_running: bool,
         generations: &[&str],
+        object: &DynamicObject,
     ) -> Result<(), KubernetesDriverError> {
         if !desired_running {
             return self
                 .delete_sandbox_runtime_supervisor(sandbox_id, namespace, generations)
                 .await;
+        }
+        if self
+            .config
+            .sandbox_runtime
+            .app_listener
+            .as_ref()
+            .is_some_and(|app| app.create_service)
+        {
+            let owner = sandbox_runtime_sandbox_owner_reference(
+                object.metadata.name.as_deref().ok_or_else(|| {
+                    KubernetesDriverError::Precondition("sandbox has no name".into())
+                })?,
+                object.metadata.uid.as_deref().ok_or_else(|| {
+                    KubernetesDriverError::Precondition("sandbox has no UID".into())
+                })?,
+                &object
+                    .types
+                    .as_ref()
+                    .ok_or_else(|| {
+                        KubernetesDriverError::Precondition("sandbox has no type".into())
+                    })?
+                    .api_version,
+                false,
+            );
+            self.ensure_app_service(namespace, sandbox_id, owner)
+                .await?;
         }
         let names = SandboxRuntimeNames::new(sandbox_id);
         let services = Api::<Service>::namespaced(self.client.clone(), namespace);
@@ -12868,4 +12982,70 @@ mod tests {
     }
 
     include!("lifecycle_tests.rs");
+}
+
+#[cfg(test)]
+mod app_endpoint_tests {
+    use super::*;
+    fn endpoint() -> Service {
+        app_service(
+            "workspace-a",
+            &SandboxRuntimeNames::new("sandbox-id"),
+            "sandbox-id",
+            8443,
+            sandbox_runtime_sandbox_owner_reference(
+                "sandbox",
+                "cr-uid",
+                "agents.x-k8s.io/v1beta1",
+                false,
+            ),
+        )
+    }
+    #[test]
+    fn app_service_is_headless_and_selects_only_its_supervisor() {
+        let service = endpoint();
+        let spec = service.spec.as_ref().unwrap();
+        assert_eq!(spec.cluster_ip.as_deref(), Some("None"));
+        assert_eq!(spec.ports.as_ref().unwrap()[0].port, 8443);
+        assert_eq!(
+            spec.selector.as_ref().unwrap()[BOUNDARY_ROLE_LABEL],
+            "supervisor"
+        );
+        assert_eq!(
+            spec.selector.as_ref().unwrap()[BOUNDARY_PAIR_LABEL],
+            "sandbox-id"
+        );
+        assert_eq!(
+            service.metadata.owner_references.as_ref().unwrap()[0].uid,
+            "cr-uid"
+        );
+        assert!(validate_app_service(&service, &service).is_ok());
+    }
+    #[test]
+    fn app_service_rejects_foreign_owners_and_redirected_endpoints() {
+        let desired = endpoint();
+        for change in 0..5 {
+            let mut actual = desired.clone();
+            match change {
+                0 => actual.metadata.owner_references.as_mut().unwrap()[0].uid = "other-cr".into(),
+                1 => {
+                    actual
+                        .spec
+                        .as_mut()
+                        .unwrap()
+                        .selector
+                        .as_mut()
+                        .unwrap()
+                        .insert(BOUNDARY_ROLE_LABEL.into(), "workload".into());
+                }
+                2 => {
+                    actual.spec.as_mut().unwrap().ports.as_mut().unwrap()[0].target_port =
+                        Some(IntOrString::Int(8080));
+                }
+                3 => actual.spec.as_mut().unwrap().cluster_ip = Some("10.0.0.1".into()),
+                _ => actual.spec.as_mut().unwrap().publish_not_ready_addresses = Some(true),
+            }
+            assert!(validate_app_service(&actual, &desired).is_err());
+        }
+    }
 }

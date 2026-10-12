@@ -108,6 +108,7 @@ pub struct SandboxRuntimeNames {
     pub sandbox_secret: String,
     pub supervisor_secret: String,
     pub boundary_service: String,
+    pub app_service: String,
     pub supervisor_pod: String,
     pub workload_policy: String,
     pub supervisor_policy: String,
@@ -122,6 +123,7 @@ impl SandboxRuntimeNames {
             sandbox_secret: format!("os-sandbox-{suffix}"),
             supervisor_secret: format!("os-supervisor-{suffix}"),
             boundary_service: format!("os-boundary-{suffix}"),
+            app_service: format!("os-app-{suffix}"),
             supervisor_pod: format!("os-supervisor-{suffix}"),
             workload_policy: NAMESPACE_WORKLOAD_POLICY_NAME.to_string(),
             supervisor_policy: NAMESPACE_SUPERVISOR_EGRESS_POLICY_NAME.to_string(),
@@ -199,6 +201,41 @@ pub fn boundary_service(
                 protocol: Some("TCP".to_string()),
                 port: i32::from(boundary_port),
                 target_port: Some(IntOrString::Int(i32::from(boundary_port))),
+                ..Default::default()
+            }]),
+            ..Default::default()
+        }),
+        ..Default::default()
+    }
+}
+
+/// Stable DNS endpoint without allocating a `ClusterIP`. Headless Service ports
+/// do not translate ports, so both the advertised and target ports are the app port.
+#[must_use]
+pub fn app_service(
+    namespace: &str,
+    names: &SandboxRuntimeNames,
+    sandbox_id: &str,
+    port: u16,
+    owner: OwnerReference,
+) -> Service {
+    Service {
+        metadata: ObjectMeta {
+            name: Some(names.app_service.clone()),
+            namespace: Some(namespace.into()),
+            owner_references: Some(vec![owner]),
+            labels: Some(common_labels(sandbox_id, "app-service")),
+            ..Default::default()
+        },
+        spec: Some(ServiceSpec {
+            type_: Some("ClusterIP".into()),
+            cluster_ip: Some("None".into()),
+            selector: Some(pair_labels(sandbox_id, "supervisor")),
+            ports: Some(vec![ServicePort {
+                name: Some("app-https".into()),
+                protocol: Some("TCP".into()),
+                port: i32::from(port),
+                target_port: Some(IntOrString::Int(i32::from(port))),
                 ..Default::default()
             }]),
             ..Default::default()
@@ -1415,6 +1452,7 @@ mod tests {
             port: 8443,
             service_domain: "svc.openshell.internal".into(),
             tls_secret_name: "app-tls".into(),
+            create_service: true,
         };
         let pod = supervisor_pod_with_app(SupervisorClientTls::Disabled, Some(&app));
         let env: BTreeMap<_, _> = pod.spec.as_ref().unwrap().containers[0]

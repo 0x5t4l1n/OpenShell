@@ -307,3 +307,9 @@ openshell sandbox create \
   }' \
   -- claude
 ```
+
+## Supervisor app endpoints
+
+The optional `sandbox_runtime.app_listener.create_service` flag creates a headless `os-app-<sandbox-id>` Service in the supervisor namespace. It selects the paired supervisor and publishes only ready Pod addresses, without allocating a ClusterIP. Headless DNS does not translate ports: the discovery address must use the listener port.
+
+The Sandbox CR owns the Service. Stop leaves it with no ready endpoints; restart keeps its DNS name and follows the replacement supervisor. Create/start and periodic reconciliation provision missing Services and reject foreign owners or changed routing. Sandbox deletion and failed provisioning remove them through CR garbage collection. TLS Secrets and app-port ingress NetworkPolicies remain operator-managed.
