@@ -21,7 +21,7 @@ links:
 
 ## Summary
 
-Add a dedicated application listener to supervisors. The listener resolves service hostnames and forwards HTTP and WebSocket traffic to the correct sandbox under its policy, independently of the supervisor's gateway control connection.
+Add a dedicated application listener to supervisors. The listener resolves service hostnames and forwards HTTP and WebSocket traffic to the correct sandbox's declared service port, independently of the supervisor's gateway control connection.
 
 Supervisors advertise services to the gateway for discovery. Operators can integrate their existing ingress with these listeners or use the optional `openshell-sandbox-proxy` reference implementation. Application traffic bypasses the gateway, allowing ingress to scale separately. Keep gateway routing available for simple deployments.
 
@@ -41,7 +41,8 @@ Service exposure needs the following:
 - Implement multi-tenant supervisors; accommodate them in the routing design.
 - Move SSH, execution, CLI port forwarding, or file uploads out of their current paths.
 - Add arbitrary TCP/UDP exposure, automatic port discovery, or application replication.
-- Replace egress policy, provider handling, or the isolation backend contract.
+- Add an ingress policy schema or change existing sandbox policy semantics.
+- Replace provider handling or the isolation backend contract.
 - Remove gateway routing or automatically migrate existing URLs.
 
 ## Proposal
@@ -61,7 +62,7 @@ The gateway resolves the HTTP hostname and carries application traffic through a
 
 ### Supervisor app listener
 
-The core feature is an application-only listener on each supervisor, separate from its gateway connection and management APIs. It resolves service hostnames, applies the selected sandbox's policy, and forwards traffic to that sandbox's declared service port.
+The core feature is an application-only listener on each supervisor, separate from its gateway connection and management APIs. It resolves service hostnames, validates the service declaration and sandbox ownership, and forwards traffic to the declared service port.
 
 Supervisors reach services through each sandbox's isolation backend loopback connector, as defined in [RFC 0012](../0012-isolation-backend/README.md). Traffic never reaches sandboxes directly.
 
@@ -86,13 +87,13 @@ Application ingress scales independently of the gateway. Supervisors still share
 
 ### Driver integration
 
-The app listener and discovery contract are independent of the compute driver. Driver-specific networking provides reachability without changing service identity or supervisor policy enforcement.
+The app listener and discovery contract are independent of the compute driver. Driver-specific networking provides reachability without changing service identity or supervisor mediation.
 
 Each supported driver provisions a supervisor app listener and a reachable address for it, including any required port allocation or forwarding. The supervisor advertises accepted sandbox services through the gateway. Ingress implementers consume discovery and route to the owning supervisor; they can use existing ingress infrastructure or the optional OpenShell proxy.
 
 Addresses must be reachable from the chosen ingress deployment: loopback is sufficient only when ingress shares that network context. Multiple supervisors on one host need distinct listener ports or addresses.
 
-Drivers manage endpoint allocation, restart, replacement, and deletion; advertisements and discovery must track those changes. The advertised endpoint always reaches the supervisor app listener, never a workload port. These responsibilities leave service identity, discovery, and sandbox policy enforcement unchanged across drivers.
+Drivers manage endpoint allocation, restart, replacement, and deletion; advertisements and discovery must track those changes. The advertised endpoint always reaches the supervisor app listener, never a workload port. These responsibilities leave service identity, discovery, and supervisor mediation unchanged across drivers.
 
 Architectural support does not imply every driver ships in the first release. Enable supervisor ingress only after that driver's endpoint integration is implemented and validated.
 
@@ -121,7 +122,7 @@ openshell service expose sandbox-b 9000 portal
 openshell service expose sandbox-c 8080 web
 ```
 
-The gateway sends declarations to the owning supervisor. The supervisor installs permitted routes under each sandbox's policy and advertises them back. The gateway validates ownership and publishes accepted routes. An advertisement cannot broaden a declaration, and an advertised route does not prove the application is healthy.
+The gateway sends declarations to the owning supervisor. The supervisor installs declared routes and advertises them back. The gateway validates ownership and publishes accepted routes. An advertisement cannot broaden a declaration, and an advertised route does not prove the application is healthy.
 
 Add authenticated, read-only discovery with a snapshot and a watch for changes. Each route contains its hostname, sandbox and service IDs, supervisor identity and app address, revision, runtime generation, and expiry. Addresses come from trusted operator/driver configuration. Discovery access is scoped to the router's workspaces and includes no workload secrets.
 
@@ -129,7 +130,7 @@ Routers cache routes rather than querying the gateway for each connection. Revis
 
 During discovery outages, the proposed default permits unexpired routes and rejects new connections after expiry. Revocation or sandbox teardown closes affected connections. Lease and draining rules remain open questions. Failures do not automatically fall back through the gateway.
 
-### SNI routing and policy
+### SNI routing and service authorization
 
 The proposed default is TLS passthrough: ingress reads SNI, selects the advertised supervisor, and forwards the TLS stream. The supervisor app listener terminates TLS and proxies HTTP/WebSockets to the declared loopback port. Missing SNI and unknown or expired routes are rejected.
 
@@ -144,9 +145,9 @@ For workspace `default`, the example routes are:
 
 The supervisor checks each HTTP `Host` or HTTP/2 `:authority` against the connection's SNI and installed route. Mismatches are rejected. WebSockets stay bound to their admitted service.
 
-Before opening the sandbox connector, the supervisor checks ownership, generation, readiness, and that sandbox's policy. Clients cannot choose arbitrary ports. Connection pools, quotas, and logs stay scoped to the sandbox and service. A future shared supervisor must authenticate its authority over each sandbox separately.
+Before opening the sandbox connector, the supervisor checks ownership, generation, readiness, and the service declaration. Clients cannot choose arbitrary ports. Connection pools, quotas, and logs stay scoped to the sandbox and service. A future shared supervisor must authenticate its authority over each sandbox separately.
 
-The ingress policy schema needs definition. Existing egress rules must not implicitly grant ingress access.
+An authorized `service expose` declaration permits ingress to its declared loopback port. No additional sandbox ingress-policy rule is required. Existing egress policy continues to govern outbound traffic.
 
 ### TLS and authentication
 
@@ -164,11 +165,11 @@ Enable the new path explicitly and retain existing gateway-mode behavior. CLI/SD
 
 Start with one sandbox per supervisor while preserving routing boundaries needed for shared supervisors.
 
-1. Define ingress policy, TLS, discovery credentials, route leases, and advertisement/discovery APIs following `proto/README.md`.
+1. Define TLS, discovery credentials, route leases, and advertisement/discovery APIs following `proto/README.md`.
 2. Add supervisor app listeners, service configuration sync, boundary routing, limits, and OCSF events.
 3. Add gateway discovery and integrate the first supported drivers and ingress deployment. For each enabled driver, implement reachable endpoint provisioning and lifecycle updates. Update CLI/SDK URLs, deployment configuration, docs, and related skills.
 4. Build the optional `openshell-sandbox-proxy` as a reference integration, with cached routes and direct supervisor connections.
-5. Run sandbox E2E tests for HTTP/WebSockets, SNI/host mismatches, tenant policies, authentication, deletion, replacement, and discovery outages. Validate endpoint reachability and lifecycle for each enabled driver. Use fixtures for shared-supervisor routing until that runtime exists. Measure control-plane responsiveness under application load and test gateway-mode compatibility.
+5. Run sandbox E2E tests for HTTP/WebSockets, SNI/host mismatches, sandbox boundaries, authentication, deletion, replacement, and discovery outages. Validate endpoint reachability and lifecycle for each enabled driver. Use fixtures for shared-supervisor routing until that runtime exists. Measure control-plane responsiveness under application load and test gateway-mode compatibility.
 
 ## Risks
 
@@ -194,7 +195,6 @@ Start with one sandbox per supervisor while preserving routing boundaries needed
 ## Open questions
 
 - Should TLS terminate at supervisors or the proxy? How are certificates provisioned and rotated?
-- Does `service expose` grant ingress permission, or must policy also allow it? Which policy and middleware checks apply?
 - How are discovery credentials scoped, and how does a shared supervisor authenticate ownership of each sandbox?
 - What route expiry, outage grace, revocation acknowledgement, and connection-draining rules should apply?
 - Which driver and ingress integration ship first? What backend authentication is required?
