@@ -1245,6 +1245,28 @@ The Windows sandbox initiates its authenticated control connection to a generati
 
 This development branch temporarily asserts MXC outer-fence guarantees for Windows-branch compatibility testing. These assertions do not establish supervisor-only egress or verified live revocation. Workloads can bypass the proxy to reach other host-local services. Do not use this compatibility path as a production-qualified security boundary; passing E2E does not close these known gaps.
 
+#### Prepare the Windows host
+
+Copy `wxc-exec.exe` to a regular directory outside an MSIX or `WindowsApps`
+package directory. Package ACLs can prevent the gateway from starting it.
+If creation fails with `wxc-exec spawn failed: Access is denied. (os error 5)`,
+check that `wxc_exec_path` points to the standalone copy.
+
+Run the capability probe before creating a sandbox:
+
+```shell
+& "C:\mxc\wxc-exec.exe" --probe
+```
+
+The runtime pair requires native ProcessContainer host-loopback support.
+The probe must report `probes.baseContainerSupportsIngressHostLoopbackAllow`
+as `true`. A Windows build number alone does not establish support. If the
+capability is unavailable, use an MXC runtime and host that provide it;
+`prepare-system-drive` does not add it. The AppContainer + DACL fallback
+cannot supply this runtime pair's required ProcessContainer network boundary.
+
+#### Configure MXC
+
 ```toml
 [openshell]
 version = 2
@@ -1253,13 +1275,13 @@ version = 2
 bind_address    = "127.0.0.1:17670"
 log_level       = "info"
 compute_driver = "mxc"
-# Required when gateway TLS is enabled. The gateway injects this bundle into
-# the host supervisor.
-guest_tls_ca   = "C:\\OpenShell\\certs\\ca.pem"
-guest_tls_cert = "C:\\OpenShell\\certs\\client.pem"
-guest_tls_key  = "C:\\OpenShell\\certs\\client-key.pem"
+# Required when gateway TLS is enabled. The host supervisor verifies the
+# gateway certificate with this CA and authenticates with its launch token.
+guest_tls_ca = "C:\\OpenShell\\certs\\ca.pem"
 
 [openshell.drivers.mxc]
+# Administrator opt-in for caller-supplied workload commands and directories.
+allow_driver_config = true
 wxc_exec_path = "C:\\mxc\\wxc-exec.exe"
 supervisor_binary_path = "C:\\OpenShell\\openshell-supervisor.exe"
 sandbox_binary_path = "C:\\OpenShell\\openshell-windows-sandbox.exe"
@@ -1278,6 +1300,12 @@ etw_audit = false
 ```
 
 The packaged supervisor and sandbox binaries default to siblings of `openshell-gateway.exe`; explicit paths are useful for development layouts. The driver protects host supervisor tokens and descriptors with an owner-only Windows DACL.
+
+The supervisor does not need a gateway client certificate or key. MXC does not
+support external-resource label admission; do not add `resource_admission` to
+its driver table. Host filesystem grants rely on sandbox policy and a trusted
+gateway operator. Caller-supplied commands and directories still require
+`allow_driver_config = true`.
 
 The MXC driver requires MXC 1.0.0 and emits its stable directional network schema. Remove the retired `default_configuration_id` setting before upgrading; the gateway rejects it. The `isolation_session` backend remains unsupported.
 
@@ -1438,7 +1466,9 @@ compute_driver = "kyma"
 socket_path = "/run/openshell/kyma-compute-driver.sock"
 ```
 
-## Preflight package configuration {#gateway-config-preflight}
+<a id="gateway-config-preflight" />
+
+## Preflight package configuration
 
 Before starting a package-managed gateway, validate the selected file without
 changing it:

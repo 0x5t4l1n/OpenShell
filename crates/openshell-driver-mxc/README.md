@@ -19,10 +19,11 @@ workload
 ```
 
 Caller driver config is disabled by default, so command-based MXC workflows
-need explicit administrator opt-in. Host filesystem grants have no trusted
-label resolver and are rejected while resource admission is enabled.
-See [resource admission configuration](../../docs/how-it-works/gateways/configuration.mdx#external-resource-admission)
-for the independent controls and the security consequences of opting out.
+need explicit administrator opt-in with `allow_driver_config = true`.
+MXC does not support external-resource label admission. Host filesystem grants
+rely on sandbox policy and a trusted gateway operator. See
+[resource admission configuration](../../docs/how-it-works/gateways/configuration.mdx#external-resource-admission)
+for the independent caller configuration gate and resource admission controls.
 
 This driver implements the gateway's ordinary in-process `ComputeDriver`
 contract and is linked into `openshell-gateway`. Runtime readiness comes from
