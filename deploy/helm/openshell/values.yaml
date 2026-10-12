@@ -73,6 +73,30 @@ supervisor:
     # -- Workload boundary TLS listener port.
     boundaryPort: 5500
 
+# RFC 0017 reference ingress. Application TLS terminates at supervisors.
+sandboxProxy:
+  enabled: false
+  replicas: 1
+  image:
+    repository: openshell/sandbox-proxy
+    tag: ""
+    pullPolicy: IfNotPresent
+  gatewayEndpoint: ""
+  workspaces: [default]
+  discoveryTokenSecret: ""
+  gatewayCaSecret: ""
+  allowPlaintextDevelopment: false
+  listenerPort: 8443
+  supervisorAppPort: 8443
+  maxConnections: 256
+  resources:
+    requests:
+      cpu: 100m
+      memory: 64Mi
+    limits:
+      cpu: "1"
+      memory: 128Mi
+
 sandbox:
   image:
     # -- Default standalone sandbox image repository.

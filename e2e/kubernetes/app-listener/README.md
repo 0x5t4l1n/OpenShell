@@ -122,3 +122,47 @@ grpcurl -plaintext -import-path proto -proto openshell.proto \
 Use `WatchServiceRoutes` with the same request to receive complete replacement snapshots. The local profile enables development authentication; production callers need bearer read credentials and membership in the selected workspace. The POC watch ends after 60 seconds and must be reopened. Clients replace their route cache and discard expired entries.
 
 Confirm the `web` route uses the headless supervisor Service address and expected service hostname. Change or delete the declaration and verify its old revision disappears from the watch. Recreate the supervisor and verify discovery publishes the new runtime identity only after it accepts the route. Application health is not inferred from an advertisement.
+
+## Test through the sandbox proxy
+
+Deploy the `sandbox-proxy` profile instead of `app-listener`:
+
+```shell
+KUBECONFIG=../../../kubeconfig mise exec -- skaffold run -p sandbox-proxy
+```
+
+This builds the proxy image, enables headless supervisor endpoints and discovery, and deploys `openshell-sandbox-proxy`. It permits that proxy to reach the supervisor app port in the shared namespace. Discovery uses development authentication only in this profile. Production deployment requires an HTTPS gateway, workspace-scoped bearer credentials in `sandboxProxy.discoveryTokenSecret` (key `token`), and any private gateway CA in `sandboxProxy.gatewayCaSecret` (key `ca.crt`). Operator-managed workspace namespaces need corresponding app ingress policies and address templates.
+
+Create three detached Python sandboxes from the repository root:
+
+```shell
+uv run python - <<'PY'
+from pathlib import Path
+import subprocess
+
+cli = ["target/debug/openshell", "--gateway-endpoint", "http://127.0.0.1:8090"]
+app = Path("e2e/kubernetes/app-listener/app.py").read_text()
+for suffix in ("a", "b", "c"):
+    name = f"proxy-poc-{suffix}"
+    subprocess.run(cli + ["sandbox", "create", "--name", name,
+        "--from", "python:3.12-slim", "--detach", "--",
+        "python3", "-u", "-c", app, "--identity", name], check=True)
+    subprocess.run(cli + ["service", "expose", name, "8080", "web"], check=True)
+subprocess.run(cli + ["service", "expose", "proxy-poc-b", "9090", "portal"], check=True)
+PY
+```
+
+These fixtures use one sandbox per supervisor; shared-supervisor runtime remains a future feature.
+
+Forward only the proxy for application requests:
+
+```shell
+KUBECONFIG=kubeconfig kubectl -n openshell port-forward \
+  svc/openshell-sandbox-proxy 25443:443
+uv run python e2e/kubernetes/app-listener/proxy-smoke.py \
+  --ca /path/to/public-app-certificate.crt
+```
+
+The smoke test verifies HTTPS and WebSocket echo for A/web, B/web, B/portal, and C/web through the same proxy address. It checks distinct sandbox/port responses, Host mismatches, and undeclared SNI. It preserves service SNI and verifies the supervisor certificate; no private app keys belong in the proxy.
+
+Inspect headless EndpointSlices and confirm their addresses match supervisor Pods. Stop/start a fixture and verify its Service DNS name stays stable while its Pod address and discovered runtime change; repeat the smoke test. Delete a fixture and verify its Service is garbage-collected and its route closes. Leave a watch running past 60 seconds to verify proxy reconnects. During gateway outages, new connections must fail after the remaining route lease expires.

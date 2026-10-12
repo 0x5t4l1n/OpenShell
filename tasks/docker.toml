@@ -3,6 +3,11 @@
 
 # Docker image build tasks
 
+["docker:build:sandbox-proxy"]
+description = "Build the OpenShell sandbox proxy image"
+run = "tasks/scripts/docker-build-image.sh sandbox-proxy"
+hide = true
+
 ["build:docker"]
 description = "Build all Docker images"
 depends = [

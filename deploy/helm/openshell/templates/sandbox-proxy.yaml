@@ -1,0 +1,125 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES.
+# SPDX-License-Identifier: Apache-2.0
+{{- if .Values.sandboxProxy.enabled }}
+{{- $proxy := .Values.sandboxProxy }}
+{{- $name := printf "%s-sandbox-proxy" (include "openshell.fullname" .) }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ $name }}
+spec:
+  replicas: {{ $proxy.replicas }}
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: {{ $name }}
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: {{ $name }}
+        openshell.ai/app-ingress-client: "true"
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: sandbox-proxy
+          image: "{{ $proxy.image.repository }}:{{ default .Chart.AppVersion $proxy.image.tag }}"
+          imagePullPolicy: {{ $proxy.image.pullPolicy }}
+          args:
+            - --listen-address=0.0.0.0:{{ $proxy.listenerPort }}
+            - --gateway-endpoint={{ required "sandboxProxy.gatewayEndpoint is required" $proxy.gatewayEndpoint }}
+            - --max-connections={{ $proxy.maxConnections }}
+            {{- range $proxy.workspaces }}
+            - --workspace={{ . }}
+            {{- end }}
+            {{- if $proxy.allowPlaintextDevelopment }}
+            - --allow-plaintext-development
+            {{- else }}
+            - --discovery-token-file=/discovery/token
+            {{- end }}
+            {{- if $proxy.gatewayCaSecret }}
+            - --gateway-ca=/gateway-ca/ca.crt
+            {{- end }}
+          ports:
+            - name: app-tls
+              containerPort: {{ $proxy.listenerPort }}
+          readinessProbe:
+            tcpSocket:
+              port: app-tls
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          resources:
+            {{- toYaml $proxy.resources | nindent 12 }}
+          {{- if or (not $proxy.allowPlaintextDevelopment) $proxy.gatewayCaSecret }}
+          volumeMounts:
+            {{- if not $proxy.allowPlaintextDevelopment }}
+            - name: discovery
+              mountPath: /discovery
+              readOnly: true
+            {{- end }}
+            {{- if $proxy.gatewayCaSecret }}
+            - name: gateway-ca
+              mountPath: /gateway-ca
+              readOnly: true
+            {{- end }}
+          {{- end }}
+      {{- if or (not $proxy.allowPlaintextDevelopment) $proxy.gatewayCaSecret }}
+      volumes:
+        {{- if not $proxy.allowPlaintextDevelopment }}
+        - name: discovery
+          secret:
+            secretName: {{ required "sandboxProxy.discoveryTokenSecret is required" $proxy.discoveryTokenSecret }}
+            items:
+              - key: token
+                path: token
+        {{- end }}
+        {{- if $proxy.gatewayCaSecret }}
+        - name: gateway-ca
+          secret:
+            secretName: {{ $proxy.gatewayCaSecret }}
+            items:
+              - key: ca.crt
+                path: ca.crt
+        {{- end }}
+      {{- end }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $name }}
+spec:
+  ports:
+    - name: app-tls
+      port: 443
+      targetPort: app-tls
+  selector:
+    app.kubernetes.io/name: {{ $name }}
+---
+# Restrict supervisor app ingress to this proxy in the shared namespace.
+# Other workspace placements need corresponding operator-managed policies.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ $name }}
+spec:
+  podSelector:
+    matchLabels:
+      openshell.ai/component: supervisor
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: {{ $name }}
+      ports:
+        - protocol: TCP
+          port: {{ $proxy.supervisorAppPort }}
+{{- end }}
