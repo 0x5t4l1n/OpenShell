@@ -196,6 +196,18 @@ fn append_additional_ca_bundle(
 /// task. It must remain alive for the duration of the sandbox wait loop,
 /// which is achieved by holding the returned `Networking` value in
 /// `run_sandbox`'s frame.
+/// Per-session inputs that must not come from process-wide environment when
+/// one supervisor process hosts several sandboxes.
+#[derive(Clone, Debug, Default)]
+pub struct NetworkingSession {
+    /// Provisioned proxy CA (certificate, key) paths for this sandbox.
+    /// Overrides the process-wide `PROXY_CA_CERT`/`PROXY_CA_KEY` environment.
+    pub proxy_ca_paths: Option<(std::path::PathBuf, std::path::PathBuf)>,
+    /// Durable TOFU pin journal used by recovery-capable supervision.
+    pub pin_journal:
+        Option<Arc<openshell_isolation_interface::recovery_state::EnforcementPinJournal>>,
+}
+
 pub struct Networking {
     pub proxy: Option<ProxyHandle>,
 
@@ -250,6 +262,7 @@ pub async fn run_networking(
     #[cfg(target_os = "linux")] transparent_runtime: Option<TransparentRuntimeSetup>,
     network_mediation_source: Option<Arc<NetworkMediationSource>>,
     proxy_listener: Option<ProxyListenerConfig>,
+    session: &NetworkingSession,
 ) -> Result<Networking> {
     // Build the policy-local route context. The orchestrator's policy poll
     // loop also holds an `Arc` clone (via `Networking::policy_local_ctx`) so
@@ -364,15 +377,32 @@ pub async fn run_networking(
 
     // Identity cache for SHA256 TOFU when OPA is active. Only consumed by
     // the proxy, so it's owned here.
-    let identity_cache = opa_engine.map(|_| Arc::new(BinaryIdentityCache::new()));
+    let identity_cache = opa_engine.map(|_| {
+        Arc::new(
+            session
+                .pin_journal
+                .clone()
+                .map_or_else(BinaryIdentityCache::new, BinaryIdentityCache::with_journal),
+        )
+    });
 
     // Load a provisioned CA when the boundary lifetime outlives this control
     // process; otherwise generate an ephemeral CA.
     // The CA cert is written to disk so sandbox processes can trust it.
     let (tls_state, ca_file_paths) = if matches!(policy.network.mode, NetworkMode::Proxy) {
-        let configured_ca = match (
-            std::env::var_os(openshell_core::sandbox_env::PROXY_CA_CERT),
-            std::env::var_os(openshell_core::sandbox_env::PROXY_CA_KEY),
+        let configured_ca = match session.proxy_ca_paths.as_ref().map_or_else(
+            || {
+                (
+                    std::env::var_os(openshell_core::sandbox_env::PROXY_CA_CERT),
+                    std::env::var_os(openshell_core::sandbox_env::PROXY_CA_KEY),
+                )
+            },
+            |(certificate, key)| {
+                (
+                    Some(certificate.clone().into_os_string()),
+                    Some(key.clone().into_os_string()),
+                )
+            },
         ) {
             (Some(certificate), Some(private_key)) => Some(SandboxCa::load_from_paths(
                 std::path::Path::new(&certificate),

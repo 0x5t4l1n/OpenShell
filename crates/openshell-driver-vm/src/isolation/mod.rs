@@ -109,6 +109,7 @@ impl VmBoundarySpec {
                 workload_identity: workload_identity.clone(),
                 provisioning_evidence: provisioning_evidence.clone(),
                 child_env: self.child_env,
+                supervisor_recovery: None,
             },
             runtime_descriptor: SandboxRuntimeDescriptor {
                 boundary_id: self.boundary_id,
@@ -123,6 +124,7 @@ impl VmBoundarySpec {
                 host_gateway_ip: Some(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)),
                 resource_claims,
                 provisioning_evidence,
+                supervisor_recovery: None,
             },
         })
     }

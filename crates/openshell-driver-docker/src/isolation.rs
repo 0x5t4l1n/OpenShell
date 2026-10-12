@@ -118,6 +118,7 @@ impl DockerBoundarySpec {
                 workload_identity: self.workload_identity.clone(),
                 provisioning_evidence: provisioning_evidence.clone(),
                 child_env: self.child_env,
+                supervisor_recovery: None,
             },
             runtime_descriptor: SandboxRuntimeDescriptor {
                 boundary_id: self.boundary_id,
@@ -131,6 +132,7 @@ impl DockerBoundarySpec {
                 host_gateway_ip: self.host_gateway_ip,
                 resource_claims,
                 provisioning_evidence,
+                supervisor_recovery: None,
             },
         })
     }

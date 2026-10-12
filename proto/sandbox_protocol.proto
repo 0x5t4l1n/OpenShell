@@ -85,6 +85,13 @@ message RequestEnvelope {
     LoopbackConnect loopback_connect = 24;
     OpenMediation open_mediation = 25;
     AcceptNetwork accept_network = 26;
+    // supervisor-recovery.v1 extension. Sent only when the trusted runtime
+    // descriptor negotiated that protocol; otherwise rejected as unsupported.
+    RecoveryHello recovery_hello = 27;
+    Recover recover = 28;
+    ConfirmRecovery confirm_recovery = 29;
+    RenewLease renew_lease = 30;
+    StoreRecoveryState store_recovery_state = 31;
   }
 }
 message ResponseEnvelope {
@@ -106,6 +113,10 @@ message ResponseEnvelope {
     MediationReady mediation_ready = 24;
     NetworkConnected network_connected = 25;
     Error error = 26;
+    RecoveryChallenge recovery_challenge = 27;
+    Recovered recovered = 28;
+    LeaseRenewed lease_renewed = 29;
+    RecoveryStateStored recovery_state_stored = 30;
   }
 }
 // Read-only image-policy discovery, permitted before attachment.
@@ -173,6 +184,40 @@ message LoopbackConnect {
 message OpenMediation {}
 message AcceptNetwork {}
 
+// supervisor-recovery.v1: fenced replacement of the enforcing supervisor.
+// None of these operations are replayable mutations; each uses a fresh ID.
+// Ask a frozen runtime for a single-use recovery challenge. Allowed without an
+// active owner connection.
+message RecoveryHello {}
+// Fence the previous owner with a gateway-signed recovery grant bound to the
+// challenge and a proof signed by the candidate's ephemeral key.
+message Recover {
+  string grant = 1 [(openshell.options.v1.secret) = true];
+  string proof = 2 [(openshell.options.v1.secret) = true];
+}
+// Resume a recovered workload with a gateway-signed activation bound to the
+// runtime fencing receipt. Never starts a new agent.
+message ConfirmRecovery {
+  string activation = 1 [(openshell.options.v1.secret) = true];
+}
+// Extend the active owner's enforced lease with a gateway-signed lease.
+message RenewLease {
+  string lease = 1 [(openshell.options.v1.secret) = true];
+}
+// Checkpoint supervisor-owned state a replacement must restore.
+message StoreRecoveryState {
+  SupervisorRecoveryState state = 1;
+}
+// Opaque to runtime decisions; only the active owner may write it.
+message SupervisorRecoveryState {
+  // Monotonic within one ownership epoch lineage.
+  uint64 revision = 1;
+  // Trust-on-first-use executable pins: absolute path to SHA-256 hex.
+  map<string, string> binary_pins = 2;
+  // Highest gateway policy version the owner enforced.
+  uint64 policy_version = 3;
+}
+
 // No image policy is yaml absent with invalid=false. invalid=true reports an
 // unreadable or invalid image policy; it must not be treated as missing.
 message ImagePolicy {
@@ -224,6 +269,28 @@ message NetworkConnected {
 message Error {
   BoundaryErrorKind kind = 1;
   string message = 2;
+}
+message RecoveryChallenge {
+  string protocol = 1;
+  string challenge = 2;
+  uint64 ownership_epoch = 3;
+  string generation = 4;
+}
+message Recovered {
+  // Runtime-signed fencing receipt (openshell-recovery-receipt+jwt).
+  string receipt = 1;
+  SessionSnapshot snapshot = 2;
+  // Policy bound by the original Attach; the replacement reattaches with it.
+  SandboxPolicy attached_policy = 3;
+  optional string main_process_id = 4;
+  uint64 provider_env_generation = 5;
+  SupervisorRecoveryState state = 6;
+}
+message LeaseRenewed {
+  google.protobuf.Duration expires_in = 1;
+}
+message RecoveryStateStored {
+  uint64 revision = 1;
 }
 
 enum BoundaryErrorKind {

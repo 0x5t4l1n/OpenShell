@@ -32,6 +32,7 @@ pub mod google_cloud;
 pub mod gpu;
 pub mod grpc_client;
 pub mod host_pattern;
+pub mod hosted_session;
 pub mod image;
 pub mod isolation_registration;
 pub mod jwt;

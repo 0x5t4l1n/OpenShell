@@ -30,6 +30,7 @@ mod provider_files;
 #[cfg(target_os = "linux")]
 mod pty;
 #[cfg(target_os = "linux")]
+mod recovery_ownership;
 pub mod sandbox;
 #[cfg(target_os = "linux")]
 pub mod sftp;

@@ -50,6 +50,7 @@ impl DelegatedLaunch {
             host_gateway_ip: self.host_gateway_ip,
             resource_claims: self.resource_claims,
             provisioning_evidence: self.provisioning_evidence,
+            supervisor_recovery: None,
         };
         crate::runtime::validate_runtime_coordinates(&descriptor)?;
         Ok(descriptor)

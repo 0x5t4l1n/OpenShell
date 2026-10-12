@@ -60,3 +60,17 @@ belong to the sandbox or isolation backend. Signals use `BoundarySignal`.
 
 These portable control-plane foundations do not qualify a platform isolation
 backend or enable a Windows workload runtime.
+
+## Shared pool mode (prototype)
+
+`openshell-supervisor pool` runs one replica of the gateway supervisor
+topology. It authenticates pool RPCs with its projected token, follows
+gateway assignments, and hosts each assigned sandbox through
+`run_hosted_session` on its own Tokio runtime. The runtime's thread-start hook
+binds the session identity, OCSF context, and log-push sink, so attribution,
+tasks, and cleanup stay per sandbox. Gateway clients use a session-scoped
+endpoint whose credentials live only in that session; dropping the session
+revokes them. A `RELEASE` assignment (stop or delete) terminates the session;
+losing the assignment abandons it without touching the workload so the next
+owner can resume it. Process signals stop the replica, never a hosted
+workload.

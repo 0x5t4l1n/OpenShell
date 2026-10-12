@@ -363,6 +363,26 @@ impl WireMessage for c::BoundaryConfirmation {
         })
     }
 }
+impl WireMessage for w::SupervisorRecoveryStateWire {
+    type Proto = p::SupervisorRecoveryState;
+    fn to_proto(&self) -> Result<Self::Proto, FrameError> {
+        Ok(p::SupervisorRecoveryState {
+            revision: self.revision,
+            binary_pins: self.binary_pins.clone().into_iter().collect(),
+            policy_version: self.policy_version,
+        })
+    }
+    fn from_proto(v: Self::Proto) -> Result<Self, FrameError> {
+        if v.binary_pins.len() > w::MAX_RECOVERY_STATE_PINS {
+            return Err(invalid("too many recovery state pins"));
+        }
+        Ok(Self {
+            revision: v.revision,
+            binary_pins: v.binary_pins.into_iter().collect(),
+            policy_version: v.policy_version,
+        })
+    }
+}
 impl WireMessage for w::SessionSnapshotWire {
     type Proto = p::SessionSnapshot;
     fn to_proto(&self) -> Result<Self::Proto, FrameError> {
@@ -510,6 +530,20 @@ impl WireMessage for w::RequestEnvelope {
             }),
             W::OpenMediation => P::OpenMediation(p::OpenMediation {}),
             W::AcceptNetwork => P::AcceptNetwork(p::AcceptNetwork {}),
+            W::RecoveryHello => P::RecoveryHello(p::RecoveryHello {}),
+            W::Recover { grant, proof } => P::Recover(p::Recover {
+                grant: grant.clone(),
+                proof: proof.clone(),
+            }),
+            W::ConfirmRecovery { activation } => P::ConfirmRecovery(p::ConfirmRecovery {
+                activation: activation.clone(),
+            }),
+            W::RenewLease { lease } => P::RenewLease(p::RenewLease {
+                lease: lease.clone(),
+            }),
+            W::StoreRecoveryState { state } => P::StoreRecoveryState(p::StoreRecoveryState {
+                state: Some(state.to_proto()?),
+            }),
         };
         Ok(p::RequestEnvelope {
             request_id: self.request_id.clone(),
@@ -573,6 +607,18 @@ impl WireMessage for w::RequestEnvelope {
             },
             P::OpenMediation(_) => W::OpenMediation,
             P::AcceptNetwork(_) => W::AcceptNetwork,
+            P::RecoveryHello(_) => W::RecoveryHello,
+            P::Recover(v) => W::Recover {
+                grant: v.grant,
+                proof: v.proof,
+            },
+            P::ConfirmRecovery(v) => W::ConfirmRecovery {
+                activation: v.activation,
+            },
+            P::RenewLease(v) => W::RenewLease { lease: v.lease },
+            P::StoreRecoveryState(v) => W::StoreRecoveryState {
+                state: w::SupervisorRecoveryStateWire::from_proto(required(v.state)?)?,
+            },
         };
         // The server derives a fingerprint from decoded typed fields. Clients
         // supply only the random ID; protobuf map order never changes a replay.
@@ -658,6 +704,45 @@ impl WireMessage for w::ResponseEnvelope {
                 kind: kind.to_proto()? as i32,
                 message: message.clone(),
             }),
+            W::RecoveryChallenge {
+                protocol,
+                challenge,
+                ownership_epoch,
+                generation,
+            } => P::RecoveryChallenge(p::RecoveryChallenge {
+                protocol: protocol.clone(),
+                challenge: challenge.clone(),
+                ownership_epoch: *ownership_epoch,
+                generation: generation.clone(),
+            }),
+            W::Recovered {
+                receipt,
+                snapshot,
+                attached_policy,
+                main_process_id,
+                provider_env_generation,
+                state,
+            } => P::Recovered(p::Recovered {
+                receipt: receipt.clone(),
+                snapshot: Some(snapshot.to_proto()?),
+                attached_policy: attached_policy
+                    .as_deref()
+                    .map(WireMessage::to_proto)
+                    .transpose()?,
+                main_process_id: main_process_id.clone(),
+                provider_env_generation: *provider_env_generation,
+                state: state.as_ref().map(WireMessage::to_proto).transpose()?,
+            }),
+            W::LeaseRenewed { expires_in_ms } => P::LeaseRenewed(p::LeaseRenewed {
+                expires_in: Some(duration(
+                    expires_in_ms
+                        .checked_mul(1000)
+                        .ok_or_else(|| invalid("lease duration overflow"))?,
+                )?),
+            }),
+            W::RecoveryStateStored { revision } => P::RecoveryStateStored(p::RecoveryStateStored {
+                revision: *revision,
+            }),
         };
         Ok(p::ResponseEnvelope {
             request_id: self.request_id.clone(),
@@ -720,6 +805,32 @@ impl WireMessage for w::ResponseEnvelope {
             P::Error(v) => W::Error {
                 kind: w::BoundaryErrorKind::from_proto(enum_value(v.kind)?)?,
                 message: v.message,
+            },
+            P::RecoveryChallenge(v) => W::RecoveryChallenge {
+                protocol: v.protocol,
+                challenge: v.challenge,
+                ownership_epoch: v.ownership_epoch,
+                generation: v.generation,
+            },
+            P::Recovered(v) => W::Recovered {
+                receipt: v.receipt,
+                snapshot: w::SessionSnapshotWire::from_proto(required(v.snapshot)?)?,
+                attached_policy: v
+                    .attached_policy
+                    .map(|v| w::SandboxPolicyWire::from_proto(v).map(Box::new))
+                    .transpose()?,
+                main_process_id: v.main_process_id,
+                provider_env_generation: v.provider_env_generation,
+                state: v
+                    .state
+                    .map(w::SupervisorRecoveryStateWire::from_proto)
+                    .transpose()?,
+            },
+            P::LeaseRenewed(v) => W::LeaseRenewed {
+                expires_in_ms: micros(Some(required(v.expires_in)?))? / 1000,
+            },
+            P::RecoveryStateStored(v) => W::RecoveryStateStored {
+                revision: v.revision,
             },
         };
         Ok(Self {
