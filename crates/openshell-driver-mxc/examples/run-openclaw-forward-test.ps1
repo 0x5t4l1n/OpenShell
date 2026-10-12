@@ -535,6 +535,10 @@ try {
     $createCode = 1
   }
   $createBenign = Show-SandboxCreate $createOut $SandboxName
+  # The trailing `-- exit` post-create exec has nothing to run in a supervisor-less
+  # sandbox; current CLIs report that as exit 255 + "posix_spawnp: No such file".
+  # The sandbox itself is created and ready, so do not abort on it.
+  if ($createCode -eq 255 -and (($createOut | Out-String) -match "posix_spawnp")) { $createBenign = $true }
   if ($createCode -ne 0 -and -not $createBenign) {
     throw "sandbox create '$SandboxName' failed (exit $createCode): $($createOut | Out-String)"
   }
