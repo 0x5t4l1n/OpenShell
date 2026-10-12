@@ -16,7 +16,7 @@ use hyper::body::Incoming;
 use hyper_util::rt::{TokioIo, TokioTimer};
 use miette::{IntoDiagnostic, Result};
 use openshell_core::grpc_client::SettingsPollResult;
-use openshell_core::proto::SandboxServiceRoute;
+use openshell_core::proto::{SandboxServiceRoute, SupervisorServiceAdvertisement};
 use openshell_isolation_interface::contract::LoopbackTarget;
 use openshell_sandbox_backend::BoundaryLoopbackConnector;
 use openshell_ocsf::{
@@ -238,12 +238,17 @@ pub struct BoundListener {
 pub struct Handle {
     task: tokio::task::JoinHandle<()>,
     routes: Routes,
+    advertisement_task: tokio::task::JoinHandle<()>,
+    advertisements: watch::Sender<Option<SupervisorServiceAdvertisement>>,
 }
 
 impl Drop for Handle {
     fn drop(&mut self) {
         self.routes.stopped.store(true, Ordering::Release);
         self.routes.suspend();
+        self.advertisements
+            .send_replace(Some(SupervisorServiceAdvertisement::default()));
+        self.advertisement_task.abort();
         self.task.abort();
     }
 }
@@ -255,8 +260,16 @@ impl BoundListener {
         sandbox: String,
         workspace: watch::Receiver<String>,
         connector: Arc<BoundaryLoopbackConnector>,
+        advertisements: watch::Sender<Option<SupervisorServiceAdvertisement>>,
     ) -> Handle {
         let retained_routes = routes.clone();
+        let publication_routes = routes.clone();
+        let publication_domain = self.domain.clone();
+        let publication_sender = advertisements.clone();
+        let advertisement_task = tokio::spawn(async move {
+            publish_advertisements(publication_routes, publication_domain, publication_sender)
+                .await;
+        });
         let task = tokio::spawn(async move {
             let permits = Arc::new(Semaphore::new(64));
             let mut connections = JoinSet::new();
@@ -311,6 +324,47 @@ impl BoundListener {
         Handle {
             task,
             routes: retained_routes,
+            advertisement_task,
+            advertisements,
+        }
+    }
+}
+
+async fn publish_advertisements(
+    routes: Routes,
+    domain: String,
+    sender: watch::Sender<Option<SupervisorServiceAdvertisement>>,
+) {
+    let mut updates = routes.sender.subscribe();
+    loop {
+        let snapshot = updates.borrow_and_update().clone();
+        let remaining = snapshot
+            .expires
+            .and_then(|expiry| expiry.checked_duration_since(Instant::now()));
+        let active = remaining.is_some_and(|duration| !duration.is_zero())
+            && !routes.stopped.load(Ordering::Acquire);
+        sender.send_replace(Some(SupervisorServiceAdvertisement {
+            service_domain: domain.clone(),
+            routes: if active {
+                snapshot.routes.values().cloned().collect()
+            } else {
+                Vec::new()
+            },
+            expires_at: remaining.and_then(|duration| {
+                openshell_core::time::timestamp_from_system_time(
+                    std::time::SystemTime::now() + duration,
+                )
+                .ok()
+            }),
+            report_sequence: 0,
+        }));
+        tokio::select! {
+            changed = updates.changed() => { if changed.is_err() { return; } },
+            () = async {
+                if let Some(duration) = remaining.filter(|duration| !duration.is_zero()) {
+                    tokio::time::sleep(duration).await;
+                } else { std::future::pending::<()>().await; }
+            } => {},
         }
     }
 }
@@ -632,6 +686,7 @@ mod tests {
         routes: Routes,
         connector: Arc<Connector>,
         route: SandboxServiceRoute,
+        advertisements: watch::Receiver<Option<SupervisorServiceAdvertisement>>,
     }
 
     async fn fixture() -> Fixture {
@@ -674,11 +729,13 @@ mod tests {
         let connector = Arc::new(Connector {
             calls: AtomicUsize::new(0),
         });
+        let (advertisement_sender, advertisements) = watch::channel(None);
         let handle = bound.start(
             routes.clone(),
             "sandbox-a".into(),
             watch::channel("default".into()).1,
             rpc_test::loopback(connector.clone()),
+            advertisement_sender,
         );
         Fixture {
             _directory: directory,
@@ -688,6 +745,7 @@ mod tests {
             routes,
             connector,
             route,
+            advertisements,
         }
     }
 
@@ -840,5 +898,46 @@ mod tests {
             .unwrap();
         assert!(closed.is_none() || closed.unwrap().is_err());
         assert_eq!(f.connector.calls.load(Ordering::SeqCst), 1);
+    }
+    #[tokio::test]
+    async fn advertisements_follow_installed_routes_and_withdrawal() {
+        let mut f = fixture().await;
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while f
+                .advertisements
+                .borrow_and_update()
+                .as_ref()
+                .is_none_or(|ad| ad.routes.is_empty())
+            {
+                f.advertisements.changed().await.unwrap();
+            }
+        })
+        .await
+        .unwrap();
+        let report = f.advertisements.borrow().clone().unwrap();
+        assert_eq!(report.service_domain, "svc.openshell.internal");
+        assert_eq!(report.routes, vec![f.route.clone()]);
+        assert!(report.expires_at.is_some());
+        f.routes.suspend();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while f
+                .advertisements
+                .borrow_and_update()
+                .as_ref()
+                .is_some_and(|ad| !ad.routes.is_empty())
+            {
+                f.advertisements.changed().await.unwrap();
+            }
+        })
+        .await
+        .unwrap();
+        assert!(
+            f.advertisements
+                .borrow()
+                .as_ref()
+                .unwrap()
+                .routes
+                .is_empty()
+        );
     }
 }

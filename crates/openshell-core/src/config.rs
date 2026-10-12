@@ -316,6 +316,10 @@ pub struct ServiceRoutingConfig {
     /// Enable TLS-enabled loopback gateway listeners to also accept plaintext
     /// HTTP for sandbox service hostnames.
     pub enable_loopback_service_http: bool,
+    /// Trusted supervisor app address, supporting `{sandbox_id}`, `{sandbox}`, `{workspace}`.
+    pub supervisor_app_address_template: Option<String>,
+    /// Service SNI domain for direct supervisor ingress.
+    pub supervisor_app_service_domain: Option<String>,
 }
 
 /// TLS configuration.
@@ -1115,6 +1119,8 @@ impl Default for ServiceRoutingConfig {
         Self {
             base_domains: default_service_routing_domains(),
             enable_loopback_service_http: default_enable_loopback_service_http(),
+            supervisor_app_address_template: None,
+            supervisor_app_service_domain: None,
         }
     }
 }

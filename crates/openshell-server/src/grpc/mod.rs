@@ -12,6 +12,7 @@ pub mod provider_readiness;
 mod sandbox;
 pub use sandbox::mint_persisted_authentication;
 mod service;
+pub mod service_advertisement;
 mod validation;
 pub mod workspace;
 

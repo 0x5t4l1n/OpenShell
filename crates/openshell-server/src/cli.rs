@@ -574,6 +574,16 @@ fn prepare_server_config_with_drivers(
     }
 
     if let Some(gateway_file) = file.as_ref().map(|f| &f.openshell.gateway) {
+        config
+            .service_routing
+            .supervisor_app_address_template
+            .clone_from(&gateway_file.supervisor_app_address_template);
+        config
+            .service_routing
+            .supervisor_app_service_domain
+            .clone_from(&gateway_file.supervisor_app_service_domain);
+        crate::grpc::service_advertisement::validate_config(&config.service_routing)
+            .map_err(|error| miette::miette!(error))?;
         if let Some(drivers) = &gateway_file.credential_drivers {
             config = config.with_credential_drivers(drivers.clone());
         }
