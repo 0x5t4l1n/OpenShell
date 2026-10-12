@@ -3,11 +3,18 @@
 
 //! Agent-oriented CLI reference rendered from the clap command tree.
 //!
-//! `openshell agent context` prints every visible command, argument, and flag
-//! as one plain-text document, so a coding agent can learn the installed CLI
-//! in a single call instead of walking nested `--help` pages. The text is
-//! projected from the same clap definitions that parse arguments, which keeps
-//! it in lockstep with the binary.
+//! `openshell agent context` gives a coding agent the installed CLI in a few
+//! calls instead of a walk through nested `--help` pages. Without arguments it
+//! prints global flags and an overview of every command, grouped into
+//! sections of commands that are used together. A section name prints the
+//! full usage, flags, and examples of that section's commands, and a command
+//! path prints one command or command group.
+//!
+//! Everything except the section grouping is projected from the clap
+//! definitions that parse arguments, so the reference cannot drift from the
+//! binary. Commands that no section claims still appear, in an `other`
+//! section, and [`section_problems`] lets a test require that every command is
+//! assigned.
 //!
 //! The output is deterministic. Commands and arguments appear in definition
 //! order, hidden commands and flags are omitted, and no ANSI styling survives.
@@ -17,42 +24,78 @@ use std::fmt::Write as _;
 use clap::{Arg, ArgAction, Command};
 use miette::{Result, miette};
 
-/// Usage notes printed under the header. Each one must hold for every command.
+/// Usage notes printed in the overview. Each one must hold for every command.
 const CONVENTIONS: &[&str] = &[
     "This reference is generated from the installed binary and matches its version.",
-    "Global flags apply to every command and are listed once.",
+    "Global flags apply to every command and are listed only in this overview.",
     "Prefer `--output json` where a command offers it. Table output is for people and may change.",
     "Most commands with an optional sandbox name default to the last-used sandbox. Pass the name explicitly in automation.",
-    "Run `openshell agent context <COMMAND>...` to print one command group or command.",
 ];
+
+/// Section that collects visible commands no configured section claims.
+const OTHER_SECTION: &str = "other";
 
 /// Indentation for argument forms such as `-o, --output <OUTPUT>`.
 const ARG_INDENT: &str = "  ";
 /// Indentation for argument descriptions and attribute tags.
 const ARG_BODY_INDENT: &str = "      ";
 
-/// Render the agent reference for `cmd`, optionally narrowed by `path`.
+/// A named group of commands that agents usually need together.
+#[derive(Debug, Clone, Copy)]
+pub struct ContextSection {
+    /// Name passed to `agent context`, such as `sandboxes`. Must not match a
+    /// top-level command name or alias.
+    pub name: &'static str,
+    /// One-line description shown in the overview.
+    pub summary: &'static str,
+    /// Command paths relative to the root, such as `sandbox` or
+    /// `sandbox provider`. A path includes its subcommands, except subtrees
+    /// that another section claims with a longer path.
+    pub commands: &'static [&'static str],
+}
+
+/// Render the agent reference for the root command `cmd`.
 ///
-/// `cmd` is the root command, normally `Cli::command()`. `path` names a
-/// command group or command, for example `["sandbox", "create"]`. Aliases are
-/// accepted in `path`; hidden commands are not.
-pub fn render_context(cmd: &Command, path: &[String]) -> Result<String> {
+/// `cmd` is normally `Cli::command()`. With an empty `target` the result is
+/// the overview. A single `target` that names a section renders that section.
+/// Otherwise `target` is a command path such as `["sandbox", "create"]`;
+/// aliases are accepted and hidden commands are not.
+pub fn render_context(
+    cmd: &Command,
+    sections: &[ContextSection],
+    target: &[String],
+) -> Result<String> {
     let mut root = cmd.clone();
     // Propagate global arguments and binary names so subcommand usage lines
     // and argument lists match what `--help` shows.
     root.build();
+    let layout = Layout::new(&root, sections);
 
+    let section = match target {
+        [name] => layout.index_of(name),
+        _ => None,
+    };
     let mut out = String::new();
-    write_header(&mut out, &root);
-    write_global_flags(&mut out, &root);
-
-    let target = find_command(&mut root, path)?;
-    if path.is_empty() {
-        for child in target.get_subcommands_mut().filter(|c| !c.is_hide_set()) {
-            write_tree(&mut out, child);
-        }
+    if target.is_empty() {
+        write_overview(&mut out, &root, &layout);
+    } else if let Some(index) = section {
+        write_section(&mut out, &mut root, &layout, index);
     } else {
-        write_tree(&mut out, target);
+        if !visible_subcommands(&root).any(|c| answers_to(c, &target[0])) {
+            return Err(miette!(
+                "unknown section or command `{}`\nSections: {}\nCommands: {}",
+                target[0],
+                layout.names().join(", "),
+                visible_subcommands(&root)
+                    .map(Command::get_name)
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            ));
+        }
+        write_title(&mut out, &root, Some(&target.join(" ")));
+        write_overview_pointer(&mut out, &root);
+        let command = find_command(&mut root, target)?;
+        write_tree(&mut out, command);
     }
 
     // Example constants embed ANSI escapes, and clap strips styling only when
@@ -62,6 +105,253 @@ pub fn render_context(cmd: &Command, path: &[String]) -> Result<String> {
     let mut text = text.trim_end().to_string();
     text.push('\n');
     Ok(text)
+}
+
+/// Describe every way `sections` fails to cover `cmd` cleanly.
+///
+/// Returns an empty list when every visible top-level command belongs to a
+/// section, every section path names a visible command by its canonical
+/// name, no path is claimed twice, and section names are unique and distinct
+/// from top-level command names and aliases.
+pub fn section_problems(cmd: &Command, sections: &[ContextSection]) -> Vec<String> {
+    let mut problems = Vec::new();
+
+    let mut names = Vec::new();
+    let mut paths = Vec::new();
+    for section in sections {
+        if names.contains(&section.name) {
+            problems.push(format!("section `{}` is defined twice", section.name));
+        }
+        names.push(section.name);
+        if section.name == OTHER_SECTION {
+            problems.push(format!("section name `{OTHER_SECTION}` is reserved"));
+        }
+        if visible_subcommands(cmd).any(|c| answers_to(c, section.name)) {
+            problems.push(format!(
+                "section `{}` has the same name as a command",
+                section.name
+            ));
+        }
+        for path in section.commands {
+            if paths.contains(path) {
+                problems.push(format!("command `{path}` is claimed by two sections"));
+            }
+            paths.push(path);
+            if !is_visible_path(cmd, path) {
+                problems.push(format!(
+                    "section `{}` names `{path}`, which is not a visible command",
+                    section.name
+                ));
+            }
+        }
+    }
+
+    let layout = Layout::configured(sections);
+    for command in visible_subcommands(cmd) {
+        if layout.owner(command.get_name()).is_none() {
+            problems.push(format!(
+                "command `{}` is not in any section",
+                command.get_name()
+            ));
+        }
+    }
+    problems
+}
+
+/// Sections resolved against a built command tree, including a trailing
+/// `other` section when some visible top-level commands are unclaimed.
+struct Layout {
+    sections: Vec<ResolvedSection>,
+}
+
+struct ResolvedSection {
+    name: &'static str,
+    summary: &'static str,
+    roots: Vec<String>,
+}
+
+impl Layout {
+    /// The configured sections only, without the `other` fallback.
+    fn configured(sections: &[ContextSection]) -> Self {
+        Self {
+            sections: sections
+                .iter()
+                .map(|section| ResolvedSection {
+                    name: section.name,
+                    summary: section.summary,
+                    roots: section.commands.iter().map(ToString::to_string).collect(),
+                })
+                .collect(),
+        }
+    }
+
+    fn new(root: &Command, sections: &[ContextSection]) -> Self {
+        let mut layout = Self::configured(sections);
+        let unclaimed = visible_subcommands(root)
+            .map(|c| c.get_name().to_string())
+            .filter(|name| layout.owner(name).is_none())
+            .collect::<Vec<_>>();
+        if !unclaimed.is_empty() {
+            layout.sections.push(ResolvedSection {
+                name: OTHER_SECTION,
+                summary: "Commands that are not assigned to a section yet.",
+                roots: unclaimed,
+            });
+        }
+        layout
+    }
+
+    fn names(&self) -> Vec<&'static str> {
+        self.sections.iter().map(|section| section.name).collect()
+    }
+
+    fn index_of(&self, name: &str) -> Option<usize> {
+        self.sections
+            .iter()
+            .position(|section| section.name == name)
+    }
+
+    /// Index of the section that owns the command at `path`: the section
+    /// whose claimed path is the longest prefix of `path`. Duplicate claims
+    /// are rejected by [`section_problems`], so ties do not arise in practice.
+    fn owner(&self, path: &str) -> Option<usize> {
+        self.sections
+            .iter()
+            .enumerate()
+            .flat_map(|(index, section)| section.roots.iter().map(move |root| (index, root)))
+            .filter(|(_, root)| {
+                path == root.as_str()
+                    || path
+                        .strip_prefix(root.as_str())
+                        .is_some_and(|rest| rest.starts_with(' '))
+            })
+            .max_by_key(|(_, root)| root.len())
+            .map(|(index, _)| index)
+    }
+}
+
+fn write_overview(out: &mut String, root: &Command, layout: &Layout) {
+    write_title(out, root, None);
+    if let Some(about) = root.get_about() {
+        out.push('\n');
+        write_text(out, &about.to_string(), "");
+    }
+    let name = root.get_name();
+    let _ = writeln!(
+        out,
+        "\nThis overview lists every command by section. Run `{name} agent context <SECTION>` \
+         for the usage, flags, and examples of every command in a section, or \
+         `{name} agent context <COMMAND>...` for one command or command group."
+    );
+    out.push_str("\nConventions:\n");
+    for convention in CONVENTIONS {
+        let _ = writeln!(out, "- {convention}");
+    }
+    write_global_flags(out, root);
+
+    out.push_str("\n## Sections\n");
+    for (index, section) in layout.sections.iter().enumerate() {
+        let _ = writeln!(out, "\n### {}\n\n{}\n", section.name, section.summary);
+        let mut leaves = Vec::new();
+        for path in &section.roots {
+            if let Some(command) = lookup(root, path) {
+                collect_leaves(command, path, layout, index, &mut leaves);
+            }
+        }
+        let width = leaves
+            .iter()
+            .map(|(path, _)| path.len())
+            .max()
+            .unwrap_or_default();
+        for (path, about) in leaves {
+            let line = format!("  {path:width$}  {about}");
+            let _ = writeln!(out, "{}", line.trim_end());
+        }
+    }
+}
+
+/// Collect `(path, summary)` for each visible leaf command under `cmd` that
+/// belongs to section `index`.
+fn collect_leaves(
+    cmd: &Command,
+    path: &str,
+    layout: &Layout,
+    index: usize,
+    leaves: &mut Vec<(String, String)>,
+) {
+    let mut children = visible_subcommands(cmd).peekable();
+    if children.peek().is_none() {
+        let about = cmd.get_about().map(ToString::to_string).unwrap_or_default();
+        leaves.push((path.to_string(), about));
+        return;
+    }
+    for child in children {
+        let child_path = format!("{path} {}", child.get_name());
+        if layout.owner(&child_path) == Some(index) {
+            collect_leaves(child, &child_path, layout, index, leaves);
+        }
+    }
+}
+
+fn write_section(out: &mut String, root: &mut Command, layout: &Layout, index: usize) {
+    let section = &layout.sections[index];
+    write_title(out, root, Some(section.name));
+    let _ = writeln!(out, "\n{}", section.summary);
+    write_overview_pointer(out, root);
+    for path in &section.roots {
+        if let Some(command) = lookup_mut(root, path) {
+            write_section_tree(out, command, path, layout, index);
+        }
+    }
+}
+
+/// Write `cmd` and each visible descendant that belongs to section `index`.
+fn write_section_tree(
+    out: &mut String,
+    cmd: &mut Command,
+    path: &str,
+    layout: &Layout,
+    index: usize,
+) {
+    let elsewhere = |child: &str| {
+        let owner = layout.owner(&format!("{path} {child}"))?;
+        (owner != index).then(|| layout.sections[owner].name)
+    };
+    write_command(out, cmd, &elsewhere);
+    for child in cmd.get_subcommands_mut().filter(|c| !c.is_hide_set()) {
+        let child_path = format!("{path} {}", child.get_name());
+        if layout.owner(&child_path) == Some(index) {
+            write_section_tree(out, child, &child_path, layout, index);
+        }
+    }
+}
+
+/// Write `cmd` and every visible descendant, depth first.
+fn write_tree(out: &mut String, cmd: &mut Command) {
+    write_command(out, cmd, &|_| None);
+    for child in cmd.get_subcommands_mut().filter(|c| !c.is_hide_set()) {
+        write_tree(out, child);
+    }
+}
+
+/// Resolve a canonical command path such as `sandbox provider`.
+fn lookup<'a>(root: &'a Command, path: &str) -> Option<&'a Command> {
+    path.split(' ')
+        .try_fold(root, |cmd, name| cmd.find_subcommand(name))
+}
+
+fn lookup_mut<'a>(root: &'a mut Command, path: &str) -> Option<&'a mut Command> {
+    path.split(' ')
+        .try_fold(root, |cmd, name| cmd.find_subcommand_mut(name))
+}
+
+/// Whether `path` names a visible command using canonical names only.
+fn is_visible_path(root: &Command, path: &str) -> bool {
+    path.split(' ')
+        .try_fold(root, |cmd, name| {
+            visible_subcommands(cmd).find(|c| c.get_name() == name)
+        })
+        .is_some()
 }
 
 /// Walk `path` from `root` and return the named visible command.
@@ -102,20 +392,24 @@ fn command_path(cmd: &Command) -> &str {
     cmd.get_bin_name().unwrap_or_else(|| cmd.get_name())
 }
 
-fn write_header(out: &mut String, root: &Command) {
+/// Write the first line, such as `# openshell 1.2.3: sandboxes`.
+fn write_title(out: &mut String, root: &Command, subject: Option<&str>) {
     let _ = write!(out, "# {}", root.get_name());
     if let Some(version) = root.get_version() {
         let _ = write!(out, " {version}");
     }
+    if let Some(subject) = subject {
+        let _ = write!(out, ": {subject}");
+    }
     out.push('\n');
-    if let Some(about) = root.get_about() {
-        out.push('\n');
-        write_text(out, &about.to_string(), "");
-    }
-    out.push_str("\nConventions:\n");
-    for convention in CONVENTIONS {
-        let _ = writeln!(out, "- {convention}");
-    }
+}
+
+fn write_overview_pointer(out: &mut String, root: &Command) {
+    let _ = writeln!(
+        out,
+        "\nRun `{} agent context` for global flags, conventions, and the other sections.",
+        root.get_name()
+    );
 }
 
 fn write_global_flags(out: &mut String, root: &Command) {
@@ -132,15 +426,13 @@ fn write_global_flags(out: &mut String, root: &Command) {
     }
 }
 
-/// Write `cmd` and then each visible descendant, depth first.
-fn write_tree(out: &mut String, cmd: &mut Command) {
-    write_command(out, cmd);
-    for child in cmd.get_subcommands_mut().filter(|c| !c.is_hide_set()) {
-        write_tree(out, child);
-    }
-}
-
-fn write_command(out: &mut String, cmd: &mut Command) {
+/// Write one command block. `elsewhere` maps a child command name to the
+/// section that documents it when that is not the section being written.
+fn write_command(
+    out: &mut String,
+    cmd: &mut Command,
+    elsewhere: &dyn Fn(&str) -> Option<&'static str>,
+) {
     let is_group = visible_subcommands(cmd).next().is_some();
     let usage = if is_group {
         None
@@ -177,12 +469,14 @@ fn write_command(out: &mut String, cmd: &mut Command) {
             .max()
             .unwrap_or_default();
         for child in visible_subcommands(cmd) {
-            let about = child.get_about().map(ToString::to_string);
-            let line = format!(
-                "  {:width$}  {}",
-                child.get_name(),
-                about.unwrap_or_default()
-            );
+            let mut about = child
+                .get_about()
+                .map(ToString::to_string)
+                .unwrap_or_default();
+            if let Some(section) = elsewhere(child.get_name()) {
+                let _ = write!(about, " (see section {section})");
+            }
+            let line = format!("  {:width$}  {about}", child.get_name());
             let _ = writeln!(out, "{}", line.trim_end());
         }
     }
@@ -410,6 +704,19 @@ mod tests {
   $ tool box list
 ";
 
+    const SECTIONS: &[ContextSection] = &[
+        ContextSection {
+            name: "boxes",
+            summary: "Create and list boxes.",
+            commands: &["box"],
+        },
+        ContextSection {
+            name: "storage",
+            summary: "Organize shelves.",
+            commands: &["box shelf"],
+        },
+    ];
+
     fn fixture() -> Command {
         Command::new("tool")
             .version("1.2.3")
@@ -481,61 +788,131 @@ mod tests {
                             ),
                     )
                     .subcommand(Command::new("list").about("List boxes."))
+                    .subcommand(
+                        Command::new("shelf")
+                            .about("Manage shelves.")
+                            .subcommand(Command::new("add").about("Add a shelf.")),
+                    )
                     .subcommand(Command::new("secret").about("Hidden box.").hide(true)),
             )
             .subcommand(Command::new("ping").about("Ping the server."))
             .subcommand(Command::new("debug").about("Hidden command.").hide(true))
     }
 
-    fn render(path: &[&str]) -> Result<String> {
-        let path = path.iter().map(ToString::to_string).collect::<Vec<_>>();
-        render_context(&fixture(), &path)
+    fn render(target: &[&str]) -> Result<String> {
+        let target = target.iter().map(ToString::to_string).collect::<Vec<_>>();
+        render_context(&fixture(), SECTIONS, &target)
     }
 
     #[test]
-    fn renders_every_visible_command_with_usage() {
+    fn overview_lists_globals_and_leaf_commands_by_section() {
         let text = render(&[]).expect("render");
 
-        assert!(text.starts_with("# tool 1.2.3\n"), "{text}");
+        assert!(text.starts_with("# tool 1.2.3\n\nFixture CLI.\n"), "{text}");
+        assert!(
+            text.contains("Run `tool agent context <SECTION>`"),
+            "{text}"
+        );
+        assert!(text.contains("## Global flags"), "{text}");
+        assert!(text.contains("[env: TOOL_PROFILE]"), "{text}");
+        assert!(
+            text.contains(
+                "### boxes\n\nCreate and list boxes.\n\n  box create  Create a box.\n  box list    List boxes.\n"
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains("### storage\n\nOrganize shelves.\n\n  box shelf add  Add a shelf.\n"),
+            "{text}"
+        );
+        assert!(
+            !text.contains("Usage:"),
+            "overview should omit details:\n{text}"
+        );
+    }
+
+    #[test]
+    fn unclaimed_commands_fall_into_other_section() {
+        let text = render(&[]).expect("render");
+        assert!(text.contains("### other\n"), "{text}");
+        assert!(text.contains("  ping  Ping the server."), "{text}");
+
+        let other = render(&["other"]).expect("render other");
+        assert!(other.contains("## tool ping"), "{other}");
+    }
+
+    #[test]
+    fn section_renders_owned_commands_and_points_to_other_sections() {
+        let text = render(&["boxes"]).expect("render");
+
+        assert!(
+            text.starts_with("# tool 1.2.3: boxes\n\nCreate and list boxes.\n"),
+            "{text}"
+        );
+        assert!(
+            text.contains("Run `tool agent context` for global flags"),
+            "{text}"
+        );
         for heading in [
             "## tool box\n",
             "## tool box create\n",
             "## tool box list\n",
-            "## tool ping\n",
         ] {
             assert!(text.contains(heading), "missing {heading:?}:\n{text}");
         }
         assert!(
-            text.contains("Usage: tool box create [OPTIONS] <name> [-- <command>...]"),
+            text.contains("  shelf   Manage shelves. (see section storage)"),
             "{text}"
         );
-        assert!(text.contains("Aliases: bx"), "{text}");
-        assert!(text.contains("The box starts empty."), "{text}");
+        assert!(!text.contains("## tool box shelf"), "{text}");
+        assert!(!text.contains("## Global flags"), "{text}");
+        assert!(!text.contains("## tool ping"), "{text}");
+
+        let storage = render(&["storage"]).expect("render storage");
+        assert!(storage.contains("## tool box shelf\n"), "{storage}");
+        assert!(storage.contains("## tool box shelf add\n"), "{storage}");
+        assert!(!storage.contains("## tool box create"), "{storage}");
+    }
+
+    #[test]
+    fn command_path_renders_full_subtree_and_accepts_aliases() {
+        let text = render(&["bx"]).expect("render");
+
+        assert!(text.starts_with("# tool 1.2.3: bx\n"), "{text}");
+        for heading in [
+            "## tool box\n",
+            "## tool box create\n",
+            "## tool box shelf add\n",
+        ] {
+            assert!(text.contains(heading), "missing {heading:?}:\n{text}");
+        }
+        assert!(!text.contains("(see section"), "{text}");
+
+        let leaf = render(&["box", "create"]).expect("render leaf");
+        assert!(leaf.contains("## tool box create"), "{leaf}");
+        assert!(!leaf.contains("## tool box list"), "{leaf}");
+        assert!(
+            leaf.contains("Usage: tool box create [OPTIONS] <name> [-- <command>...]"),
+            "{leaf}"
+        );
+        assert!(leaf.contains("The box starts empty."), "{leaf}");
     }
 
     #[test]
     fn omits_hidden_commands_flags_and_help() {
-        let text = render(&[]).expect("render");
-
-        for hidden in [
-            "secret",
-            "debug",
-            "--legacy",
-            "--internal",
-            "--help",
-            "--version",
-        ] {
-            assert!(!text.contains(hidden), "unexpected {hidden:?}:\n{text}");
+        for target in [&[][..], &["boxes"][..], &["box"][..]] {
+            let text = render(target).expect("render");
+            for hidden in [
+                "secret",
+                "debug",
+                "--legacy",
+                "--internal",
+                "--help",
+                "--version",
+            ] {
+                assert!(!text.contains(hidden), "unexpected {hidden:?}:\n{text}");
+            }
         }
-    }
-
-    #[test]
-    fn lists_global_flags_once() {
-        let text = render(&[]).expect("render");
-
-        assert!(text.contains("## Global flags"), "{text}");
-        assert_eq!(text.matches("--profile").count(), 1, "{text}");
-        assert!(text.contains("[env: TOOL_PROFILE]"), "{text}");
     }
 
     #[test]
@@ -576,7 +953,7 @@ mod tests {
         let text = render(&["box"]).expect("render");
 
         assert!(
-            text.contains("Subcommands:\n  create  Create a box.\n  list    List boxes.\n"),
+            text.contains("Subcommands:\n  create  Create a box.\n  list    List boxes.\n  shelf   Manage shelves.\n"),
             "{text}"
         );
         assert!(
@@ -588,30 +965,21 @@ mod tests {
     }
 
     #[test]
-    fn path_narrows_output_and_accepts_aliases() {
-        let text = render(&["bx", "create"]).expect("render");
-
-        assert!(text.contains("## tool box create"), "{text}");
-        assert!(!text.contains("## tool box list"), "{text}");
-        assert!(!text.contains("## tool ping"), "{text}");
-        assert!(text.contains("## Global flags"), "{text}");
-    }
-
-    #[test]
-    fn unknown_or_hidden_path_lists_available_commands() {
-        for path in [&["bogus"][..], &["debug"][..]] {
-            let err = render(path).expect_err("unknown command should fail");
-            let message = err.to_string();
+    fn unknown_target_lists_sections_and_commands() {
+        for target in [&["bogus"][..], &["debug"][..], &["bogus", "create"][..]] {
+            let message = render(target).expect_err("unknown target").to_string();
+            assert!(message.contains("unknown section or command"), "{message}");
             assert!(
-                message.contains("Available under `tool`: box, ping"),
+                message.contains("Sections: boxes, storage, other"),
                 "{message}"
             );
+            assert!(message.contains("Commands: box, ping"), "{message}");
         }
 
         let err = render(&["box", "secret"]).expect_err("hidden subcommand should fail");
         assert!(
             err.to_string()
-                .contains("Available under `tool box`: create, list"),
+                .contains("Available under `tool box`: create, list, shelf"),
             "{err}"
         );
 
@@ -623,17 +991,66 @@ mod tests {
     }
 
     #[test]
-    fn output_is_deterministic_and_plain() {
-        let first = render(&[]).expect("render");
-        let second = render(&[]).expect("render");
-
-        assert_eq!(first, second);
-        assert!(
-            first.ends_with('\n') && !first.ends_with("\n\n"),
-            "{first:?}"
+    fn section_problems_require_complete_valid_assignment() {
+        assert_eq!(
+            section_problems(&fixture(), SECTIONS),
+            vec!["command `ping` is not in any section".to_string()]
         );
-        for line in first.lines() {
-            assert_eq!(line, line.trim_end(), "trailing whitespace in {line:?}");
+
+        let complete = [
+            SECTIONS[0],
+            SECTIONS[1],
+            ContextSection {
+                name: "network",
+                summary: "Check the server.",
+                commands: &["ping"],
+            },
+        ];
+        assert!(section_problems(&fixture(), &complete).is_empty());
+
+        let broken = [
+            ContextSection {
+                name: "box",
+                summary: "Collides with a command.",
+                commands: &["box", "bx create", "box secret"],
+            },
+            ContextSection {
+                name: "box",
+                summary: "Duplicate name and path.",
+                commands: &["box", "missing"],
+            },
+        ];
+        let problems = section_problems(&fixture(), &broken);
+        for expected in [
+            "section `box` has the same name as a command",
+            "section `box` names `bx create`, which is not a visible command",
+            "section `box` names `box secret`, which is not a visible command",
+            "section `box` is defined twice",
+            "command `box` is claimed by two sections",
+            "section `box` names `missing`, which is not a visible command",
+            "command `ping` is not in any section",
+        ] {
+            assert!(
+                problems.iter().any(|problem| problem == expected),
+                "missing {expected:?} in {problems:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn output_is_deterministic_and_plain() {
+        for target in [&[][..], &["boxes"][..], &["box"][..]] {
+            let first = render(target).expect("render");
+            let second = render(target).expect("render");
+
+            assert_eq!(first, second);
+            assert!(
+                first.ends_with('\n') && !first.ends_with("\n\n"),
+                "{first:?}"
+            );
+            for line in first.lines() {
+                assert_eq!(line, line.trim_end(), "trailing whitespace in {line:?}");
+            }
         }
     }
 }

@@ -180,42 +180,136 @@ fn gateway_add_rejects_removed_ssh_key_flag() {
     );
 }
 
+/// Upper bound for the overview every agent loads first. If this fails, move
+/// detail out of the overview rather than raising the bound casually.
+const AGENT_OVERVIEW_BUDGET_BYTES: usize = 10_000;
+/// Upper bound for one section. If this fails, split the section in
+/// `AGENT_SECTIONS` so agents keep loading only what they need.
+const AGENT_SECTION_BUDGET_BYTES: usize = 24_000;
+
+/// Section names and their leaf command paths, parsed from the overview.
+fn overview_sections(overview: &str) -> Vec<(String, Vec<String>)> {
+    let mut sections: Vec<(String, Vec<String>)> = Vec::new();
+    let body = overview
+        .split_once("\n## Sections\n")
+        .map_or("", |(_, body)| body);
+    for line in body.lines() {
+        if let Some(name) = line.strip_prefix("### ") {
+            sections.push((name.to_string(), Vec::new()));
+        } else if let Some(entry) = line.strip_prefix("  ")
+            && let Some((_, leaves)) = sections.last_mut()
+        {
+            let path = entry.split("  ").next().unwrap_or_default();
+            leaves.push(path.to_string());
+        }
+    }
+    sections
+}
+
 #[test]
-fn agent_context_prints_flat_reference_for_visible_commands() {
+fn agent_context_overview_lists_every_section_without_details() {
     // Force color to prove the reference stays plain even when styling is on.
     let output = run_isolated(&["--color", "always", "agent", "context"]);
     assert_eq!(output.code, 0, "agent context:\n{}", output.combined);
+    let overview = &output.stdout;
 
-    for heading in [
+    for expected in [
         "## Global flags",
-        "## openshell sandbox create",
-        "## openshell gateway add",
-        "## openshell policy update",
-        "## openshell provider refresh configure",
-        "## openshell workspace member add",
-        "## openshell agent context",
+        "## Sections",
+        "### sandboxes",
+        "### providers",
+        "  sandbox create",
+        "  provider refresh configure",
+        "  workspace member add",
+        "  agent context",
     ] {
         assert!(
-            output.stdout.contains(heading),
-            "expected '{heading}' in agent context:\n{}",
-            output.stdout
+            overview.contains(expected),
+            "expected '{expected}' in agent context overview:\n{overview}"
         );
     }
-    for hidden in [
-        "## openshell rule",
-        "## openshell doctor",
-        "## openshell ssh-proxy",
-        "  --keep\n",
+    for unexpected in ["### other", "Usage:", "doctor", "ssh-proxy", "\x1b"] {
+        assert!(
+            !overview.contains(unexpected),
+            "unexpected '{unexpected}' in agent context overview:\n{overview}"
+        );
+    }
+    assert!(
+        overview.len() <= AGENT_OVERVIEW_BUDGET_BYTES,
+        "agent context overview is {} bytes, over the {AGENT_OVERVIEW_BUDGET_BYTES}-byte budget",
+        overview.len()
+    );
+}
+
+#[test]
+fn agent_context_sections_document_every_overview_command() {
+    let overview = run_isolated(&["agent", "context"]);
+    assert_eq!(overview.code, 0, "agent context:\n{}", overview.combined);
+    let sections = overview_sections(&overview.stdout);
+    assert!(
+        sections.len() > 1,
+        "expected sections in overview:\n{}",
+        overview.stdout
+    );
+
+    for (name, leaves) in sections {
+        assert!(
+            !leaves.is_empty(),
+            "section '{name}' lists no commands in the overview:\n{}",
+            overview.stdout
+        );
+        let output = run_isolated(&["--color", "always", "agent", "context", &name]);
+        assert_eq!(output.code, 0, "agent context {name}:\n{}", output.combined);
+        for leaf in leaves {
+            let heading = format!("\n## openshell {leaf}\n");
+            assert!(
+                output.stdout.contains(&heading),
+                "section '{name}' is missing '{leaf}':\n{}",
+                output.stdout
+            );
+        }
+        for unexpected in ["## Global flags", "  --keep\n", "\x1b"] {
+            assert!(
+                !output.stdout.contains(unexpected),
+                "unexpected '{unexpected}' in section '{name}':\n{}",
+                output.stdout
+            );
+        }
+        assert!(
+            output.stdout.len() <= AGENT_SECTION_BUDGET_BYTES,
+            "section '{name}' is {} bytes, over the {AGENT_SECTION_BUDGET_BYTES}-byte budget",
+            output.stdout.len()
+        );
+    }
+}
+
+#[test]
+fn agent_context_section_points_to_related_sections() {
+    let output = run_isolated(&["agent", "context", "sandboxes"]);
+    assert_eq!(
+        output.code, 0,
+        "agent context sandboxes:\n{}",
+        output.combined
+    );
+
+    for expected in [
+        "## openshell sandbox create",
+        "## openshell logs",
+        "(see section providers)",
+        "(see section templates)",
     ] {
         assert!(
-            !output.stdout.contains(hidden),
-            "unexpected hidden entry '{hidden}' in agent context:\n{}",
+            output.stdout.contains(expected),
+            "expected '{expected}' in sandboxes section:\n{}",
             output.stdout
         );
     }
     assert!(
-        !output.stdout.contains('\x1b'),
-        "agent context must not contain ANSI escapes"
+        !output
+            .stdout
+            .contains("## openshell sandbox provider attach"),
+        "sandbox provider commands belong to the providers section:\n{}",
+        output.stdout
     );
 }
 
@@ -243,20 +337,20 @@ fn agent_context_narrows_to_command_path() {
 }
 
 #[test]
-fn agent_context_rejects_unknown_command_path() {
+fn agent_context_rejects_unknown_target() {
     let output = run_isolated(&["agent", "context", "bogus"]);
     assert_ne!(
         output.code, 0,
-        "unknown path should fail:\n{}",
+        "unknown target should fail:\n{}",
         output.combined
     );
-    assert!(
-        output
-            .combined
-            .contains("unknown command `openshell bogus`"),
-        "expected unknown command error:\n{}",
-        output.combined
-    );
+    for expected in ["unknown section or command `bogus`", "sandboxes"] {
+        assert!(
+            output.combined.contains(expected),
+            "expected '{expected}' in error:\n{}",
+            output.combined
+        );
+    }
 }
 
 #[test]
