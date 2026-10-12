@@ -6,7 +6,7 @@
 [CmdletBinding()]
 param(
     [Parameter(Mandatory = $true, Position = 0)]
-    [ValidateSet("check", "lint", "build", "build-mxc-fixtures", "test", "test-precommit", "test-unsupported", "test-mxc-real", "artifacts", "ci")]
+    [ValidateSet("check", "lint", "build", "build-mxc-fixtures", "test", "test-precommit", "test-unsupported", "test-mxc-real", "test-mxc-boundary", "test-mxc-loopback", "test-mxc-network", "artifacts", "ci")]
     [string] $Action,
 
     [Parameter(Position = 1)]
@@ -312,9 +312,18 @@ function Get-VsTargetArch([string] $RustTarget) {
     }
 }
 
+function Get-NativeHostArch {
+    # SSH may launch an emulated PowerShell; select the machine's native target.
+    switch ([Environment]::GetEnvironmentVariable('PROCESSOR_ARCHITECTURE', 'Machine')) {
+        'ARM64' { return 'arm64' }
+        'AMD64' { return 'amd64' }
+        default { throw 'Windows validation requires a native ARM64 or x64 machine.' }
+    }
+}
+
 function Assert-NativeTestTarget([string] $RustTarget) {
     $targetArch = Get-VsTargetArch $RustTarget
-    $hostArch = Get-HostArch
+    $hostArch = Get-NativeHostArch
     if ($targetArch -ne $hostArch) {
         throw "Windows tests require a native runner. Target $RustTarget maps to $targetArch, but the host is $hostArch."
     }
@@ -322,7 +331,7 @@ function Assert-NativeTestTarget([string] $RustTarget) {
 
 function Get-SelectedTargets([string] $RequestedTarget) {
     if ($RequestedTarget -eq "native") {
-        switch (Get-HostArch) {
+        switch (Get-NativeHostArch) {
             "arm64" { return @("aarch64-pc-windows-msvc") }
             default { return @("x86_64-pc-windows-msvc") }
         }
@@ -648,7 +657,7 @@ if ($Action -in @("test", "test-precommit", "test-unsupported", "test-mxc-real")
     }
 }
 
-if ($Action -in @("check", "lint", "build", "build-mxc-fixtures", "test", "test-precommit", "test-unsupported", "test-mxc-real", "ci")) {
+if ($Action -in @("check", "lint", "build", "build-mxc-fixtures", "test", "test-precommit", "test-unsupported", "test-mxc-real", "test-mxc-boundary", "test-mxc-loopback", "test-mxc-network", "ci")) {
     $z3Features = Configure-Z3
     $Z3WorkspaceFeatures = $z3Features.WorkspaceFeatures
     $Z3ServerFeatures = $z3Features.ServerFeatures
@@ -696,6 +705,32 @@ switch ($Action) {
     "test-unsupported" {
         foreach ($rustTarget in $targets) {
             Invoke-UnsupportedContractTests $rustTarget
+        }
+    }
+    "test-mxc-boundary" {
+        foreach ($rustTarget in $targets) {
+            Assert-NativeTestTarget $rustTarget
+            Invoke-VsCargo -RustTarget $rustTarget `
+                -CargoArgs "cargo test --release -p openshell-mxc-boundary --lib --target $rustTarget -- --test-threads=1" `
+                -LogName "test-$rustTarget-mxc-boundary.log"
+        }
+    }
+    "test-mxc-loopback" {
+        foreach ($rustTarget in $targets) {
+            Assert-NativeTestTarget $rustTarget
+            Invoke-VsCargo -RustTarget $rustTarget `
+                -CargoArgs "cargo test --release -p openshell-mxc-boundary --lib --target $rustTarget native_same_container_loopback -- --ignored --nocapture --test-threads=1" `
+                -LogName "test-$rustTarget-mxc-loopback.log"
+        }
+    }
+    "test-mxc-network" {
+        foreach ($rustTarget in $targets) {
+            Assert-NativeTestTarget $rustTarget
+            foreach ($testName in @('pc_https_egress_reads_injected_ca_bundle', 'pc_proxy_scopes_network_policy_to_socket_owner')) {
+                Invoke-VsCargo -RustTarget $rustTarget `
+                    -CargoArgs "cargo test --release -p openshell-driver-mxc --test wxc_exec_real --target $rustTarget $testName -- --ignored --exact --test-threads=1 --nocapture" `
+                    -LogName "test-$rustTarget-$testName.log"
+            }
         }
     }
     "test-mxc-real" {

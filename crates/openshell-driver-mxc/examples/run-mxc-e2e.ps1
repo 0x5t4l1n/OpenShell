@@ -766,6 +766,17 @@ try {
             Description = 'curl trusts the injected CA and observes the OpenShell HTTPS proxy certificate'
         }
     }
+    if ($Scenario -in @('socket-owner-allow', 'socket-owner-deny')) {
+        $allScenarios += @{
+            Name = $Scenario; PolicyFile = Join-Path $policyDir 'https-ca.yaml'
+            SandboxId = 'own'; Backends = 'process_container'; Kind = 'socket-owner'
+            PosTarget = Join-Path $DemoDir 'example.html'
+            ControlTarget = Join-Path $DemoDir 'owner-launched.txt'
+            ErrorTarget = Join-Path $DemoDir 'curl-stderr.txt'
+            ExpectAllowed = ($Scenario -eq 'socket-owner-allow')
+            Description = 'network policy follows child curl rather than parent cmd'
+        }
+    }
     if ($Scenario) {
         # Wrap in @() so an exact single match stays an array: without it a lone
         # match is a bare hashtable, its .Count is unreliable on PS 5.1, and
@@ -814,10 +825,13 @@ try {
                 $defaultDemoDir.Replace('\', '/'),
                 $DemoDir.Replace('\', '/')
             )
-            $curlExe = Join-Path $env:SYSTEMROOT 'System32/curl.exe'
+            $curlExe = [IO.Path]::Combine([IO.Path]::GetDirectoryName($cmdExe), 'curl.exe')
             # Preserve the exact Windows executable path used in the launch;
             # network binary identities are compared as strings, not FS paths.
             $policyText = $policyText.Replace('__CURL_EXE__', $curlExe.Replace("'", "''"))
+            if ($sc.Kind -eq 'socket-owner' -and -not $sc.ExpectAllowed) {
+                $policyText = $policyText.Replace($curlExe, $cmdExe)
+            }
             Set-Content -Path $policyUsed -Value $policyText -Encoding UTF8
 
             # Per-scenario gateway logs land in the bundle under their own names.
@@ -838,6 +852,12 @@ try {
                 } else {
                     $command = @($cmdExe, "/c", "echo denied 1> $denied")
                 }
+            } elseif ($sc.Kind -eq 'socket-owner') {
+                Remove-Item -LiteralPath $sc.PosTarget, $sc.ControlTarget, $sc.ErrorTarget -Force -ErrorAction SilentlyContinue
+                $child = 'echo launched > "{0}" && "{1}" --disable --fail --silent --show-error --max-time 30 --ssl-revoke-best-effort --cacert "%CURL_CA_BUNDLE%" --stderr "{2}" --output "{3}" https://example.com/' -f $sc.ControlTarget, $curlExe, $sc.ErrorTarget, $sc.PosTarget
+                $batch = Join-Path $DemoDir 'socket-owner.cmd'
+                Set-Content -LiteralPath $batch -Value ("@echo off`r`n" + $child + "`r`nexit /b %errorlevel%`r`n") -Encoding ASCII
+                $command = @($cmdExe, '/d', '/c', $batch)
             } elseif ($sc.Kind -eq 'https') {
                 if (-not (Test-Path -LiteralPath $curlExe)) { throw "Missing Windows curl: $curlExe" }
                 Remove-Item -LiteralPath $sc.PosTarget, $sc.CertificateTarget, $sc.ErrorTarget -Force -ErrorAction SilentlyContinue
@@ -913,7 +933,32 @@ try {
             $gwText = (Get-Content $gwLog, $gwErrLog -Raw -ErrorAction SilentlyContinue) -join "`n"
 
             # Evaluate.
-            if ($sc.Kind -eq 'https') {
+            if ($sc.Kind -eq 'socket-owner') {
+                try {
+                    if (-not (Wait-File $sc.ControlTarget 30)) { throw "parent cmd did not launch: $createOutStr" }
+                    $deadline = (Get-Date).AddSeconds(45)
+                    do {
+                        $curlError = Get-Content $sc.ErrorTarget -Raw -ErrorAction SilentlyContinue
+                        $response = (Test-Path -LiteralPath $sc.PosTarget) -and ((Get-Item $sc.PosTarget).Length -gt 0)
+                        if ($response -or $curlError) { break }
+                        Start-Sleep -Milliseconds 200
+                    } while ((Get-Date) -lt $deadline)
+                    if ($sc.ExpectAllowed) {
+                        if ($createExitCode -ne 0 -or -not $response -or (Get-Item $sc.PosTarget).Length -eq 0) {
+                            $curlError = Get-Content $sc.ErrorTarget -Raw -ErrorAction SilentlyContinue
+                            throw "allowed child curl failed: $curlError $createOutStr"
+                        }
+                    } else {
+                        $curlError = Get-Content $sc.ErrorTarget -Raw -ErrorAction SilentlyContinue
+                        if ($response -or $curlError -notmatch '403') { throw "expected child curl policy denial: $curlError" }
+                    }
+                    Ok "$($sc.Name): socket-owning child curl policy verified"
+                    $results += [pscustomobject]@{ Scenario=$sc.Name; Result='PASS'; Reason='child socket-owner policy verified' }
+                } catch {
+                    Bad "$($sc.Name): $($_.Exception.Message)"
+                    $results += [pscustomobject]@{ Scenario=$sc.Name; Result='FAIL'; Reason=$_.Exception.Message }
+                }
+            } elseif ($sc.Kind -eq 'https') {
                 try {
                     if ($createExitCode -ne 0) { throw "sandbox create failed: $createOutStr" }
                     if (-not (Wait-File $sc.CertificateTarget 60)) { throw 'HTTPS certificate absent' }

@@ -89,3 +89,9 @@ The bootstrap path must be absolute. Injected proxy CA files are stored beside
 the consumed bootstrap, under the generation's protected boundary-state
 directory already granted by the driver. They do not use ambient host
 APPDATA/TEMP paths, which may be isolated or inaccessible inside MXC.
+
+The host supervisor uses this library's Windows TCP owner lookup to attribute
+proxy connections to the socket-owning executable. Windows kernel calls remain
+in this library; the safe shared proxy receives measured per-connection identity.
+Provider environment keys are validated before initial launch and later updates,
+with case-insensitive collision detection and reserved TLS trust names rejected.

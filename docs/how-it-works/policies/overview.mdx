@@ -67,6 +67,11 @@ order:
 An invalid image policy keeps the workload from starting until you repair it.
 OpenShell does not skip it and use the default.
 
+For Windows MXC, network rules follow the executable that owns the TCP socket:
+allowing a shell does not automatically allow its child processes to connect.
+Provider environment names must be unique ignoring ASCII case and cannot use
+names reserved for OpenShell's injected TLS trust settings.
+
 ### Base and Effective Policies
 
 The selected sandbox policy is the base policy. Attached providers can

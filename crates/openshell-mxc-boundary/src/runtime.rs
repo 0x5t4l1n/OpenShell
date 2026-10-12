@@ -852,6 +852,9 @@ impl BoundaryRuntime {
                 return guest_error(BoundaryErrorKind::Denied, "MXC start policy changed");
             }
         }
+        if let Err(error) = validate_provider_environment(provider_env) {
+            return guest_error(BoundaryErrorKind::Invalid, error);
+        }
         let ca_paths = match install_ca_material(
             &self.runtime_directory,
             &self.config.generation,
@@ -1187,8 +1190,14 @@ fn workload_environment(
     ca_paths: Option<&(PathBuf, PathBuf)>,
 ) -> HashMap<String, String> {
     let mut environment = child.clone();
-    environment.extend(providers.clone());
-    environment.extend(overrides.iter().cloned());
+    // Provider values override child aliases using Windows environment semantics.
+    for (key, value) in providers
+        .iter()
+        .chain(overrides.iter().map(|(key, value)| (key, value)))
+    {
+        environment.retain(|existing, _| !existing.eq_ignore_ascii_case(key));
+        environment.insert(key.clone(), value.clone());
+    }
     for (key, value) in [
         ("HTTP_PROXY", proxy_url),
         ("HTTPS_PROXY", proxy_url),
@@ -1617,12 +1626,48 @@ fn guest_error(kind: BoundaryErrorKind, message: impl Into<String>) -> Response 
     }
 }
 
+/// Reject ambiguous Windows keys before launch or publication, without logging values.
+fn validate_provider_environment(environment: &HashMap<String, String>) -> Result<(), String> {
+    let mut seen = std::collections::BTreeMap::new();
+    let mut keys: Vec<_> = environment.keys().collect();
+    keys.sort();
+    for key in keys {
+        if key.is_empty() || key.contains(['=', '\0']) || environment[key].contains('\0') {
+            return Err("MXC provider environment contains an invalid key or value".into());
+        }
+        let folded = key.to_ascii_uppercase();
+        if [
+            "NODE_EXTRA_CA_CERTS",
+            "DENO_CERT",
+            "SSL_CERT_FILE",
+            "REQUESTS_CA_BUNDLE",
+            "CURL_CA_BUNDLE",
+            "GIT_SSL_CAINFO",
+        ]
+        .contains(&folded.as_str())
+        {
+            return Err(format!(
+                "MXC provider environment key {key:?} is reserved for TLS trust"
+            ));
+        }
+        if let Some(previous) = seen.insert(folded, key) {
+            return Err(format!(
+                "MXC provider environment keys {previous:?} and {key:?} collide on Windows"
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn publish_provider_environment(
     installed: &mut (u64, HashMap<String, String>, u64),
     generation: u64,
     revision: u64,
     environment: &HashMap<String, String>,
 ) -> Response {
+    if let Err(error) = validate_provider_environment(environment) {
+        return guest_error(BoundaryErrorKind::Invalid, error);
+    }
     // The revision is an opaque fingerprint, not publication order. A newer
     // generation can repair an identical revision or install a smaller value.
     let applied = generation > installed.2;
@@ -1814,6 +1859,42 @@ mod tests {
             "GIT_SSL_CAINFO",
         ] {
             assert_eq!(environment[key], bundle.display().to_string());
+        }
+    }
+
+    #[test]
+    fn provider_environment_overrides_case_aliases_in_child_environment() {
+        let child = HashMap::from([("token".into(), "old".into())]);
+        let providers = HashMap::from([("TOKEN".into(), "new".into())]);
+        let environment = workload_environment(&child, &providers, &[], "http://proxy", None);
+        assert!(!environment.contains_key("token"));
+        assert_eq!(environment["TOKEN"], "new");
+    }
+
+    #[test]
+    fn provider_publications_reject_ambiguous_or_reserved_keys_atomically() {
+        for environment in [
+            HashMap::from([
+                ("TOKEN".into(), "one".into()),
+                ("token".into(), "two".into()),
+            ]),
+            HashMap::from([("ssl_cert_file".into(), "untrusted".into())]),
+            HashMap::from([("Node_Extra_CA_Certs".into(), "untrusted".into())]),
+            HashMap::from([("BAD=KEY".into(), "value".into())]),
+        ] {
+            let mut installed = (7, HashMap::from([("GOOD".into(), "kept".into())]), 3);
+            let previous = installed.clone();
+            assert!(matches!(
+                publish_provider_environment(&mut installed, 4, 8, &environment),
+                Response::Error {
+                    kind: BoundaryErrorKind::Invalid,
+                    ..
+                }
+            ));
+            assert_eq!(
+                installed, previous,
+                "invalid publication must retain the prior environment"
+            );
         }
     }
 

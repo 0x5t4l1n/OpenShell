@@ -262,7 +262,7 @@ impl ProxyHandle {
         backend_host_gateway: Option<IpAddr>,
         network_mediation_source: Option<Arc<dyn NetworkMediationSource>>,
         policy_dns_store: Option<Arc<ResolvedEndpointStore>>,
-        direct_listener_identity: Option<ContractBinaryIdentity>,
+        direct_listener_identity: Option<Arc<crate::identity_source::ProxyIdentityResolver>>,
         required_proxy_authorization: Option<Arc<str>>,
     ) -> Result<Self> {
         // Use override bind_addr, fall back to policy http_addr, then default
@@ -470,7 +470,16 @@ impl ProxyHandle {
                             let stream: BoundaryDuplexStream = Box::new(stream);
                             (
                                 stream,
-                                direct_listener_identity.clone().map(Ok),
+                                direct_listener_identity.as_ref().map(|resolver| {
+                                    workload_addr.zip(proxy_addr).map_or_else(
+                                        || {
+                                            Err(ResolveError::Failed(
+                                                "direct proxy TCP endpoints unavailable".into(),
+                                            ))
+                                        },
+                                        |(workload, proxy)| resolver(workload, proxy),
+                                    )
+                                }),
                                 workload_addr.zip(proxy_addr),
                                 None,
                             )

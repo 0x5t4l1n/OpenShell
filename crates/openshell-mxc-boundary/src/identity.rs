@@ -129,7 +129,46 @@ mod tests {
     #[test]
     #[ignore = "requires native MXC with all host loopback and egress denied"]
     fn native_same_container_loopback() {
-        current_appcontainer_sid().expect("must run inside native MXC");
+        if std::env::var_os("OPENSHELL_MXC_LOOPBACK_CHILD").is_none() {
+            use base64::Engine as _;
+            let directory = tempfile::tempdir().unwrap();
+            let executable = directory.path().join("native-loopback-test.exe");
+            std::fs::copy(std::env::current_exe().unwrap(), &executable).unwrap();
+            let system_root = std::env::var("SYSTEMROOT").unwrap();
+            let request = serde_json::json!({
+                "version": "1.0.0", "containerId": "openshell-native-loopback-test",
+                "containment": "processcontainer",
+                "process": {
+                    "commandLine": format!("\"{}\" --exact identity::tests::native_same_container_loopback --ignored --nocapture", executable.display()),
+                    "cwd": directory.path(), "timeout": 60000,
+                    "env": [format!("SYSTEMROOT={system_root}"), format!("WINDIR={system_root}"),
+                        format!("LOCALAPPDATA={}", directory.path().display()), "OPENSHELL_MXC_LOOPBACK_CHILD=1".to_string()]
+                },
+                "filesystem": { "readwritePaths": [directory.path()] },
+                "network": { "egress": { "default": "deny" },
+                    "ingress": { "default": "deny", "hostLoopback": "deny" } }
+            });
+            let encoded = base64::engine::general_purpose::STANDARD
+                .encode(serde_json::to_vec(&request).unwrap());
+            let wxc = std::env::var("OPENSHELL_WXC_EXEC_PATH")
+                .unwrap_or_else(|_| "C:/Tools/MXC/wxc-exec.exe".into());
+            let output = std::process::Command::new(wxc)
+                .args(["--config-base64", &encoded])
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "native MXC loopback failed: {} {}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(
+                String::from_utf8_lossy(&output.stdout).contains("1 passed"),
+                "child test must execute"
+            );
+            return;
+        }
+        current_appcontainer_sid().expect("child must run inside native MXC");
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
         let client =

@@ -72,9 +72,8 @@ impl MxcLaunchDescriptor {
 }
 
 impl MxcProxyConfig {
-    /// Supply actual digest evidence for the configured main workload. This
-    /// retains MXC's existing fixed-main attribution; it is not per-connection
-    /// socket-owner or descendant identity discovery.
+    /// Supply digest evidence for launch metadata. Network enforcement resolves
+    /// the actual socket-owning executable separately for each connection.
     pub fn binary_identity(&self) -> Result<BinaryIdentity, BackendError> {
         self.validate()?;
         let bytes = std::fs::read(&self.workload_binary).map_err(|error| {

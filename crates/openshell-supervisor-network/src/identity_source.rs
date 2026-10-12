@@ -25,6 +25,12 @@ use std::sync::atomic::AtomicU32;
 use openshell_binary_identity::ProcfsIdentityResolver as SharedProcfsIdentityResolver;
 use openshell_isolation_interface::contract::{BinaryIdentity, ResolveError};
 
+/// Trusted platform resolver for an accepted direct-proxy TCP connection.
+/// Errors remain supplied errors: they must never fall back to launch identity.
+pub type ProxyIdentityResolver = dyn Fn(std::net::SocketAddr, std::net::SocketAddr) -> Result<BinaryIdentity, ResolveError>
+    + Send
+    + Sync;
+
 /// In-pod binary-identity resolver: reads and hashes the executable resolved
 /// for an accepted connection from procfs. Resolution fails closed; it never
 /// fabricates identity fields.

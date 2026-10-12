@@ -76,10 +76,10 @@ sensitive host-local services to workloads using this compatibility path.
 - The host supervisor owns an authenticated per-generation explicit proxy.
   Missing or cross-sandbox credentials receive HTTP 407 before policy
   evaluation. MXC denies direct Internet egress.
-- The current explicit-proxy path attributes traffic to the admitted main
-  workload binary. It does not distinguish descendant processes. MXC process
-  policy must therefore prevent an untrusted allowed child binary from
-  inheriting broader per-binary network rights.
+- The explicit proxy resolves the actual socket-owning executable from the
+  Windows kernel TCP table, hashes it, and rechecks ownership before policy
+  evaluation. Allowing a launcher such as `cmd.exe` does not authorize a child
+  such as `curl.exe`; missing, ambiguous, or changed ownership denies the request.
 - The loopback fence permits `127.0.0.1/32`; it does not isolate unrelated host
   services bound to that address. Treat the gateway host as trusted.
 - Host supervisor tokens and descriptors live beneath an owner-only Windows
@@ -297,3 +297,27 @@ or provider-backed inference scenarios to the six-scenario E2E runner.
 With `-KeepRunning`, the runner restores the caller's environment but retains
 the disposable CLI/runtime directory for the live gateway and prints its path.
 Remove that directory only after stopping the gateway.
+
+### Focused native qualification
+
+After building the native release binaries, run:
+
+```powershell
+mise run --skip-tools windows:test:mxc-boundary
+mise run --skip-tools windows:test:mxc-network
+mise run --skip-tools windows:test:mxc-loopback
+```
+
+The network task runs real injected-CA HTTPS and both child-curl policy cases.
+It requires Internet access. Native target selection uses the machine architecture,
+including when SSH launches an emulated PowerShell. The loopback task hosts its
+test inside a real ProcessContainer with host loopback denied; it is a separate
+qualification and never relaxes the fence or reports an unsupported run as a pass.
+On the ARM64 test host (Windows build 28120, MXC 1.0.0), this qualification
+currently fails with socket error 10013. Enabling the documented private-network
+capability while retaining host-loopback denial also fails; no safe OpenShell
+workaround has been established.
+
+Provider environment publications reject case-insensitive duplicate names,
+invalid environment entries, and names reserved for the six injected TLS trust
+variables before installing them. Rejected updates retain the prior revision.

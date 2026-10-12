@@ -63,13 +63,45 @@ impl PreparedBackend for MxcLaunch {
     fn build(self: Box<Self>, services: BackendServices) -> Result<BuiltBackend, BackendError> {
         let payload = self.descriptor.runtime.backend_descriptor()?.payload;
         let proxy = self.descriptor.proxy;
-        let binary_identity = proxy.binary_identity()?;
+        let identity_cache =
+            Arc::new(openshell_supervisor_network::identity::BinaryIdentityCache::new());
+        let identity_resolver = Arc::new(move |workload, listener| {
+            use openshell_isolation_interface::contract::{
+                BinaryIdentity, ExecutableIdentity, ResolveError,
+            };
+            let (path, pid) =
+                openshell_mxc_boundary::socket_owner::resolve_connection_owner(workload, listener)
+                    .map_err(ResolveError::Failed)?;
+            let hash = identity_cache
+                .verify_or_cache(&path)
+                .map_err(|error| ResolveError::Failed(error.to_string()))?;
+            let digest = hash.parse().map_err(|error| {
+                ResolveError::Failed(format!("invalid executable digest: {error}"))
+            })?;
+            // The connection must still have the same owner after integrity hashing.
+            if openshell_mxc_boundary::socket_owner::resolve_connection_owner(workload, listener)
+                .map_err(ResolveError::Failed)?
+                != (path.clone(), pid)
+            {
+                return Err(ResolveError::Failed(
+                    "proxy socket owner changed during identity resolution".into(),
+                ));
+            }
+            Ok(BinaryIdentity {
+                executable: ExecutableIdentity {
+                    path,
+                    digest: Some(digest),
+                },
+                ancestors: Vec::new(),
+                cmdline_paths: Vec::new(),
+            })
+        });
         Ok(BuiltBackend {
             payload,
             proxy_listener: Some(ProxyListenerConfig {
                 bind_addr: proxy.bind_addr,
                 authorization: proxy.authorization.into(),
-                binary_identity,
+                identity_resolver,
             }),
             backend: Arc::new(MxcRuntimeBackend::new(
                 services.ca_file_paths,

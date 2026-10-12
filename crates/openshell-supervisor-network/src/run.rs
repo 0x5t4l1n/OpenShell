@@ -46,7 +46,7 @@ use openshell_isolation_interface::contract::NetworkMediationSource;
 pub struct ProxyListenerConfig {
     pub bind_addr: SocketAddr,
     pub authorization: Arc<str>,
-    pub binary_identity: openshell_isolation_interface::contract::BinaryIdentity,
+    pub identity_resolver: Arc<crate::identity_source::ProxyIdentityResolver>,
 }
 
 impl std::fmt::Debug for ProxyListenerConfig {
@@ -54,7 +54,7 @@ impl std::fmt::Debug for ProxyListenerConfig {
         f.debug_struct("ProxyListenerConfig")
             .field("bind_addr", &self.bind_addr)
             .field("authorization", &"<redacted>")
-            .field("binary_identity", &self.binary_identity)
+            .field("identity_resolver", &"<per-connection>")
             .finish()
     }
 }
@@ -518,7 +518,7 @@ pub async fn run_networking(
                 .map(|runtime| runtime.store.clone()),
             proxy_listener
                 .as_ref()
-                .map(|proxy| proxy.binary_identity.clone()),
+                .map(|proxy| proxy.identity_resolver.clone()),
             proxy_listener
                 .as_ref()
                 .map(|proxy| proxy.authorization.clone()),

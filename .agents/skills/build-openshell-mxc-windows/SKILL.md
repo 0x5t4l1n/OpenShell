@@ -530,3 +530,17 @@ Every substantial Windows build run should report:
 | Artifacts | Binary paths, size, and SHA256 when available. |
 | Skips | Explicitly explain tests not run for a non-native architecture, unsupported driver package exclusions, and Windows cfg-gated tests. |
 | Follow-ups | Only concrete follow-ups tied to failures or requested scope. |
+
+## Focused MXC network qualification
+
+Use `mise run --skip-tools windows:test:mxc-boundary` for boundary unit tests and
+real Windows kernel socket-owner lookup. `windows:test:mxc-network` requires the
+native release build and Internet access; it runs the injected-CA HTTPS test and
+the allow-child/deny-child socket-owner regression through the authenticated
+harness. `windows:test:mxc-loopback` executes its test inside a real native MXC
+container with host loopback denied, separately from ordinary unit coverage.
+Do not enable broad host loopback to turn an unsupported-runtime failure green.
+The MSVC wrapper selects native test architecture from the machine environment,
+so an emulated SSH PowerShell does not incorrectly reject ARM64 qualification.
+Keep Windows kernel calls in the boundary library and retain shared supervisor
+unsafe-code bans, per-generation proxy authentication, and executable digests.
