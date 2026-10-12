@@ -1430,6 +1430,7 @@ pub struct CachedOpenShellClient {
 /// Settings poll result returned by [`CachedOpenShellClient::poll_settings`].
 #[derive(Clone, Debug)]
 pub struct SettingsPollResult {
+    pub service_routes: Vec<crate::proto::SandboxServiceRoute>,
     pub configuration_instance_id: String,
     pub configuration_admitted: bool,
     pub configuration_error: String,
@@ -1456,6 +1457,7 @@ pub struct SettingsPollResult {
 
 fn settings_poll_result(inner: crate::proto::GetSandboxConfigResponse) -> SettingsPollResult {
     SettingsPollResult {
+        service_routes: inner.service_routes,
         configuration_instance_id: inner.configuration_instance_id,
         configuration_admitted: inner.configuration_admitted,
         configuration_error: inner.configuration_error,

@@ -80,18 +80,67 @@ pub const DEFAULT_WORKSPACE_STORAGE_SIZE: &str = "2Gi";
 pub struct KubernetesSandboxRuntimeConfig {
     /// TCP port exposed by the workload boundary to its paired control pod.
     pub boundary_port: u16,
+    /// Operator-owned application ingress, disabled when omitted.
+    pub app_listener: Option<KubernetesAppListenerConfig>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct KubernetesAppListenerConfig {
+    pub port: u16,
+    pub service_domain: String,
+    /// TLS Secret in the supervisor namespace, with tls.crt and tls.key.
+    pub tls_secret_name: String,
 }
 
 impl Default for KubernetesSandboxRuntimeConfig {
     fn default() -> Self {
         Self {
             boundary_port: 5500,
+            app_listener: None,
         }
     }
 }
 
 impl KubernetesSandboxRuntimeConfig {
     pub fn validate(&self) -> Result<(), String> {
+        if let Some(app) = &self.app_listener {
+            if app.port < 1024 || app.port == self.boundary_port {
+                return Err(
+                    "app listener port must be unprivileged and distinct from boundary port".into(),
+                );
+            }
+            if app.service_domain.is_empty()
+                || app.service_domain.len() > 253
+                || !app.service_domain.split('.').all(|label| {
+                    !label.is_empty()
+                        && label.len() <= 63
+                        && !label.starts_with('-')
+                        && !label.ends_with('-')
+                        && label
+                            .bytes()
+                            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+                })
+            {
+                return Err("app listener service_domain must be a DNS domain".into());
+            }
+            if app.tls_secret_name.is_empty()
+                || app.tls_secret_name.len() > 253
+                || !app.tls_secret_name.split('.').all(|label| {
+                    !label.is_empty()
+                        && label.len() <= 63
+                        && !label.starts_with('-')
+                        && !label.ends_with('-')
+                        && label
+                            .bytes()
+                            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+                })
+            {
+                return Err(
+                    "app listener tls_secret_name must be a Kubernetes DNS subdomain".into(),
+                );
+            }
+        }
         if self.boundary_port < 1024 {
             return Err("sandbox_runtime.boundary_port must be at least 1024".to_string());
         }

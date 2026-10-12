@@ -148,6 +148,8 @@ mod tests {
     // Operator credential export adds four public messages and no durable types.
     // ListProvidersRequest field 4 adds a public-only label selector. Older
     // requests decode an empty selector; durable schemas remain unchanged.
+    // Sandbox service route snapshots add one public-only message. They reuse
+    // existing durable ServiceEndpoint declarations without a storage change.
     const PUBLIC_RPC_SCHEMA_SHA256: &str =
         "b6734ba353b4ffe81240309f7971ef48f6473e14ce2196412beabe1984b0548d";
     const DURABLE_SCHEMA_SHA256: &str =
@@ -621,7 +623,7 @@ mod tests {
                 overlap_hash.as_str(),
             ),
             (
-                (311, 27),
+                (312, 27),
                 (93, 21),
                 (81, 21),
                 PUBLIC_RPC_SCHEMA_SHA256,

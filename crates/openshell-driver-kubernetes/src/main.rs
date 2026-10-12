@@ -264,6 +264,7 @@ async fn main() -> Result<()> {
             supervisor_image_pull_policy: args.supervisor_image_pull_policy,
             sandbox_runtime: KubernetesSandboxRuntimeConfig {
                 boundary_port: args.sandbox_runtime_boundary_port,
+                app_listener: None,
             },
             https_proxy: args.https_proxy,
             no_proxy: args.no_proxy,

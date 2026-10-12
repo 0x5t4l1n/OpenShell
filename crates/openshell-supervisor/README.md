@@ -16,6 +16,14 @@ The client receives the supervisor's live provider state, bearer-token slot, and
 
 The setup interface stays private to the supervisor. It adds no runtime backend registration, endpoint configuration, or public factory API. The public `run_sandbox` signature and standard backend selection remain unchanged.
 
+## Application ingress
+
+The optional app listener terminates TLS separately from the gateway session. Operators enable it with `OPENSHELL_APP_LISTEN_ADDRESS`, `OPENSHELL_APP_SERVICE_DOMAIN`, `OPENSHELL_APP_TLS_CERT`, and `OPENSHELL_APP_TLS_KEY`; all four are required. The Kubernetes driver can supply these through `sandbox_runtime.app_listener` and a TLS Secret. Certificates reload on supervisor recreation.
+
+SNI selects a declared service using `<workspace>--<sandbox>--<service>.<domain>`. HTTP Host must match SNI. An unnamed service omits the final `--<service>`. The listener connects to the declared port through `BoundaryLoopbackConnector`, preserving the isolation backend's mediation. Gateway configuration polling supplies a complete route snapshot independently of policy revisions. Withdrawal, configuration rejection, or a stale 30-second snapshot closes affected connections.
+
+This initial listener supports HTTP/1.1 and WebSockets, limits connections to 64, and uses 10-second TLS, header, and connect deadlines. It requires gateway-managed policy. Existing service authorization modes govern bearer stripping or passthrough; operators provide edge authentication and listener reachability. Discovery and ingress provisioning are separate components. See the [manual Kubernetes smoke test](../../e2e/kubernetes/app-listener/README.md).
+
 ## Console logging
 
 Diagnostics and OCSF shorthand share a bounded, nonblocking stderr writer. With `ocsf_json_enabled=true`, the same writer also receives timestamped `OCSF-JSON` records. Each formatter submits a complete line in one write so concurrent producers cannot interleave records in the queue. The 1,024-line queue drops new lines when full rather than waiting for stderr.

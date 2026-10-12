@@ -51,6 +51,8 @@ Use `openshell --help` and nested `--help` output as the authority for the insta
 
 ## Workflow
 
+For direct supervisor app ingress, check the operator's `sandbox_runtime.app_listener` configuration, TLS Secret in the supervisor namespace, Service selector, and endpoint readiness. A Service must select supervisor Pods rather than workload Pods. Clients need matching service SNI and HTTP Host. Configuration refresh failures expire app routes after 30 seconds; gateway service URLs still use the gateway relay path. Refer to the published gateway configuration reference for listener fields and limits.
+
 Run diagnostics in order and stop once the root cause is clear.
 
 ### Step 1: Check CLI Reachability

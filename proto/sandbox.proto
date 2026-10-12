@@ -449,6 +449,21 @@ message GetSandboxConfigResponse {
   string configuration_error = 16;
   // Registration fence for a new supervisor; capture once and retain on retry.
   string configuration_instance_id = 15;
+  // Complete gateway-owned ingress declarations for this sandbox. An empty
+  // list withdraws every route. Service changes do not change policy revision.
+  repeated SandboxServiceRoute service_routes = 17;
+}
+
+// A declared service reached through the supervisor's application listener.
+// The supervisor binds this to its authenticated sandbox identity and boundary.
+message SandboxServiceRoute {
+  string endpoint_id = 1;
+  string name = 2;
+  uint32 target_port = 3;
+  // Matches ServiceAuthorizationMode: 1 = strip, 2 = bearer passthrough.
+  // Unknown values must be rejected, never interpreted as passthrough.
+  int32 authorization_mode = 4;
+  uint64 resource_version = 5;
 }
 
 // Connection details for one operator-registered supervisor middleware service.

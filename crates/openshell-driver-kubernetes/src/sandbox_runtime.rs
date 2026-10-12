@@ -234,6 +234,7 @@ pub fn supervisor_pod(
     provider_spiffe_socket_path: Option<&str>,
     owner: OwnerReference,
     tracing_environment: &[(&str, String)],
+    app_listener: Option<&crate::config::KubernetesAppListenerConfig>,
 ) -> Result<Pod, String> {
     let labels = control_labels(sandbox_id, gateway_id);
     let mut environment = vec![
@@ -275,6 +276,23 @@ pub fn supervisor_pod(
             .iter()
             .map(|(name, value)| env_var(name, value)),
     );
+    if let Some(app) = app_listener {
+        environment.extend([
+            env_var(
+                "OPENSHELL_APP_LISTEN_ADDRESS",
+                &format!("0.0.0.0:{}", app.port),
+            ),
+            env_var("OPENSHELL_APP_SERVICE_DOMAIN", &app.service_domain),
+            env_var(
+                "OPENSHELL_APP_TLS_CERT",
+                "/var/run/secrets/openshell-app/tls.crt",
+            ),
+            env_var(
+                "OPENSHELL_APP_TLS_KEY",
+                "/var/run/secrets/openshell-app/tls.key",
+            ),
+        ]);
+    }
     if let Some(server_name) = gateway_tls_server_name(grpc_endpoint) {
         environment.push(env_var(
             openshell_core::sandbox_env::GATEWAY_TLS_SERVER_NAME,
@@ -447,6 +465,25 @@ pub fn supervisor_pod(
     };
     if let Some(policy) = supervisor_pull_policy {
         container.image_pull_policy = Some(policy.as_kubernetes_str().to_string());
+    }
+    if let Some(app) = app_listener {
+        container
+            .volume_mounts
+            .as_mut()
+            .expect("supervisor mounts")
+            .push(volume_mount(
+                "app-tls",
+                "/var/run/secrets/openshell-app",
+                true,
+            ));
+        volumes.push(secret_volume("app-tls", &app.tls_secret_name, None));
+        container.ports.get_or_insert_with(Vec::new).push(
+            k8s_openapi::api::core::v1::ContainerPort {
+                name: Some("app-https".into()),
+                container_port: i32::from(app.port),
+                ..Default::default()
+            },
+        );
     }
     Ok(Pod {
         metadata: ObjectMeta {
@@ -810,6 +847,13 @@ mod tests {
     }
 
     fn supervisor_pod_with_client_tls(client_tls: SupervisorClientTls<'_>) -> Pod {
+        supervisor_pod_with_app(client_tls, None)
+    }
+
+    fn supervisor_pod_with_app(
+        client_tls: SupervisorClientTls<'_>,
+        app: Option<&crate::config::KubernetesAppListenerConfig>,
+    ) -> Pod {
         supervisor_pod(
             "sandbox",
             &SandboxRuntimeNames::new("pair"),
@@ -836,6 +880,7 @@ mod tests {
             None,
             owner(),
             &[],
+            app,
         )
         .expect("render supervisor Pod")
     }
@@ -901,6 +946,7 @@ mod tests {
                 ),
                 ("TRACEPARENT", TRACEPARENT.to_string()),
             ],
+            None,
         )
         .expect("render supervisor Pod");
         let environment = pod.spec.expect("Pod spec").containers[0]
@@ -1021,6 +1067,7 @@ mod tests {
             None,
             owner(),
             &[],
+            None,
         )
         .expect("render supervisor Pod");
         let pod_spec = pod.spec.as_ref().expect("Pod spec");
@@ -1279,6 +1326,7 @@ mod tests {
             None,
             owner(),
             &[],
+            None,
         )
         .expect("render supervisor Pod")
     }
@@ -1360,5 +1408,64 @@ mod tests {
                 .starts_with("-----BEGIN CERTIFICATE-----")
         );
         assert!(material.private_key_pem.contains("PRIVATE KEY"));
+    }
+    #[test]
+    fn app_listener_mounts_operator_tls_only_on_supervisor() {
+        let app = crate::config::KubernetesAppListenerConfig {
+            port: 8443,
+            service_domain: "svc.openshell.internal".into(),
+            tls_secret_name: "app-tls".into(),
+        };
+        let pod = supervisor_pod_with_app(SupervisorClientTls::Disabled, Some(&app));
+        let env: BTreeMap<_, _> = pod.spec.as_ref().unwrap().containers[0]
+            .env
+            .as_ref()
+            .unwrap()
+            .iter()
+            .map(|variable| {
+                (
+                    variable.name.clone(),
+                    variable.value.clone().unwrap_or_default(),
+                )
+            })
+            .collect();
+        assert_eq!(env["OPENSHELL_APP_LISTEN_ADDRESS"], "0.0.0.0:8443");
+        assert_eq!(
+            env["OPENSHELL_APP_SERVICE_DOMAIN"],
+            "svc.openshell.internal"
+        );
+        let spec = pod.spec.unwrap();
+        assert_eq!(
+            spec.containers[0].ports.as_ref().unwrap()[0].container_port,
+            8443
+        );
+        let volume = spec
+            .volumes
+            .unwrap()
+            .into_iter()
+            .find(|v| v.name == "app-tls")
+            .unwrap();
+        assert_eq!(
+            volume.secret.unwrap().secret_name.as_deref(),
+            Some("app-tls")
+        );
+        assert!(
+            spec.containers[0]
+                .volume_mounts
+                .as_ref()
+                .unwrap()
+                .iter()
+                .any(|v| v.name == "app-tls" && v.read_only == Some(true))
+        );
+        let disabled = supervisor_pod_with_client_tls(SupervisorClientTls::Disabled);
+        assert!(
+            disabled
+                .spec
+                .unwrap()
+                .volumes
+                .unwrap()
+                .iter()
+                .all(|v| v.name != "app-tls")
+        );
     }
 }

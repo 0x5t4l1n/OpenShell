@@ -1275,4 +1275,70 @@ mod tests {
             err.code()
         );
     }
+    #[tokio::test]
+    async fn sandbox_config_delivers_only_current_sandbox_service_routes() {
+        let state = test_server_state().await;
+        seed_sandbox(&state, "route-a").await;
+        seed_sandbox(&state, "route-b").await;
+        handle_expose_service(
+            &state,
+            authed_request(ExposeServiceRequest {
+                sandbox: "route-a".into(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
+                name: "web".into(),
+                target_port: 8080,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        let sandbox = state
+            .store
+            .get_message::<Sandbox>("sandbox-route-a")
+            .await
+            .unwrap()
+            .unwrap();
+        let before = crate::grpc::policy::load_sandbox_config(&state, &sandbox)
+            .await
+            .unwrap();
+        assert_eq!(before.service_routes.len(), 1);
+        assert_eq!(before.service_routes[0].target_port, 8080);
+        let other = state
+            .store
+            .get_message::<Sandbox>("sandbox-route-b")
+            .await
+            .unwrap()
+            .unwrap();
+        let other_config = crate::grpc::policy::load_sandbox_config(&state, &other)
+            .await
+            .unwrap();
+        assert!(other_config.service_routes.is_empty());
+        let mut replacement = sandbox.clone();
+        replacement.metadata.as_mut().unwrap().id = "replacement-id".into();
+        let replacement_config = crate::grpc::policy::load_sandbox_config(&state, &replacement)
+            .await
+            .unwrap();
+        assert!(replacement_config.service_routes.is_empty());
+        handle_expose_service(
+            &state,
+            authed_request(ExposeServiceRequest {
+                sandbox: "route-a".into(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
+                name: "web".into(),
+                target_port: 9000,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        let after = crate::grpc::policy::load_sandbox_config(&state, &sandbox)
+            .await
+            .unwrap();
+        assert_eq!(after.service_routes[0].target_port, 9000);
+        assert_ne!(
+            before.service_routes[0].resource_version,
+            after.service_routes[0].resource_version
+        );
+        assert_eq!(before.config_revision, after.config_revision);
+    }
 }
