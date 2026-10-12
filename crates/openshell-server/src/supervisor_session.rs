@@ -2731,6 +2731,13 @@ async fn handle_supervisor_message(
                 ),
             }
         }
+        Some(supervisor_message::Payload::ServiceAdvertisement(advertisement)) => {
+            if let Err(error) =
+                crate::grpc::service_advertisement::accept(state, owner_guard, advertisement).await
+            {
+                warn!(%error, %sandbox_id, "supervisor service advertisement rejected");
+            }
+        }
         Some(supervisor_message::Payload::RelayOpenResult(result)) => {
             if result.success {
                 info!(

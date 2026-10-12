@@ -51,6 +51,8 @@ Use `openshell --help` and nested `--help` output as the authority for the insta
 
 ## Workflow
 
+For app route advertisements, verify that `supervisor_app_address_template` and `supervisor_app_service_domain` are both configured on the gateway, and that the domain matches the supervisor listener. Addresses must reach the app listener; advertisements prove route installation, not application health.
+
 For direct supervisor app ingress, check the operator's `sandbox_runtime.app_listener` configuration, TLS Secret in the supervisor namespace, Service selector, and endpoint readiness. A Service must select supervisor Pods rather than workload Pods. Clients need matching service SNI and HTTP Host. Configuration refresh failures expire app routes after 30 seconds; gateway service URLs still use the gateway relay path. Refer to the published gateway configuration reference for listener fields and limits.
 
 Run diagnostics in order and stop once the root cause is clear.

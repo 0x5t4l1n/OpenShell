@@ -152,7 +152,7 @@ streams during gateway rollouts and scale events.
 
 ### TLS behaviour
 
-For direct supervisor app-listener testing, use Skaffold's `app-listener` profile and the manual Service/TLS procedure in `e2e/kubernetes/app-listener/README.md`. It mounts an operator-created `openshell-app-tls` Secret only into supervisor Pods and enables port 8443. The gateway can remain plaintext. This profile creates no app Services or discovery proxy; check SNI/Host against a manually selected supervisor Service. Add a separate NetworkPolicy permitting the designated ingress source to reach supervisor port 8443, then test ClusterIP reachability; port-forward bypasses that network path.
+For direct supervisor app-listener testing, use Skaffold's `app-listener` profile and the manual Service/TLS procedure in `e2e/kubernetes/app-listener/README.md`. It mounts an operator-created `openshell-app-tls` Secret only into supervisor Pods and enables port 8443. The gateway can remain plaintext. The profile enables gateway publication using the trusted `<sandbox>-ingress.openshell.svc.cluster.local:443` address template and matching service domain. It creates no app Services or discovery proxy; check SNI/Host against a manually selected supervisor Service. Add a separate NetworkPolicy permitting the designated ingress source to reach supervisor port 8443, then test ClusterIP reachability; port-forward bypasses that network path.
 
 `ci/values-skaffold.yaml` sets `server.disableTls: true`, so Skaffold-based deploys run
 plaintext by default. Override `server.disableTls=false` to exercise TLS/mTLS.

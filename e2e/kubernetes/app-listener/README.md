@@ -27,7 +27,7 @@ KUBECONFIG=kubeconfig kubectl -n openshell create secret tls openshell-app-tls \
   --cert="$app_tls_dir/tls.crt" --key="$app_tls_dir/tls.key"
 ```
 
-Deploy using the `app-listener` Skaffold profile:
+Deploy using the `app-listener` Skaffold profile. It also configures the gateway to publish installed routes at manually created `<sandbox>-ingress` Services in `openshell`:
 
 ```shell
 KUBECONFIG=../../../kubeconfig mise exec -- skaffold run -p app-listener

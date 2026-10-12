@@ -20,6 +20,8 @@ fn ocsf_ctx() -> &'static openshell_ocsf::EventContext {
 /// Supervisor-owned SSH and gateway-session tasks for a running sandbox.
 pub struct BoundaryAccess {
     instance_id: String,
+    service_advertisements:
+        tokio::sync::watch::Sender<Option<openshell_core::proto::SupervisorServiceAdvertisement>>,
     terminating: Arc<AtomicBool>,
     ssh_task: Option<tokio::task::JoinHandle<()>>,
     session_task: Option<tokio::task::JoinHandle<()>>,
@@ -28,6 +30,15 @@ pub struct BoundaryAccess {
 }
 
 impl BoundaryAccess {
+    /// Latest complete app route snapshot, replayed on gateway reconnect.
+    #[must_use]
+    pub fn service_advertisement_sender(
+        &self,
+    ) -> tokio::sync::watch::Sender<Option<openshell_core::proto::SupervisorServiceAdvertisement>>
+    {
+        self.service_advertisements.clone()
+    }
+
     /// Stable supervisor instance ID used for lifecycle reporting.
     #[must_use]
     pub fn instance_id(&self) -> &str {
@@ -90,10 +101,12 @@ pub async fn start_boundary_access(
     host_key: Option<russh::keys::PrivateKey>,
 ) -> Result<BoundaryAccess> {
     let instance_id = uuid::Uuid::new_v4().to_string();
+    let (service_advertisements, service_advertisement_rx) = tokio::sync::watch::channel(None);
     let terminating = Arc::new(AtomicBool::new(false));
     let Some(ssh_socket_path) = ssh_socket_path.map(std::path::PathBuf::from) else {
         return Ok(BoundaryAccess {
             instance_id,
+            service_advertisements,
             terminating,
             ssh_task: None,
             session_task: None,
@@ -169,6 +182,7 @@ pub async fn start_boundary_access(
                 crate::supervisor_session::SessionRuntimeContext {
                     instance_id: instance_id.clone(),
                     session_id_updates: supervisor_session_updates,
+                    service_advertisements: service_advertisement_rx,
                 },
             );
             // Session establishment retries through gateway restarts. The
@@ -181,6 +195,7 @@ pub async fn start_boundary_access(
 
     Ok(BoundaryAccess {
         instance_id,
+        service_advertisements,
         terminating,
         ssh_task: Some(ssh_task),
         session_task,
@@ -246,6 +261,7 @@ mod tests {
         let main_session = crate::main_session::MainSession::inert();
         let access = BoundaryAccess {
             instance_id: "instance".to_string(),
+            service_advertisements: tokio::sync::watch::channel(None).0,
             terminating: Arc::new(AtomicBool::new(false)),
             ssh_task: None,
             session_task: None,

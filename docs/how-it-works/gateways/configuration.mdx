@@ -776,6 +776,18 @@ Omit this table to keep the listener disabled. The Secret must exist in each sup
 
 For Helm, use the same fields under `gatewayConfig["openshell.drivers.kubernetes"].sandbox_runtime.app_listener`. Create Services or ingress routes targeting supervisor pods yourself, and add a NetworkPolicy allowing only the intended ingress sources to reach the app port; this configuration does not create them or change the CLI's gateway service URLs. Clients must send matching TLS SNI and HTTP Host for a declared service. The listener supports HTTP/1.1 and WebSockets, with 64 connections, 10-second handshake/header/connect deadlines, and a 30-second configuration freshness lease. Service updates take effect through configuration polling. Gateway-managed policy is required; local policy overrides are unsupported for this listener. Service declarations form the ingress allowlist; existing egress rules do not grant ingress access. Protect listener reachability when an edge proxy supplies authentication.
 
+To publish accepted app routes, set both gateway fields:
+
+```toml
+[openshell.gateway]
+supervisor_app_service_domain = "svc.openshell.internal"
+supervisor_app_address_template = "{sandbox}-ingress.openshell.svc.cluster.local:443"
+```
+
+The address template supports `{sandbox_id}`, `{sandbox}`, and `{workspace}` and must resolve to `host:port`. Addresses come from this trusted operator configuration, not supervisor reports. The example assumes manually created `<sandbox>-ingress` Services in `openshell`; no Services are provisioned automatically. The listener domain must match the configured publication domain.
+
+Supervisors advertise only installed declarations over their authenticated gateway session. Reports are fenced by session, runtime instance, sequence, and declaration revision, and expire within 30 seconds. An advertisement means a route was installed, not that its application passed a health check. Losing ownership or changing a declaration invalidates the old advertisement.
+
 The gateway runs as a Pod and creates paired workload and supervisor Pods in another namespace. The gateway CA is projected from a Kubernetes Secret into supervisor Pods; user client certificate and key entries in that Secret are not exposed to either Pod.
 
 ```toml

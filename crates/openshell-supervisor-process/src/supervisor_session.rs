@@ -43,6 +43,8 @@ pub struct SessionRuntimeContext {
     pub instance_id: String,
     /// Publishes the currently accepted gateway session to sibling reporters.
     pub session_id_updates: Option<watch::Sender<Option<String>>>,
+    pub service_advertisements:
+        watch::Receiver<Option<openshell_core::proto::SupervisorServiceAdvertisement>>,
 }
 
 /// Parse a gRPC endpoint URI into an OCSF `Endpoint` (host + port). Falls back
@@ -335,6 +337,7 @@ pub fn spawn_with_readiness(
         terminating,
         instance_id: runtime.instance_id,
         session_id_updates: runtime.session_id_updates,
+        service_advertisements: runtime.service_advertisements,
         ready_tx,
     };
     (tokio::spawn(run_session_loop(config)), ready_rx)
@@ -350,6 +353,8 @@ struct SessionConfig {
     instance_id: String,
     /// Publishes the currently accepted session to sibling control-plane reporters.
     session_id_updates: Option<watch::Sender<Option<String>>>,
+    service_advertisements:
+        watch::Receiver<Option<openshell_core::proto::SupervisorServiceAdvertisement>>,
     ready_tx: watch::Sender<bool>,
 }
 
@@ -563,12 +568,35 @@ async fn run_single_session(
     ocsf_emit!(event);
     config.ready_tx.send_replace(true);
 
+    let mut advertisements = config.service_advertisements.clone();
+    let mut report_sequence = 0_u64;
+    let mut publication_pending = true;
+    let mut advertisements_open = true;
     // Main loop: receive gateway messages + send heartbeats.
     let mut heartbeat_interval = tokio::time::interval(Duration::from_secs(heartbeat_secs));
     heartbeat_interval.tick().await; // skip immediate tick
 
     loop {
+        if publication_pending {
+            publication_pending = false;
+            let snapshot = advertisements.borrow_and_update().clone();
+            if let Some(mut snapshot) = snapshot {
+                report_sequence = report_sequence
+                    .checked_add(1)
+                    .ok_or("service advertisement sequence exhausted")?;
+                snapshot.report_sequence = report_sequence;
+                tx.send(SupervisorMessage {
+                    payload: Some(supervisor_message::Payload::ServiceAdvertisement(snapshot)),
+                })
+                .await
+                .map_err(|_| "outbound channel closed")?;
+            }
+        }
         tokio::select! {
+            changed = advertisements.changed(), if advertisements_open => {
+                if changed.is_err() { advertisements_open = false; }
+                else { publication_pending = true; }
+            }
             msg = inbound.message() => {
                 let msg = match map_session_stream_message(
                     msg,

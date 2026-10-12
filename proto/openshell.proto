@@ -3043,7 +3043,19 @@ message SupervisorMessage {
     SupervisorHeartbeat heartbeat = 2;
     RelayOpenResult relay_open_result = 3;
     RelayClose relay_close = 4;
+    SupervisorServiceAdvertisement service_advertisement = 5;
   }
+}
+
+// Complete accepted app routes for this authenticated supervisor session.
+// Addresses are derived by the gateway from operator configuration, never supplied here.
+// An empty route list withdraws prior routes. Expiry cannot exceed the gateway lease cap.
+message SupervisorServiceAdvertisement {
+  string service_domain = 1;
+  repeated openshell.sandbox.v1.SandboxServiceRoute routes = 2;
+  google.protobuf.Timestamp expires_at = 3;
+  // Monotonic within one ConnectSupervisor session; assigned when sending.
+  uint64 report_sequence = 4;
 }
 
 // Envelope for gateway-to-supervisor messages on the ConnectSupervisor stream.
