@@ -91,6 +91,9 @@ pub struct KubernetesAppListenerConfig {
     pub service_domain: String,
     /// TLS Secret in the supervisor namespace, with tls.crt and tls.key.
     pub tls_secret_name: String,
+    /// Create a stable headless Service owned by the sandbox CR.
+    #[serde(default)]
+    pub create_service: bool,
 }
 
 impl Default for KubernetesSandboxRuntimeConfig {

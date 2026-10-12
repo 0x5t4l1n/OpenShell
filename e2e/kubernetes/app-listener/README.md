@@ -1,6 +1,6 @@
 # Supervisor app listener smoke test
 
-This opt-in development path exercises supervisor TLS/SNI routing through a manually created Kubernetes Service. It needs no discovery API, proxy component, or ingress controller. Use the repository's Helm dev environment and a CLI built from this checkout.
+This opt-in development path exercises supervisor TLS/SNI routing through driver-managed headless supervisor Services. Direct listener testing needs no proxy component or ingress controller. Use the repository's Helm dev environment and a CLI built from this checkout.
 
 ## Deploy
 
@@ -27,7 +27,7 @@ KUBECONFIG=kubeconfig kubectl -n openshell create secret tls openshell-app-tls \
   --cert="$app_tls_dir/tls.crt" --key="$app_tls_dir/tls.key"
 ```
 
-Deploy using the `app-listener` Skaffold profile. It also configures the gateway to publish installed routes at manually created `<sandbox>-ingress` Services in `openshell`:
+Deploy using the `app-listener` Skaffold profile. It also configures the gateway to publish installed routes at driver-managed `os-app-<sandbox-id>` headless Services in `openshell`:
 
 ```shell
 KUBECONFIG=../../../kubeconfig mise exec -- skaffold run -p app-listener
@@ -44,27 +44,11 @@ openshell service expose app-a 8080 web
 
 Allow one successful configuration poll (normally 10 seconds) for the named route to install. The listener requires gateway-managed policy and does not accept local policy overrides. The printed service URL still belongs to the existing gateway path in this slice; use the supervisor URL below.
 
-## Create the Service
+## Inspect the headless Service
 
-Find the supervisor pod for `app-a`, inspect its `openshell.ai/sandbox-id` label, and substitute that ID:
+The profile sets `app_listener.create_service: true`. Resolve the sandbox ID and inspect `os-app-<sandbox-id>` in its namespace. Confirm `clusterIP: None`, the supervisor-only selector, and ready EndpointSlices. Headless DNS resolves directly to supervisor Pod IPs; use port 8443 because it does not translate port 443.
 
-```yaml
-apiVersion: v1
-kind: Service
-metadata:
-  name: app-a-ingress
-  namespace: openshell
-spec:
-  selector:
-    openshell.ai/sandbox-id: REPLACE_WITH_SANDBOX_ID
-    openshell.ai/component: supervisor
-  ports:
-    - name: app-https
-      port: 443
-      targetPort: 8443
-```
-
-Apply it manually. Confirm its EndpointSlice selects the supervisor, not the workload pod. The Secret and Service must be in the sandbox's actual namespace; this profile assumes shared placement in `openshell`.
+The Sandbox CR owns the Service, which survives stop/start and disappears on sandbox deletion. Leave `create_service` false to supply your own endpoints.
 
 The existing SSH ingress policy blocks the app port. Add a separate policy that allows your ingress client or controller to reach only supervisor app ports. For a same-namespace test client labeled `openshell.ai/app-ingress-client=true`:
 
@@ -93,8 +77,8 @@ Keep workload network policies in place. Adapt the source selector and namespace
 
 ```shell
 KUBECONFIG=kubeconfig kubectl -n openshell get endpointslices \
-  -l kubernetes.io/service-name=app-a-ingress -o wide
-KUBECONFIG=kubeconfig kubectl -n openshell port-forward svc/app-a-ingress 18443:443
+  -l kubernetes.io/service-name=os-app-REPLACE_WITH_SANDBOX_ID -o wide
+KUBECONFIG=kubeconfig kubectl -n openshell port-forward svc/os-app-REPLACE_WITH_SANDBOX_ID 18443:8443
 ```
 
 ## Verify routing
@@ -115,7 +99,7 @@ Port-forwarding verifies routing and a selected backend, but bypasses normal Ser
 
 ```shell
 curl --cacert /tmp/app-cert.crt \
-  --connect-to default--app-a--web.svc.openshell.internal:443:app-a-ingress.openshell.svc.cluster.local:443 \
+  --connect-to default--app-a--web.svc.openshell.internal:443:os-app-REPLACE_WITH_SANDBOX_ID.openshell.svc.cluster.local:8443 \
   https://default--app-a--web.svc.openshell.internal/
 ```
 
@@ -137,4 +121,4 @@ grpcurl -plaintext -import-path proto -proto openshell.proto \
 
 Use `WatchServiceRoutes` with the same request to receive complete replacement snapshots. The local profile enables development authentication; production callers need bearer read credentials and membership in the selected workspace. The POC watch ends after 60 seconds and must be reopened. Clients replace their route cache and discard expired entries.
 
-Confirm the `web` route uses the manually created supervisor Service address and expected service hostname. Change or delete the declaration and verify its old revision disappears from the watch. Recreate the supervisor and verify discovery publishes the new runtime identity only after it accepts the route. Application health is not inferred from an advertisement.
+Confirm the `web` route uses the headless supervisor Service address and expected service hostname. Change or delete the declaration and verify its old revision disappears from the watch. Recreate the supervisor and verify discovery publishes the new runtime identity only after it accepts the route. Application health is not inferred from an advertisement.
