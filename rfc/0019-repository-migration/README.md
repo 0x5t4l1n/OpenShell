@@ -1,6 +1,7 @@
 ---
 authors:
   - "@drew"
+  - "@SDAChess"
 state: draft
 links:
   - https://github.com/NVIDIA/OpenShell/issues/4425
