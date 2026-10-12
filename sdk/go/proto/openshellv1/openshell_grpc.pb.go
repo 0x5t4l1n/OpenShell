@@ -45,6 +45,8 @@ const (
 	OpenShell_ExposeService_FullMethodName                 = "/openshell.v1.OpenShell/ExposeService"
 	OpenShell_GetService_FullMethodName                    = "/openshell.v1.OpenShell/GetService"
 	OpenShell_ListServices_FullMethodName                  = "/openshell.v1.OpenShell/ListServices"
+	OpenShell_GetServiceRouteSnapshot_FullMethodName       = "/openshell.v1.OpenShell/GetServiceRouteSnapshot"
+	OpenShell_WatchServiceRoutes_FullMethodName            = "/openshell.v1.OpenShell/WatchServiceRoutes"
 	OpenShell_DeleteService_FullMethodName                 = "/openshell.v1.OpenShell/DeleteService"
 	OpenShell_RevokeSshSession_FullMethodName              = "/openshell.v1.OpenShell/RevokeSshSession"
 	OpenShell_ExecSandbox_FullMethodName                   = "/openshell.v1.OpenShell/ExecSandbox"
@@ -172,6 +174,11 @@ type OpenShellClient interface {
 	GetService(ctx context.Context, in *GetServiceRequest, opts ...grpc.CallOption) (*ServiceEndpointResponse, error)
 	// List sandbox HTTP service endpoints.
 	ListServices(ctx context.Context, in *ListServicesRequest, opts ...grpc.CallOption) (*ListServicesResponse, error)
+	// Complete snapshot of currently advertised supervisor app routes in one workspace.
+	GetServiceRouteSnapshot(ctx context.Context, in *GetServiceRouteSnapshotRequest, opts ...grpc.CallOption) (*GetServiceRouteSnapshotResponse, error)
+	// Initial snapshot followed by complete replacements. No event history or resume cursor.
+	// Clients reconnect after the bounded watch lifetime and discard expired routes.
+	WatchServiceRoutes(ctx context.Context, in *WatchServiceRoutesRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[WatchServiceRoutesResponse], error)
 	// Delete one sandbox HTTP service endpoint.
 	DeleteService(ctx context.Context, in *DeleteServiceRequest, opts ...grpc.CallOption) (*DeleteServiceResponse, error)
 	// Revoke a previously issued SSH session.
@@ -569,6 +576,35 @@ func (c *openShellClient) ListServices(ctx context.Context, in *ListServicesRequ
 	return out, nil
 }
 
+func (c *openShellClient) GetServiceRouteSnapshot(ctx context.Context, in *GetServiceRouteSnapshotRequest, opts ...grpc.CallOption) (*GetServiceRouteSnapshotResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(GetServiceRouteSnapshotResponse)
+	err := c.cc.Invoke(ctx, OpenShell_GetServiceRouteSnapshot_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *openShellClient) WatchServiceRoutes(ctx context.Context, in *WatchServiceRoutesRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[WatchServiceRoutesResponse], error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	stream, err := c.cc.NewStream(ctx, &OpenShell_ServiceDesc.Streams[0], OpenShell_WatchServiceRoutes_FullMethodName, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	x := &grpc.GenericClientStream[WatchServiceRoutesRequest, WatchServiceRoutesResponse]{ClientStream: stream}
+	if err := x.ClientStream.SendMsg(in); err != nil {
+		return nil, err
+	}
+	if err := x.ClientStream.CloseSend(); err != nil {
+		return nil, err
+	}
+	return x, nil
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type OpenShell_WatchServiceRoutesClient = grpc.ServerStreamingClient[WatchServiceRoutesResponse]
+
 func (c *openShellClient) DeleteService(ctx context.Context, in *DeleteServiceRequest, opts ...grpc.CallOption) (*DeleteServiceResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(DeleteServiceResponse)
@@ -591,7 +627,7 @@ func (c *openShellClient) RevokeSshSession(ctx context.Context, in *RevokeSshSes
 
 func (c *openShellClient) ExecSandbox(ctx context.Context, in *ExecSandboxRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[ExecSandboxEvent], error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	stream, err := c.cc.NewStream(ctx, &OpenShell_ServiceDesc.Streams[0], OpenShell_ExecSandbox_FullMethodName, cOpts...)
+	stream, err := c.cc.NewStream(ctx, &OpenShell_ServiceDesc.Streams[1], OpenShell_ExecSandbox_FullMethodName, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -610,7 +646,7 @@ type OpenShell_ExecSandboxClient = grpc.ServerStreamingClient[ExecSandboxEvent]
 
 func (c *openShellClient) ForwardTcp(ctx context.Context, opts ...grpc.CallOption) (grpc.BidiStreamingClient[TcpForwardFrame, TcpForwardFrame], error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	stream, err := c.cc.NewStream(ctx, &OpenShell_ServiceDesc.Streams[1], OpenShell_ForwardTcp_FullMethodName, cOpts...)
+	stream, err := c.cc.NewStream(ctx, &OpenShell_ServiceDesc.Streams[2], OpenShell_ForwardTcp_FullMethodName, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -623,7 +659,7 @@ type OpenShell_ForwardTcpClient = grpc.BidiStreamingClient[TcpForwardFrame, TcpF
 
 func (c *openShellClient) ExecSandboxInteractive(ctx context.Context, opts ...grpc.CallOption) (grpc.BidiStreamingClient[ExecSandboxInput, ExecSandboxEvent], error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	stream, err := c.cc.NewStream(ctx, &OpenShell_ServiceDesc.Streams[2], OpenShell_ExecSandboxInteractive_FullMethodName, cOpts...)
+	stream, err := c.cc.NewStream(ctx, &OpenShell_ServiceDesc.Streams[3], OpenShell_ExecSandboxInteractive_FullMethodName, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -916,7 +952,7 @@ func (c *openShellClient) GetSandboxLogs(ctx context.Context, in *GetSandboxLogs
 
 func (c *openShellClient) PushSandboxLogs(ctx context.Context, opts ...grpc.CallOption) (grpc.ClientStreamingClient[PushSandboxLogsRequest, PushSandboxLogsResponse], error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	stream, err := c.cc.NewStream(ctx, &OpenShell_ServiceDesc.Streams[3], OpenShell_PushSandboxLogs_FullMethodName, cOpts...)
+	stream, err := c.cc.NewStream(ctx, &OpenShell_ServiceDesc.Streams[4], OpenShell_PushSandboxLogs_FullMethodName, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -929,7 +965,7 @@ type OpenShell_PushSandboxLogsClient = grpc.ClientStreamingClient[PushSandboxLog
 
 func (c *openShellClient) ConnectSupervisor(ctx context.Context, opts ...grpc.CallOption) (grpc.BidiStreamingClient[SupervisorMessage, GatewayMessage], error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	stream, err := c.cc.NewStream(ctx, &OpenShell_ServiceDesc.Streams[4], OpenShell_ConnectSupervisor_FullMethodName, cOpts...)
+	stream, err := c.cc.NewStream(ctx, &OpenShell_ServiceDesc.Streams[5], OpenShell_ConnectSupervisor_FullMethodName, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -962,7 +998,7 @@ func (c *openShellClient) FinalizeMainProcessExit(ctx context.Context, in *Final
 
 func (c *openShellClient) RelayStream(ctx context.Context, opts ...grpc.CallOption) (grpc.BidiStreamingClient[RelayFrame, RelayFrame], error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	stream, err := c.cc.NewStream(ctx, &OpenShell_ServiceDesc.Streams[5], OpenShell_RelayStream_FullMethodName, cOpts...)
+	stream, err := c.cc.NewStream(ctx, &OpenShell_ServiceDesc.Streams[6], OpenShell_RelayStream_FullMethodName, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -975,7 +1011,7 @@ type OpenShell_RelayStreamClient = grpc.BidiStreamingClient[RelayFrame, RelayFra
 
 func (c *openShellClient) PeerRelay(ctx context.Context, opts ...grpc.CallOption) (grpc.BidiStreamingClient[PeerRelayFrame, PeerRelayFrame], error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	stream, err := c.cc.NewStream(ctx, &OpenShell_ServiceDesc.Streams[6], OpenShell_PeerRelay_FullMethodName, cOpts...)
+	stream, err := c.cc.NewStream(ctx, &OpenShell_ServiceDesc.Streams[7], OpenShell_PeerRelay_FullMethodName, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -1018,7 +1054,7 @@ func (c *openShellClient) PeerGetSandboxProviderStatus(ctx context.Context, in *
 
 func (c *openShellClient) WatchSandbox(ctx context.Context, in *WatchSandboxRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[SandboxStreamEvent], error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	stream, err := c.cc.NewStream(ctx, &OpenShell_ServiceDesc.Streams[7], OpenShell_WatchSandbox_FullMethodName, cOpts...)
+	stream, err := c.cc.NewStream(ctx, &OpenShell_ServiceDesc.Streams[8], OpenShell_WatchSandbox_FullMethodName, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -1279,6 +1315,11 @@ type OpenShellServer interface {
 	GetService(context.Context, *GetServiceRequest) (*ServiceEndpointResponse, error)
 	// List sandbox HTTP service endpoints.
 	ListServices(context.Context, *ListServicesRequest) (*ListServicesResponse, error)
+	// Complete snapshot of currently advertised supervisor app routes in one workspace.
+	GetServiceRouteSnapshot(context.Context, *GetServiceRouteSnapshotRequest) (*GetServiceRouteSnapshotResponse, error)
+	// Initial snapshot followed by complete replacements. No event history or resume cursor.
+	// Clients reconnect after the bounded watch lifetime and discard expired routes.
+	WatchServiceRoutes(*WatchServiceRoutesRequest, grpc.ServerStreamingServer[WatchServiceRoutesResponse]) error
 	// Delete one sandbox HTTP service endpoint.
 	DeleteService(context.Context, *DeleteServiceRequest) (*DeleteServiceResponse, error)
 	// Revoke a previously issued SSH session.
@@ -1521,6 +1562,12 @@ func (UnimplementedOpenShellServer) GetService(context.Context, *GetServiceReque
 }
 func (UnimplementedOpenShellServer) ListServices(context.Context, *ListServicesRequest) (*ListServicesResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method ListServices not implemented")
+}
+func (UnimplementedOpenShellServer) GetServiceRouteSnapshot(context.Context, *GetServiceRouteSnapshotRequest) (*GetServiceRouteSnapshotResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method GetServiceRouteSnapshot not implemented")
+}
+func (UnimplementedOpenShellServer) WatchServiceRoutes(*WatchServiceRoutesRequest, grpc.ServerStreamingServer[WatchServiceRoutesResponse]) error {
+	return status.Error(codes.Unimplemented, "method WatchServiceRoutes not implemented")
 }
 func (UnimplementedOpenShellServer) DeleteService(context.Context, *DeleteServiceRequest) (*DeleteServiceResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method DeleteService not implemented")
@@ -2121,6 +2168,35 @@ func _OpenShell_ListServices_Handler(srv interface{}, ctx context.Context, dec f
 	}
 	return interceptor(ctx, in, info, handler)
 }
+
+func _OpenShell_GetServiceRouteSnapshot_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(GetServiceRouteSnapshotRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(OpenShellServer).GetServiceRouteSnapshot(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: OpenShell_GetServiceRouteSnapshot_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(OpenShellServer).GetServiceRouteSnapshot(ctx, req.(*GetServiceRouteSnapshotRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _OpenShell_WatchServiceRoutes_Handler(srv interface{}, stream grpc.ServerStream) error {
+	m := new(WatchServiceRoutesRequest)
+	if err := stream.RecvMsg(m); err != nil {
+		return err
+	}
+	return srv.(OpenShellServer).WatchServiceRoutes(m, &grpc.GenericServerStream[WatchServiceRoutesRequest, WatchServiceRoutesResponse]{ServerStream: stream})
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type OpenShell_WatchServiceRoutesServer = grpc.ServerStreamingServer[WatchServiceRoutesResponse]
 
 func _OpenShell_DeleteService_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(DeleteServiceRequest)
@@ -3236,6 +3312,10 @@ var OpenShell_ServiceDesc = grpc.ServiceDesc{
 			Handler:    _OpenShell_ListServices_Handler,
 		},
 		{
+			MethodName: "GetServiceRouteSnapshot",
+			Handler:    _OpenShell_GetServiceRouteSnapshot_Handler,
+		},
+		{
 			MethodName: "DeleteService",
 			Handler:    _OpenShell_DeleteService_Handler,
 		},
@@ -3449,6 +3529,11 @@ var OpenShell_ServiceDesc = grpc.ServiceDesc{
 		},
 	},
 	Streams: []grpc.StreamDesc{
+		{
+			StreamName:    "WatchServiceRoutes",
+			Handler:       _OpenShell_WatchServiceRoutes_Handler,
+			ServerStreams: true,
+		},
 		{
 			StreamName:    "ExecSandbox",
 			Handler:       _OpenShell_ExecSandbox_Handler,

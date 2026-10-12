@@ -13,6 +13,7 @@ mod sandbox;
 pub use sandbox::mint_persisted_authentication;
 mod service;
 pub mod service_advertisement;
+mod service_discovery;
 mod validation;
 pub mod workspace;
 
@@ -232,6 +233,22 @@ impl OpenShellService {
 
 #[tonic::async_trait]
 impl OpenShell for OpenShellService {
+    type WatchServiceRoutesStream = service_discovery::RouteWatchStream;
+
+    async fn get_service_route_snapshot(
+        &self,
+        request: Request<openshell_core::proto::GetServiceRouteSnapshotRequest>,
+    ) -> Result<Response<openshell_core::proto::GetServiceRouteSnapshotResponse>, Status> {
+        service_discovery::get_snapshot(&self.state, request).await
+    }
+
+    async fn watch_service_routes(
+        &self,
+        request: Request<openshell_core::proto::WatchServiceRoutesRequest>,
+    ) -> Result<Response<Self::WatchServiceRoutesStream>, Status> {
+        service_discovery::watch_routes(&self.state, request).await
+    }
+
     async fn health(
         &self,
         _request: Request<HealthRequest>,

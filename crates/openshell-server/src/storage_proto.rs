@@ -151,7 +151,7 @@ mod tests {
     // Sandbox service route snapshots and advertisements add public-only messages. They reuse
     // existing durable ServiceEndpoint declarations without a storage change.
     const PUBLIC_RPC_SCHEMA_SHA256: &str =
-        "f975ba80d19bd1ca61cd71679a58979ead1215b613d83e4edb765d1f2180a079";
+        "73de5f9ad75f6280357f1bad52524bb4a9b46d15a5a8266e4059c75ab6b8d4c5";
     const DURABLE_SCHEMA_SHA256: &str =
         "5281143e2825539af6148785c91f9df67f654eb74d215f57940af9314867a55f";
     const PUBLIC_DURABLE_OVERLAP_SHA256: &str =
@@ -566,12 +566,12 @@ mod tests {
         }
         assert_eq!(
             compiled_method_count,
-            103 + PROVIDER_READINESS_RPC_SIGNATURES.len() + PEER_OWNER_RPC_SIGNATURES.len(),
+            105 + PROVIDER_READINESS_RPC_SIGNATURES.len() + PEER_OWNER_RPC_SIGNATURES.len(),
             "classify every compiled RPC"
         );
         assert_eq!(
             methods.len(),
-            78 + PROVIDER_READINESS_RPC_SIGNATURES.len() + PEER_OWNER_RPC_SIGNATURES.len(),
+            80 + PROVIDER_READINESS_RPC_SIGNATURES.len() + PEER_OWNER_RPC_SIGNATURES.len(),
             "inventory every public gateway RPC"
         );
         assert_eq!(
@@ -579,7 +579,7 @@ mod tests {
                 .iter()
                 .filter(|method| method.starts_with("openshell.v1.OpenShell/"))
                 .count(),
-            78 + PROVIDER_READINESS_RPC_SIGNATURES.len() + PEER_OWNER_RPC_SIGNATURES.len()
+            80 + PROVIDER_READINESS_RPC_SIGNATURES.len() + PEER_OWNER_RPC_SIGNATURES.len()
         );
         assert!(methods.iter().all(|method| !method.contains(".storage.")));
 
@@ -623,7 +623,7 @@ mod tests {
                 overlap_hash.as_str(),
             ),
             (
-                (313, 27),
+                (319, 27),
                 (93, 21),
                 (81, 21),
                 PUBLIC_RPC_SCHEMA_SHA256,

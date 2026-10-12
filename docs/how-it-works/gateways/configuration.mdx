@@ -788,6 +788,12 @@ The address template supports `{sandbox_id}`, `{sandbox}`, and `{workspace}` and
 
 Supervisors advertise only installed declarations over their authenticated gateway session. Reports are fenced by session, runtime instance, sequence, and declaration revision, and expire within 30 seconds. An advertisement means a route was installed, not that its application passed a health check. Losing ownership or changing a declaration invalidates the old advertisement.
 
+`GetServiceRouteSnapshot` returns the current routes for one explicit workspace. `WatchServiceRoutes` sends an initial snapshot followed by complete replacements. Both require the existing bearer `sandbox:read` scope and workspace membership. Watch membership is rechecked on each refresh; the POC closes watches after 60 seconds so clients reconnect and reauthenticate.
+
+Each discovered route contains its service hostname and IDs, trusted supervisor app address, supervisor/runtime identity, declaration and advertisement revisions, and expiry. It contains no credentials. Discovery reads the shared ownership store, so a gateway does not need to own the supervisor control connection. Changed declarations, replaced owners, and expired advertisements disappear from snapshots. Routers must discard expired routes and replace their cache with each snapshot; no replay cursor or gateway fallback is provided.
+
+The POC polls discovery state once per second and bounds each workspace snapshot to 1,000 advertisement records and 4,096 routes. Endpoint lifecycle management and the reference proxy are separate follow-ups.
+
 The gateway runs as a Pod and creates paired workload and supervisor Pods in another namespace. The gateway CA is projected from a Kubernetes Secret into supervisor Pods; user client certificate and key entries in that Secret are not exposed to either Pod.
 
 ```toml

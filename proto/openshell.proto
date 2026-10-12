@@ -231,6 +231,25 @@ service OpenShell {
     };
   }
 
+  // Complete snapshot of currently advertised supervisor app routes in one workspace.
+  rpc GetServiceRouteSnapshot(GetServiceRouteSnapshotRequest) returns (GetServiceRouteSnapshotResponse) {
+    option (openshell.options.v1.authorization) = {
+      auth_mode: "bearer"
+      scope: "sandbox:read"
+      workspace_role: "user"
+    };
+  }
+
+  // Initial snapshot followed by complete replacements. No event history or resume cursor.
+  // Clients reconnect after the bounded watch lifetime and discard expired routes.
+  rpc WatchServiceRoutes(WatchServiceRoutesRequest) returns (stream WatchServiceRoutesResponse) {
+    option (openshell.options.v1.authorization) = {
+      auth_mode: "bearer"
+      scope: "sandbox:read"
+      workspace_role: "user"
+    };
+  }
+
   // Delete one sandbox HTTP service endpoint.
   rpc DeleteService(DeleteServiceRequest) returns (DeleteServiceResponse) {
     option (openshell.options.v1.authorization) = {
@@ -3922,4 +3941,42 @@ enum ServiceAuthorizationMode {
   SERVICE_AUTHORIZATION_MODE_STRIP = 1;
   // Forward one syntactically valid bearer Authorization header unchanged.
   SERVICE_AUTHORIZATION_MODE_BEARER_PASSTHROUGH = 2;
+}
+
+// Discovery accepts exactly one explicitly named workspace; no all_workspaces selector.
+message GetServiceRouteSnapshotRequest {
+  openshell.datamodel.v1.WorkspaceSelector workspace_scope = 1;
+}
+message GetServiceRouteSnapshotResponse {
+  ServiceRouteSnapshot snapshot = 1;
+}
+// The initial snapshot replaces any client cache. Intermediate updates may be coalesced.
+message WatchServiceRoutesRequest {
+  openshell.datamodel.v1.WorkspaceSelector workspace_scope = 1;
+}
+message WatchServiceRoutesResponse {
+  ServiceRouteSnapshot snapshot = 1;
+}
+message ServiceRouteSnapshot {
+  repeated DiscoveredServiceRoute routes = 1;
+  // Opaque content fingerprint, not a replay cursor. Identical snapshots have identical revisions.
+  string revision = 2;
+  google.protobuf.Timestamp observed_at = 3;
+}
+// A gateway-validated, unexpired installation advertisement; not an application health result.
+message DiscoveredServiceRoute {
+  string workspace = 1;
+  string sandbox = 2;
+  string name = 3;
+  string sandbox_id = 4;
+  string service_id = 5;
+  string hostname = 6;
+  string supervisor_instance_id = 7;
+  // Trusted host:port reaching the supervisor app listener, never the workload port.
+  string supervisor_app_address = 8;
+  uint64 service_revision = 9;
+  // In the one-sandbox-per-supervisor POC, the supervisor instance is the runtime generation.
+  string runtime_generation = 10;
+  google.protobuf.Timestamp expires_at = 11;
+  uint64 advertisement_revision = 12;
 }

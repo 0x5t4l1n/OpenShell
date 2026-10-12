@@ -234,6 +234,30 @@ fn workload_template_proto(name: &str, workspace: &str) -> proto::SandboxWorkloa
 
 #[tonic::async_trait]
 impl OpenShell for TestOpenShell {
+    type WatchServiceRoutesStream = std::pin::Pin<
+        Box<
+            dyn tokio_stream::Stream<Item = Result<proto::WatchServiceRoutesResponse, Status>>
+                + Send
+                + 'static,
+        >,
+    >;
+    async fn get_service_route_snapshot(
+        &self,
+        _: tonic::Request<proto::GetServiceRouteSnapshotRequest>,
+    ) -> Result<Response<proto::GetServiceRouteSnapshotResponse>, Status> {
+        Err(Status::unimplemented(
+            "service route discovery not used by this mock",
+        ))
+    }
+    async fn watch_service_routes(
+        &self,
+        _: tonic::Request<proto::WatchServiceRoutesRequest>,
+    ) -> Result<Response<Self::WatchServiceRoutesStream>, Status> {
+        Err(Status::unimplemented(
+            "service route discovery not used by this mock",
+        ))
+    }
+
     async fn peer_report_provider_readiness(
         &self,
         _request: tonic::Request<proto::ReportProviderReadinessRequest>,

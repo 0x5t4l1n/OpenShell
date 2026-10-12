@@ -74,3 +74,9 @@ The ignored `refresh_locks_coordinate_independent_replica_sessions` test require
 `OPENSHELL_REFRESH_TEST_DATABASE_URL` pointing to a disposable PostgreSQL database.
 It exercises independent sessions without the local mutex. Do not point this
 fixture at an existing deployment database.
+
+## Supervisor service discovery
+
+The supervisor sends installed app-route snapshots on its authenticated session. The gateway validates the current session/owner, runtime identity, declaration revisions, domain, sequence, and expiry, then stores bounded installation evidence as private expiring `supervisor_service_advertisement` JSON records. Operator configuration supplies the app address template; supervisors cannot advertise arbitrary backend addresses. These records are not restored as authority: every discovery read checks the shared live owner, current declaration, admitted configuration, and lease.
+
+`GetServiceRouteSnapshot` and `WatchServiceRoutes` expose read-only, explicitly workspace-scoped snapshots with the existing bearer read scope. Watch updates are complete replacements identified by an opaque content fingerprint, with no event journal or resume cursor. The POC polls shared state once per second, uses a one-message stream buffer, rechecks membership, and closes streams after 60 seconds for reauthentication. Routes carry expiry and installation identity; routers must expire caches independently and reconnect after EOF. See the [manual ingress test](../../e2e/kubernetes/app-listener/README.md).

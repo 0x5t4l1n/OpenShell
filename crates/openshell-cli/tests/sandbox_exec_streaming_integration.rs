@@ -163,6 +163,14 @@ macro_rules! mock_gateway {
     ) => {
         #[tonic::async_trait]
         impl OpenShell for MockGateway {
+    type WatchServiceRoutesStream = std::pin::Pin<Box<dyn tokio_stream::Stream<Item = Result<proto::WatchServiceRoutesResponse, Status>> + Send + 'static>>;
+    async fn get_service_route_snapshot(&self, _: Request<proto::GetServiceRouteSnapshotRequest>) -> Result<Response<proto::GetServiceRouteSnapshotResponse>, Status> {
+        Err(Status::unimplemented("service route discovery not used by this mock"))
+    }
+    async fn watch_service_routes(&self, _: Request<proto::WatchServiceRoutesRequest>) -> Result<Response<Self::WatchServiceRoutesStream>, Status> {
+        Err(Status::unimplemented("service route discovery not used by this mock"))
+    }
+
             $(async fn $method(&self, _: Request<$request>) -> Result<Response<$response>, Status> {
                 Err(Status::unimplemented("unused test RPC"))
             })*
