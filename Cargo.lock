@@ -5004,8 +5004,13 @@ dependencies = [
 name = "openshell-supervisor"
 version = "0.0.0"
 dependencies = [
+ "axum",
  "clap",
  "futures",
+ "http 1.4.0",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
  "miette",
  "nix 0.29.0",
  "openshell-core",
@@ -5022,8 +5027,10 @@ dependencies = [
  "opentelemetry",
  "prost",
  "prost-types",
+ "rcgen",
  "rustix 1.1.4",
  "rustls",
+ "rustls-pemfile",
  "serde",
  "serde_json",
  "socket2",
@@ -5031,6 +5038,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.20",
  "tokio",
+ "tokio-rustls",
  "tokio-tungstenite 0.26.2",
  "tonic",
  "tracing",

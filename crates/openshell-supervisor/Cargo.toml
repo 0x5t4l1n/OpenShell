@@ -28,6 +28,13 @@ openshell-supervisor-network = { path = "../openshell-supervisor-network", defau
 openshell-supervisor-process = { path = "../openshell-supervisor-process" }
 
 clap = { workspace = true }
+axum = { workspace = true }
+http = { workspace = true }
+hyper = { workspace = true }
+hyper-util = { workspace = true }
+http-body-util = { workspace = true }
+tokio-rustls = { workspace = true }
+rustls-pemfile = { workspace = true }
 miette = { workspace = true }
 nix = { workspace = true }
 opentelemetry = { workspace = true }
@@ -56,7 +63,7 @@ bundled-ca-roots = ["openshell-supervisor-network/bundled-ca-roots"]
 
 [dev-dependencies]
 openshell-sandbox-backend = { path = "../openshell-sandbox-backend", features = ["test-support"] }
-
+rcgen = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
 futures = { workspace = true }
 temp-env = "0.3"

@@ -3031,7 +3031,44 @@ pub(super) async fn load_sandbox_config(
             .filter(|_| matches!(policy_source, PolicySource::Global)),
     )?;
 
+    // Declarations are scoped to the authenticated sandbox. Never deliver a
+    // same-name replacement's endpoints to the previous runtime generation.
+    let endpoints = state
+        .store
+        .list_messages_with_selector::<openshell_core::proto::ServiceEndpoint>(
+            &workspace,
+            &format!("sandbox={}", sandbox.object_name()),
+            1025,
+            0,
+        )
+        .await
+        .map_err(|_| Status::internal("load sandbox service routes failed"))?;
+    if endpoints.len() > 1024 {
+        return Err(Status::resource_exhausted(
+            "too many sandbox service routes",
+        ));
+    }
+    let mut service_routes: Vec<_> = endpoints
+        .into_iter()
+        .filter(|endpoint| endpoint.sandbox_id == sandbox_id && endpoint.domain)
+        .map(|endpoint| openshell_core::proto::SandboxServiceRoute {
+            endpoint_id: endpoint
+                .metadata
+                .as_ref()
+                .map_or_else(String::new, |meta| meta.id.clone()),
+            resource_version: endpoint
+                .metadata
+                .as_ref()
+                .map_or(0, |meta| meta.resource_version),
+            name: endpoint.name,
+            target_port: endpoint.target_port,
+            authorization_mode: endpoint.authorization_mode,
+        })
+        .collect();
+    service_routes.sort_by(|a, b| a.endpoint_id.cmp(&b.endpoint_id));
+
     Ok(GetSandboxConfigResponse {
+        service_routes,
         configuration_instance_id: sandbox
             .status
             .as_ref()

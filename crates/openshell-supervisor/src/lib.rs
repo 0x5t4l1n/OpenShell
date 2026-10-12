@@ -18,6 +18,7 @@ compile_error!(
 );
 
 mod activity_aggregator;
+mod app_listener;
 pub mod backend_setup;
 mod denial_aggregator;
 mod endpoint_status;
@@ -781,6 +782,24 @@ pub async fn run_sandbox_with_backend(
             "foreground attachment to the main process requires a supported SSH access adapter; create the sandbox with --detach"
         ));
     }
+    let app_config = app_listener::Config::from_env()?;
+    if app_config.is_some()
+        && (sandbox_id.is_none() || sandbox.is_none() || openshell_endpoint.is_none())
+    {
+        return Err(miette::miette!(
+            "app listener requires authenticated gateway sandbox identity"
+        ));
+    }
+    if app_config.is_some() && (policy_rules.is_some() || policy_data.is_some()) {
+        return Err(miette::miette!(
+            "app listener requires gateway-managed policy"
+        ));
+    }
+    let app_listener = match app_config {
+        Some(config) => Some(config.bind().await?),
+        None => None,
+    };
+    let app_routes = app_listener::Routes::default();
     // An empty command is the versioned scratch-sandbox sentinel. The
     // external supervisor cannot inspect the workload filesystem, so preserve
     // it for openshell-sandbox to resolve against the agent image.
@@ -1248,6 +1267,7 @@ pub async fn run_sandbox_with_backend(
             .and_then(|v| v.parse().ok())
             .unwrap_or(10);
         let poll_ctx = PolicyPollLoopContext {
+            app_routes: app_routes.clone(),
             endpoint: poll_endpoint,
             sandbox_id: poll_id,
             sandbox: poll_sandbox,
@@ -1353,6 +1373,15 @@ pub async fn run_sandbox_with_backend(
             .chain(health_port.map(ReadinessEndpoint::Tcp))
             .map(|endpoint| ControlReadiness::start(endpoint, boundary_access.session_readiness()))
             .collect::<Result<Vec<_>>>()?;
+        // Initialize management access before scheduling application traffic.
+        let app_listener_handle = app_listener.map(|listener| {
+            listener.start(
+                app_routes.clone(),
+                sandbox.clone().unwrap_or_default(),
+                workspace_rx.clone(),
+                running.loopback_connector(),
+            )
+        });
         let instance_id = boundary_access.instance_id().to_string();
         let wait_agent = agent.clone();
         let shutdown_requested = wait_for_control_shutdown_signal();
@@ -1408,6 +1437,9 @@ pub async fn run_sandbox_with_backend(
         if !retain_access {
             control_readiness.clear();
         }
+        // App ingress follows workload lifetime even when the management
+        // access plane remains available for a completed sandbox.
+        drop(app_listener_handle);
         boundary_access
             .publish_main_exit(exit_code, await_main_process_attachment)
             .await;
@@ -3724,6 +3756,7 @@ async fn report_initial_policy_failure(
 /// When the entrypoint PID is available, policy reloads include symlink
 /// resolution for binary paths via the container filesystem.
 struct PolicyPollLoopContext {
+    app_routes: app_listener::Routes,
     endpoint: String,
     sandbox_id: String,
     /// Canonical sandbox reference used by name-scoped configuration APIs.
@@ -4217,6 +4250,7 @@ async fn run_policy_poll_loop_with_client<C: PolicyGatewayClient>(
                     if middleware_registry_status == MiddlewareRegistryStatus::Synchronized
                         && !generation.is_stale() =>
                 {
+                    ctx.app_routes.install(&result);
                     ctx.provider_readiness.policy_activated(
                         &EnvironmentIdentity::from_settings(&result),
                         result.config_revision,
@@ -4336,6 +4370,7 @@ async fn run_policy_poll_loop_with_client<C: PolicyGatewayClient>(
         };
 
         if reloads_gateway_policy && !result.configuration_admitted {
+            ctx.app_routes.suspend();
             let disposition = apply_policy_validation_failure(
                 &ctx.opa_engine,
                 result.policy_validation_failure_mode,
@@ -4360,6 +4395,9 @@ async fn run_policy_poll_loop_with_client<C: PolicyGatewayClient>(
         }
 
         let config_changed = result.config_revision != current_config_revision;
+        if config_changed || result.policy_hash != current_policy_hash {
+            ctx.app_routes.suspend();
+        }
         let desired_identity = EnvironmentIdentity::from_settings(&result);
         let provider_env_changed = result.provider_env_revision != current_provider_env_revision
             || ctx.provider_readiness.needs_environment(&desired_identity);
@@ -4394,6 +4432,9 @@ async fn run_policy_poll_loop_with_client<C: PolicyGatewayClient>(
                 &result.supervisor_middleware_services,
                 middleware_registry_status,
             );
+        if provider_env_changed || policy_runtime_changed {
+            ctx.app_routes.suspend();
+        }
         // Recovery already has its own acknowledgement path below. Giving it
         // precedence here prevents a restored last-known-good policy from
         // also being acknowledged as an ordinary same-hash revision.
@@ -4437,6 +4478,11 @@ async fn run_policy_poll_loop_with_client<C: PolicyGatewayClient>(
             && !policy_runtime_changed
             && unchanged_policy_revision.is_none()
         {
+            if result.configuration_admitted && rejected_policy_generation.is_none() {
+                ctx.app_routes.install(&result);
+            } else {
+                ctx.app_routes.suspend();
+            }
             continue;
         }
 
@@ -4882,6 +4928,7 @@ async fn run_policy_poll_loop_with_client<C: PolicyGatewayClient>(
             continue;
         }
         current_config_revision = result.config_revision;
+        ctx.app_routes.install(&result);
         if !reloads_gateway_policy {
             current_policy_hash = result.policy_hash;
         }
@@ -5646,6 +5693,7 @@ network_policies:
         source: openshell_core::proto::PolicySource,
     ) -> openshell_core::grpc_client::SettingsPollResult {
         openshell_core::grpc_client::SettingsPollResult {
+            service_routes: Vec::new(),
             policy,
             version,
             policy_hash: format!("hash-v{version}"),
@@ -8115,6 +8163,7 @@ network_policies:
             );
         }
         PolicyPollLoopContext {
+            app_routes: app_listener::Routes::default(),
             endpoint: String::new(),
             sandbox_id: "sandbox-test".to_string(),
             sandbox: "sandbox-test-name".to_string(),
@@ -8209,6 +8258,59 @@ network_policies:
             "same-hash acknowledgement must not reload OPA"
         );
         handle.abort();
+    }
+
+    #[tokio::test]
+    async fn service_changes_sync_without_policy_reload() {
+        let mut initial = settings_poll_result(
+            Some(proto_policy_fixture()),
+            1,
+            openshell_core::proto::PolicySource::Sandbox,
+        );
+        initial.workspace = "default".into();
+        let engine = Arc::new(OpaEngine::from_proto(&proto_policy_fixture()).unwrap());
+        let ctx = policy_poll_test_context(
+            engine.clone(),
+            LoadedPolicyOrigin::Gateway {
+                revision: Some(LoadedPolicyRevision::from_snapshot(&initial)),
+                has_last_valid_policy: true,
+            },
+            default_middleware_connector(),
+        );
+        let routes = ctx.app_routes.clone();
+        let (client, polls, mut reports) = scripted_policy_gateway();
+        polls.send(initial.clone()).unwrap();
+        let task = tokio::spawn(run_policy_poll_loop_with_client(ctx, client));
+        expect_policy_report(&mut reports, 1).await;
+        let mut updated = initial.clone();
+        updated
+            .service_routes
+            .push(openshell_core::proto::SandboxServiceRoute {
+                endpoint_id: "web-id".into(),
+                name: "web".into(),
+                target_port: 8080,
+                authorization_mode: 1,
+                resource_version: 1,
+            });
+        polls.send(updated).unwrap();
+        timeout(Duration::from_secs(2), async {
+            while routes.route_count() != 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        polls.send(initial).unwrap();
+        timeout(Duration::from_secs(2), async {
+            while routes.route_count() != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(engine.current_generation(), 0);
+        expect_no_policy_report(&mut reports).await;
+        task.abort();
     }
 
     #[tokio::test]

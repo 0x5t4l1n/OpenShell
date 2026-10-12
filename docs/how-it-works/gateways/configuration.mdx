@@ -849,6 +849,19 @@ Kubernetes configurations set `namespace`, `service_account_name`, and `enable_u
 
 ### Kubernetes
 
+To enable direct supervisor HTTP/WebSocket ingress, configure the operator-owned app listener:
+
+```toml
+[openshell.drivers.kubernetes.sandbox_runtime.app_listener]
+port = 8443
+service_domain = "svc.openshell.internal"
+tls_secret_name = "openshell-app-tls"
+```
+
+Omit this table to keep the listener disabled. The Secret must exist in each supervisor namespace and contain `tls.crt` and `tls.key` for the service domain. It is mounted only into supervisor pods. TLS configuration is independent of gateway TLS; recreate supervisors to apply listener or certificate changes.
+
+For Helm, use the same fields under `gatewayConfig["openshell.drivers.kubernetes"].sandbox_runtime.app_listener`. Create Services or ingress routes targeting supervisor pods yourself, and add a NetworkPolicy allowing only the intended ingress sources to reach the app port; this configuration does not create them or change the CLI's gateway service URLs. Clients must send matching TLS SNI and HTTP Host for a declared service. The listener supports HTTP/1.1 and WebSockets, with 64 connections, 10-second handshake/header/connect deadlines, and a 30-second configuration freshness lease. Service updates take effect through configuration polling. Gateway-managed policy is required; local policy overrides are unsupported for this listener. Service declarations form the ingress allowlist; existing egress rules do not grant ingress access. Protect listener reachability when an edge proxy supplies authentication.
+
 The gateway runs as a Pod and creates paired workload and supervisor Pods in another namespace. The gateway CA is projected from a Kubernetes Secret into supervisor Pods; user client certificate and key entries in that Secret are not exposed to either Pod.
 
 ```toml

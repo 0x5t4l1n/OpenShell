@@ -1,0 +1,12 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES.
+# SPDX-License-Identifier: Apache-2.0
+
+# Local opt-in. Create the openshell-app-tls Secret before creating sandboxes.
+# This does not create Services or change the gateway listener.
+gatewayConfig:
+  openshell.drivers.kubernetes:
+    sandbox_runtime:
+      app_listener:
+        port: 8443
+        service_domain: svc.openshell.internal
+        tls_secret_name: openshell-app-tls

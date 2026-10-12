@@ -154,6 +154,8 @@ mod tests {
     // Sandbox-wide grant reporting adds TokenGrantFailureObservation to both
     // closures and TokenGrantStatus to public reports. Older rows have no grant
     // record; absent report extensions retain compatibility without a rewrite.
+    // Sandbox service route snapshots add one public-only message. They reuse
+    // existing durable ServiceEndpoint declarations without a storage change.
     const PUBLIC_RPC_SCHEMA_SHA256: &str =
         "cc06b38c9ecb4c6518e0d4963f40c4f16f992483ce111c7b23cbcb729db946ea";
     const DURABLE_SCHEMA_SHA256: &str =
@@ -663,7 +665,7 @@ mod tests {
                 overlap_hash.as_str(),
             ),
             (
-                (314, 28),
+                (315, 28),
                 (95, 22),
                 (83, 22),
                 PUBLIC_RPC_SCHEMA_SHA256,
