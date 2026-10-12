@@ -144,16 +144,18 @@ push-triggered workflow jobs themselves.
 
 ### K3s conformance version baseline
 
-The tmachine `ubuntu-k3s` conformance lane pins Agent Sandbox v0.5.0 as the
-compatibility baseline for the v1beta1 Sandbox API. It does not track the local
+The tmachine `ubuntu-k3s` conformance lanes pin Agent Sandbox v0.5.0 as the
+compatibility baseline for the v1beta1 Sandbox API. They do not track the local
 K3s development default, currently v1.0.3. OpenShell also supports v0.4.6 through
 its v1alpha1 fallback, so v0.5.0 is not the overall minimum supported version.
 
-The `ubuntu-k3s` lane registers the gateway's ClusterIP Service directly, so
-recreating the Service requires reprovisioning the fixture. Before conformance,
-every installer waits up to five minutes for a connected gateway; interactive
-shells skip the wait. K3s failures upload diagnostics as `tmachine-diagnostics-*`
-artifacts.
+The `ubuntu-k3s` lanes register the gateway's ClusterIP Service directly, so
+recreating the Service requires reprovisioning the fixture. The `k3s` lane runs
+one plaintext gateway. The `k3s-ha` lane runs the supported HA configuration:
+three gateway replicas sharing PostgreSQL, serving TLS, with the CLI connecting
+over mTLS. Before conformance, every installer waits up to five minutes for a
+connected gateway; interactive shells skip the wait. K3s failures upload
+diagnostics as `tmachine-diagnostics-*` artifacts.
 
 ### Run only the policy advisor conformance tests
 
