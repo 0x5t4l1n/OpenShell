@@ -278,6 +278,7 @@ const HELP_TEMPLATE: &str = "\
   doctor:      Diagnose gateway issues
 
 \x1b[1mADDITIONAL COMMANDS\x1b[0m
+  agent:       Print CLI context for coding agents
   term:        Launch the OpenShell interactive TUI
   completions: Generate shell completions
   ssh-proxy:   SSH proxy (used by ProxyCommand)
@@ -424,6 +425,12 @@ const DOCTOR_HELP: &str = "\x1b[1mALIAS\x1b[0m
 
 \x1b[1mEXAMPLES\x1b[0m
   $ openshell doctor check
+";
+
+const AGENT_EXAMPLES: &str = "\x1b[1mEXAMPLES\x1b[0m
+  $ openshell agent context
+  $ openshell agent context sandbox
+  $ openshell agent context sandbox create
 ";
 
 /// `OpenShell` CLI - agent execution and management.
@@ -642,6 +649,13 @@ enum Commands {
     // ===================================================================
     // ADDITIONAL COMMANDS
     // ===================================================================
+    /// Print CLI context for coding agents.
+    #[command(after_help = AGENT_EXAMPLES, help_template = SUBCOMMAND_HELP_TEMPLATE)]
+    Agent {
+        #[command(subcommand)]
+        command: Option<AgentCommands>,
+    },
+
     /// Launch the `OpenShell` interactive TUI.
     #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
     Term {
@@ -758,6 +772,16 @@ If no profile exists yet, create one first:
 
    New-Item -Path $PROFILE -Type File -Force
 ";
+
+/// Write command output to stdout, treating a closed pipe as success so
+/// commands such as `openshell agent context | head` exit cleanly.
+fn write_stdout(bytes: &[u8]) -> std::io::Result<()> {
+    let mut stdout = std::io::stdout().lock();
+    match stdout.write_all(bytes).and_then(|()| stdout.flush()) {
+        Err(err) if err.kind() == std::io::ErrorKind::BrokenPipe => Ok(()),
+        result => result,
+    }
+}
 
 fn normalize_completion_script(output: Vec<u8>, executable: &std::path::Path) -> Result<String> {
     let script = String::from_utf8(output)
@@ -1417,6 +1441,25 @@ enum GatewayCommands {
         /// Output format.
         #[arg(short = 'o', long = "output", value_enum, default_value_t = OutputFormat::Table)]
         output: OutputFormat,
+    },
+}
+
+// -----------------------------------------------------------------------
+// Agent commands
+// -----------------------------------------------------------------------
+
+#[derive(Subcommand, Debug)]
+enum AgentCommands {
+    /// Print every command and flag as one plain-text reference.
+    ///
+    /// The reference is generated from this binary's command definitions, so
+    /// it always matches the installed version. Pass a command path to print
+    /// one command group or command.
+    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
+    Context {
+        /// Command path to print, such as `sandbox` or `sandbox create`.
+        #[arg(value_name = "COMMAND")]
+        path: Vec<String>,
     },
 }
 
@@ -4078,6 +4121,20 @@ async fn run_async() -> Result<()> {
                 theme,
             )
             .await?;
+        }
+        Some(Commands::Agent {
+            command: Some(AgentCommands::Context { path }),
+        }) => {
+            let reference = openshell_cli::agent::render_context(&Cli::command(), &path)?;
+            write_stdout(reference.as_bytes())
+                .map_err(|e| miette::miette!("failed to write agent context: {e}"))?;
+        }
+        Some(Commands::Agent { command: None }) => {
+            Cli::command()
+                .find_subcommand_mut("agent")
+                .expect("agent subcommand exists")
+                .print_help()
+                .expect("Failed to print help");
         }
         Some(Commands::Completions { shell }) => {
             let exe = std::env::current_exe()

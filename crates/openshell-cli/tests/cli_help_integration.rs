@@ -12,7 +12,9 @@ fn root_help_shows_top_level_commands() {
     let output = run_isolated(&["--help"]);
     assert_eq!(output.code, 0, "openshell --help:\n{}", output.combined);
 
-    for command in ["gateway", "status", "sandbox", "forward", "logs", "policy"] {
+    for command in [
+        "gateway", "status", "sandbox", "forward", "logs", "policy", "agent",
+    ] {
         assert!(
             output.combined.contains(command),
             "expected '{command}' in openshell --help:\n{}",
@@ -175,5 +177,95 @@ fn gateway_add_rejects_removed_ssh_key_flag() {
         removed.code, 0,
         "removed --ssh-key flag should fail:\n{}",
         removed.combined
+    );
+}
+
+#[test]
+fn agent_context_prints_flat_reference_for_visible_commands() {
+    // Force color to prove the reference stays plain even when styling is on.
+    let output = run_isolated(&["--color", "always", "agent", "context"]);
+    assert_eq!(output.code, 0, "agent context:\n{}", output.combined);
+
+    for heading in [
+        "## Global flags",
+        "## openshell sandbox create",
+        "## openshell gateway add",
+        "## openshell policy update",
+        "## openshell provider refresh configure",
+        "## openshell workspace member add",
+        "## openshell agent context",
+    ] {
+        assert!(
+            output.stdout.contains(heading),
+            "expected '{heading}' in agent context:\n{}",
+            output.stdout
+        );
+    }
+    for hidden in [
+        "## openshell rule",
+        "## openshell doctor",
+        "## openshell ssh-proxy",
+        "  --keep\n",
+    ] {
+        assert!(
+            !output.stdout.contains(hidden),
+            "unexpected hidden entry '{hidden}' in agent context:\n{}",
+            output.stdout
+        );
+    }
+    assert!(
+        !output.stdout.contains('\x1b'),
+        "agent context must not contain ANSI escapes"
+    );
+}
+
+#[test]
+fn agent_context_narrows_to_command_path() {
+    let output = run_isolated(&["agent", "context", "sb", "create"]);
+    assert_eq!(
+        output.code, 0,
+        "agent context sb create:\n{}",
+        output.combined
+    );
+
+    assert!(
+        output.stdout.contains("## openshell sandbox create"),
+        "expected sandbox create in narrowed agent context:\n{}",
+        output.stdout
+    );
+    for excluded in ["## openshell sandbox list", "## openshell gateway add"] {
+        assert!(
+            !output.stdout.contains(excluded),
+            "unexpected '{excluded}' in narrowed agent context:\n{}",
+            output.stdout
+        );
+    }
+}
+
+#[test]
+fn agent_context_rejects_unknown_command_path() {
+    let output = run_isolated(&["agent", "context", "bogus"]);
+    assert_ne!(
+        output.code, 0,
+        "unknown path should fail:\n{}",
+        output.combined
+    );
+    assert!(
+        output
+            .combined
+            .contains("unknown command `openshell bogus`"),
+        "expected unknown command error:\n{}",
+        output.combined
+    );
+}
+
+#[test]
+fn agent_without_subcommand_prints_group_help() {
+    let output = run_isolated(&["agent"]);
+    assert_eq!(output.code, 0, "agent:\n{}", output.combined);
+    assert!(
+        output.combined.contains("context"),
+        "expected context subcommand in agent help:\n{}",
+        output.combined
     );
 }
