@@ -1086,25 +1086,28 @@ pub async fn run_sandbox_with_backend(
     // supervisor-owned handles shared with the backend.
     let admitted_backend_name = selected_backend.backend_name().to_string();
     let ca_file_paths = Arc::new(std::sync::Mutex::new(None));
-    let (bound, proxy_listener) = selected_backend
-        .attach(
-            backend_setup::BackendServices {
-                ca_file_paths: ca_file_paths.clone(),
-                provider_credentials: provider_credentials.clone(),
-                sandbox_bearer,
-                ownership: hosted.as_ref().map(|hosted| hosted.ownership.clone()),
-            },
-            policy.clone(),
-            openshell_isolation_interface::AgentSpec {
-                program,
-                args,
-                workdir: workspace,
-                timeout_secs,
-                interactive,
-            },
-        )
-        .instrument(tracing::info_span!(parent: &startup, "supervisor.boundary.attach"))
-        .await?;
+    // Box the attach future so recovery handshakes do not inflate this frame.
+    let (bound, proxy_listener) = Box::pin(
+        selected_backend
+            .attach(
+                backend_setup::BackendServices {
+                    ca_file_paths: ca_file_paths.clone(),
+                    provider_credentials: provider_credentials.clone(),
+                    sandbox_bearer,
+                    ownership: hosted.as_ref().map(|hosted| hosted.ownership.clone()),
+                },
+                policy.clone(),
+                openshell_isolation_interface::AgentSpec {
+                    program,
+                    args,
+                    workdir: workspace,
+                    timeout_secs,
+                    interactive,
+                },
+            )
+            .instrument(tracing::info_span!(parent: &startup, "supervisor.boundary.attach")),
+    )
+    .await?;
     info!(backend = %admitted_backend_name, "Isolation boundary attached");
     let remote_boundary = (bound, admitted_backend_name, ca_file_paths);
 
