@@ -879,7 +879,9 @@ Supervisors advertise only installed declarations over their authenticated gatew
 
 Each discovered route contains its service hostname and IDs, trusted supervisor app address, supervisor/runtime identity, declaration and advertisement revisions, and expiry. It contains no credentials. Discovery reads the shared ownership store, so a gateway does not need to own the supervisor control connection. Changed declarations, replaced owners, and expired advertisements disappear from snapshots. Routers must discard expired routes and replace their cache with each snapshot; no replay cursor or gateway fallback is provided.
 
-The POC polls discovery state once per second and bounds each workspace snapshot to 1,000 advertisement records and 4,096 routes. Endpoint lifecycle management and the reference proxy are separate follow-ups.
+The POC polls discovery state once per second and bounds each workspace snapshot to 1,000 advertisement records and 4,096 routes.
+
+The optional OpenShell sandbox proxy consumes these snapshots and routes TLS streams by SNI directly to supervisors. Helm enables it with `sandboxProxy.enabled`. Set `sandboxProxy.gatewayEndpoint` to an HTTPS gateway and `sandboxProxy.workspaces` to its explicit authorized scopes. Supply a bearer credential Secret through `sandboxProxy.discoveryTokenSecret` (key `token`) and, for a private gateway CA, `sandboxProxy.gatewayCaSecret` (key `ca.crt`). It rereads credentials when watches reconnect and needs no application private keys. The proxy defaults to 256 connections and expires cached routes during discovery outages. The development-only `allowPlaintextDevelopment` option requires a plaintext gateway and no bearer credentials. Its app-port NetworkPolicy covers supervisors in the same namespace; other workspace placements require operator-managed policies.
 
 The gateway runs as a Pod and creates paired workload and supervisor Pods in another namespace. The gateway CA is projected from a Kubernetes Secret into supervisor Pods; user client certificate and key entries in that Secret are not exposed to either Pod.
 

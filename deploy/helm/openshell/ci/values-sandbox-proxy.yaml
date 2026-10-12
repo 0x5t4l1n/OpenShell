@@ -1,0 +1,10 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES.
+# SPDX-License-Identifier: Apache-2.0
+
+# Local development only. Layer on values-app-listener.yaml.
+sandboxProxy:
+  enabled: true
+  gatewayEndpoint: http://openshell.openshell.svc.cluster.local:8080
+  allowPlaintextDevelopment: true
+  image:
+    pullPolicy: Never

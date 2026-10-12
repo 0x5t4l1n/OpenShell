@@ -55,6 +55,8 @@ For app route advertisements, verify that `supervisor_app_address_template` and 
 
 For discovery, check `GetServiceRouteSnapshot` or `WatchServiceRoutes` using an explicit workspace and authorized read credentials. Watch responses replace the entire cache; clients must discard expired routes and reopen the POC watch after 60 seconds. Empty snapshots can indicate stale ownership, changed declarations, expired advertisements, or an unconfigured publication address.
 
+For the OpenShell sandbox proxy, check its gateway endpoint, explicit workspace scopes, discovery credential file, and watch reconnects. It forwards TLS unchanged and needs no application private keys. Verify advertised headless DNS resolves to ready supervisor Pods from the proxy network context and uses the app listener port. Unknown SNI and expired caches close connections. Discovery credentials require bearer read access; production discovery uses HTTPS. Restrict direct supervisor access if edge authentication must be enforced.
+
 For direct supervisor app ingress, check the operator's `sandbox_runtime.app_listener` configuration, TLS Secret in the supervisor namespace, headless Service selector, and endpoint readiness. Driver-managed app Services have `clusterIP: None` and use the listener port directly; they select supervisors and are owned by the Sandbox CR. A Service must select supervisor Pods rather than workload Pods. Clients need matching service SNI and HTTP Host. Configuration refresh failures expire app routes after 30 seconds; gateway service URLs still use the gateway relay path. Refer to the published gateway configuration reference for listener fields and limits.
 
 Run diagnostics in order and stop once the root cause is clear.
