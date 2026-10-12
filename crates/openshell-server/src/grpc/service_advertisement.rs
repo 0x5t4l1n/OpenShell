@@ -264,7 +264,7 @@ pub async fn accept(
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::super::test_support::{authed_request, test_server_state};
     use super::*;
     use openshell_core::proto::datamodel::v1::ObjectMeta;
@@ -272,8 +272,9 @@ mod tests {
         ExposeServiceRequest, FilesystemPolicy, SandboxPolicy, SandboxSpec, SandboxStatus,
     };
 
-    async fn fixture() -> (Arc<ServerState>, OwnerGuard, SupervisorServiceAdvertisement) {
+    pub async fn fixture() -> (Arc<ServerState>, OwnerGuard, SupervisorServiceAdvertisement) {
         let mut state = test_server_state().await;
+        Arc::get_mut(&mut state).unwrap().admin_role = "openshell-admin".into();
         let config = &mut Arc::get_mut(&mut state).unwrap().config.service_routing;
         config.supervisor_app_address_template =
             Some("app-{sandbox_id}.{workspace}.svc:443".into());

@@ -50,6 +50,31 @@ struct RelayGateway {
 
 #[tonic::async_trait]
 impl OpenShell for RelayGateway {
+    type WatchServiceRoutesStream = std::pin::Pin<
+        Box<
+            dyn tokio_stream::Stream<
+                    Item = Result<openshell_core::proto::WatchServiceRoutesResponse, Status>,
+                > + Send
+                + 'static,
+        >,
+    >;
+    async fn get_service_route_snapshot(
+        &self,
+        _: tonic::Request<openshell_core::proto::GetServiceRouteSnapshotRequest>,
+    ) -> Result<Response<openshell_core::proto::GetServiceRouteSnapshotResponse>, Status> {
+        Err(Status::unimplemented(
+            "service route discovery not used by this mock",
+        ))
+    }
+    async fn watch_service_routes(
+        &self,
+        _: tonic::Request<openshell_core::proto::WatchServiceRoutesRequest>,
+    ) -> Result<Response<Self::WatchServiceRoutesStream>, Status> {
+        Err(Status::unimplemented(
+            "service route discovery not used by this mock",
+        ))
+    }
+
     async fn peer_report_provider_readiness(
         &self,
         _request: tonic::Request<openshell_core::proto::ReportProviderReadinessRequest>,

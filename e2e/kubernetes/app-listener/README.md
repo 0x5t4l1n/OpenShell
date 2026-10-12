@@ -124,3 +124,17 @@ Supply the public certificate to that client without copying the private key. Ve
 ## Limitations
 
 This is HTTP/1.1 plus WebSockets, with 64 connections per supervisor, 10-second TLS/header/connect deadlines, and a 30-second route freshness lease. TLS credentials reload on supervisor recreation. There is no native user/workspace ingress authorization or new ingress policy schema; gateway-authorized declarations form the ingress allowlist. Restrict listener reachability if edge authentication is required.
+
+## Discover installed routes
+
+After exposure and configuration sync, query the gateway from the repository root:
+
+```shell
+grpcurl -plaintext -import-path proto -proto openshell.proto \
+  -d '{"workspaceScope":{"workspace":"default"}}' \
+  127.0.0.1:8090 openshell.v1.OpenShell/GetServiceRouteSnapshot
+```
+
+Use `WatchServiceRoutes` with the same request to receive complete replacement snapshots. The local profile enables development authentication; production callers need bearer read credentials and membership in the selected workspace. The POC watch ends after 60 seconds and must be reopened. Clients replace their route cache and discard expired entries.
+
+Confirm the `web` route uses the manually created supervisor Service address and expected service hostname. Change or delete the declaration and verify its old revision disappears from the watch. Recreate the supervisor and verify discovery publishes the new runtime identity only after it accepts the route. Application health is not inferred from an advertisement.
