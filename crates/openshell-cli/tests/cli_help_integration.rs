@@ -180,177 +180,54 @@ fn gateway_add_rejects_removed_ssh_key_flag() {
     );
 }
 
-/// Upper bound for the overview every agent loads first. If this fails, move
-/// detail out of the overview rather than raising the bound casually.
-const AGENT_OVERVIEW_BUDGET_BYTES: usize = 10_000;
-/// Upper bound for one section. If this fails, split the section in
-/// `AGENT_SECTIONS` so agents keep loading only what they need.
-const AGENT_SECTION_BUDGET_BYTES: usize = 24_000;
-
-/// Section names and their leaf command paths, parsed from the overview.
-fn overview_sections(overview: &str) -> Vec<(String, Vec<String>)> {
-    let mut sections: Vec<(String, Vec<String>)> = Vec::new();
-    let body = overview
-        .split_once("\n## Sections\n")
-        .map_or("", |(_, body)| body);
-    for line in body.lines() {
-        if let Some(name) = line.strip_prefix("### ") {
-            sections.push((name.to_string(), Vec::new()));
-        } else if let Some(entry) = line.strip_prefix("  ")
-            && let Some((_, leaves)) = sections.last_mut()
-        {
-            let path = entry.split("  ").next().unwrap_or_default();
-            leaves.push(path.to_string());
-        }
-    }
-    sections
-}
+/// Upper bound for the agent bootstrap. If this fails, keep long detail in
+/// `--help` rather than raising the bound casually.
+const AGENT_CONTEXT_BUDGET_BYTES: usize = 56_000;
 
 #[test]
-fn agent_context_overview_lists_every_section_without_details() {
+fn agent_context_prints_compact_reference_for_every_command() {
     // Force color to prove the reference stays plain even when styling is on.
     let output = run_isolated(&["--color", "always", "agent", "context"]);
     assert_eq!(output.code, 0, "agent context:\n{}", output.combined);
-    let overview = &output.stdout;
+    let reference = &output.stdout;
 
     for expected in [
         "## Global flags",
-        "## Sections",
-        "### sandboxes",
-        "### providers",
-        "  sandbox create",
-        "  provider refresh configure",
-        "  workspace member add",
-        "  agent context",
+        "## sandbox: Manage sandboxes (alias: sb)",
+        "\nopenshell sandbox create [OPTIONS] [-- <COMMAND>...]\n",
+        "  --from <FROM>",
+        "\nopenshell sandbox provider attach ",
+        "\nopenshell provider refresh configure ",
+        "\nopenshell workspace member add ",
+        "\nopenshell agent context ",
+        "  $ openshell sandbox create",
     ] {
         assert!(
-            overview.contains(expected),
-            "expected '{expected}' in agent context overview:\n{overview}"
+            reference.contains(expected),
+            "expected '{expected}' in agent context:\n{reference}"
         );
     }
-    for unexpected in ["### other", "Usage:", "doctor", "ssh-proxy", "\x1b"] {
+    for unexpected in ["doctor", "ssh-proxy", "  --keep ", "\x1b"] {
         assert!(
-            !overview.contains(unexpected),
-            "unexpected '{unexpected}' in agent context overview:\n{overview}"
+            !reference.contains(unexpected),
+            "unexpected '{unexpected}' in agent context:\n{reference}"
         );
     }
     assert!(
-        overview.len() <= AGENT_OVERVIEW_BUDGET_BYTES,
-        "agent context overview is {} bytes, over the {AGENT_OVERVIEW_BUDGET_BYTES}-byte budget",
-        overview.len()
+        reference.len() <= AGENT_CONTEXT_BUDGET_BYTES,
+        "agent context is {} bytes, over the {AGENT_CONTEXT_BUDGET_BYTES}-byte budget",
+        reference.len()
     );
 }
 
 #[test]
-fn agent_context_sections_document_every_overview_command() {
-    let overview = run_isolated(&["agent", "context"]);
-    assert_eq!(overview.code, 0, "agent context:\n{}", overview.combined);
-    let sections = overview_sections(&overview.stdout);
-    assert!(
-        sections.len() > 1,
-        "expected sections in overview:\n{}",
-        overview.stdout
-    );
-
-    for (name, leaves) in sections {
-        assert!(
-            !leaves.is_empty(),
-            "section '{name}' lists no commands in the overview:\n{}",
-            overview.stdout
-        );
-        let output = run_isolated(&["--color", "always", "agent", "context", &name]);
-        assert_eq!(output.code, 0, "agent context {name}:\n{}", output.combined);
-        for leaf in leaves {
-            let heading = format!("\n## openshell {leaf}\n");
-            assert!(
-                output.stdout.contains(&heading),
-                "section '{name}' is missing '{leaf}':\n{}",
-                output.stdout
-            );
-        }
-        for unexpected in ["## Global flags", "  --keep\n", "\x1b"] {
-            assert!(
-                !output.stdout.contains(unexpected),
-                "unexpected '{unexpected}' in section '{name}':\n{}",
-                output.stdout
-            );
-        }
-        assert!(
-            output.stdout.len() <= AGENT_SECTION_BUDGET_BYTES,
-            "section '{name}' is {} bytes, over the {AGENT_SECTION_BUDGET_BYTES}-byte budget",
-            output.stdout.len()
-        );
-    }
-}
-
-#[test]
-fn agent_context_section_points_to_related_sections() {
-    let output = run_isolated(&["agent", "context", "sandboxes"]);
-    assert_eq!(
-        output.code, 0,
-        "agent context sandboxes:\n{}",
-        output.combined
-    );
-
-    for expected in [
-        "## openshell sandbox create",
-        "## openshell logs",
-        "(see section providers)",
-        "(see section templates)",
-    ] {
-        assert!(
-            output.stdout.contains(expected),
-            "expected '{expected}' in sandboxes section:\n{}",
-            output.stdout
-        );
-    }
-    assert!(
-        !output
-            .stdout
-            .contains("## openshell sandbox provider attach"),
-        "sandbox provider commands belong to the providers section:\n{}",
-        output.stdout
-    );
-}
-
-#[test]
-fn agent_context_narrows_to_command_path() {
-    let output = run_isolated(&["agent", "context", "sb", "create"]);
-    assert_eq!(
-        output.code, 0,
-        "agent context sb create:\n{}",
-        output.combined
-    );
-
-    assert!(
-        output.stdout.contains("## openshell sandbox create"),
-        "expected sandbox create in narrowed agent context:\n{}",
-        output.stdout
-    );
-    for excluded in ["## openshell sandbox list", "## openshell gateway add"] {
-        assert!(
-            !output.stdout.contains(excluded),
-            "unexpected '{excluded}' in narrowed agent context:\n{}",
-            output.stdout
-        );
-    }
-}
-
-#[test]
-fn agent_context_rejects_unknown_target() {
-    let output = run_isolated(&["agent", "context", "bogus"]);
+fn agent_context_rejects_arguments() {
+    let output = run_isolated(&["agent", "context", "sandbox"]);
     assert_ne!(
         output.code, 0,
-        "unknown target should fail:\n{}",
+        "agent context takes no arguments:\n{}",
         output.combined
     );
-    for expected in ["unknown section or command `bogus`", "sandboxes"] {
-        assert!(
-            output.combined.contains(expected),
-            "expected '{expected}' in error:\n{}",
-            output.combined
-        );
-    }
 }
 
 #[test]

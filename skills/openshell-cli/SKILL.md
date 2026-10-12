@@ -13,7 +13,7 @@ The OpenShell CLI (`openshell`) is the primary interface for managing sandboxes,
 
 **Companion skill**: For creating or modifying sandbox policy YAML content (network rules, L7 inspection, access presets), use the `generate-sandbox-policy` skill. This skill covers the CLI *commands* for the policy lifecycle; `generate-sandbox-policy` covers policy *content authoring*.
 
-**Self-teaching**: Run `openshell agent context` at the start of a session. It prints global flags and an overview of every installed command, grouped into sections of commands that are used together. Then run `openshell agent context <section>` for the full usage, flags, and examples of the section you need, such as `openshell agent context sandboxes`. The reference is generated from the binary, so it always matches the installed version. When you encounter a command or option not covered in this skill, check that reference before guessing.
+**Self-teaching**: Run `openshell agent context` at the start of a session. It prints every command of the installed CLI with its usage line and description, and every flag with its description, allowed values, default, and environment variable. The reference is generated from the binary, so it always matches the installed version, and it covers most tasks without further lookups. When you encounter a command or option not covered in this skill, check that reference before guessing. If the CLI rejects a flag combination, run `openshell <group> <cmd> --help` for flag constraints.
 
 If the installed CLI does not have `agent context`, walk the help tree instead:
 
@@ -973,10 +973,9 @@ Prefer loopback binds unless the user explicitly needs LAN-visible local access.
 
 When you encounter a command or option not covered in this skill:
 
-1. **Load the overview**: `openshell agent context` prints global flags and every command, grouped into named sections.
-2. **Load a section**: `openshell agent context <section>` prints usage, arguments, flags, defaults, environment variables, allowed values, conflicts, and examples for each command in that section (e.g., `openshell agent context providers`).
-3. **Load one command**: `openshell agent context <group> [<cmd>]` prints one group or command (e.g., `openshell agent context sandbox upload`). Command aliases such as `sb` also work.
-4. **Fall back**: on a CLI that predates `agent context`, use `openshell <group> <cmd> --help`.
+1. **Load the reference**: `openshell agent context` lists every command with its usage line and description, and every flag with its description, allowed values, default, and environment variable.
+2. **Check constraints**: `openshell <group> <cmd> --help` shows the same command in its human layout, including which flags conflict (e.g., `openshell sandbox create --help`).
+3. **Fall back**: on a CLI that predates `agent context`, walk `openshell --help`, `openshell <group> --help`, and `openshell <group> <cmd> --help`.
 
 The generated reference is always authoritative. If it contradicts this skill, follow the reference -- the CLI may have been updated since this skill was written.
 
@@ -984,10 +983,10 @@ The generated reference is always authoritative. If it contradicts this skill, f
 
 ```bash
 $ openshell agent context
-# Shows: global flags and every command, grouped into sections with a one-line summary each
+# Shows: global flags, then every command with its usage line, flags, and examples
 
-$ openshell agent context sandbox upload
-# Shows: positional arguments (name, path, dest), flags, and defaults
+$ openshell sandbox create --help
+# Shows: the create flags in their human layout, including conflicts between them
 ```
 
 ---

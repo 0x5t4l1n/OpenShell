@@ -18,7 +18,6 @@ use openshell_bootstrap::{
     edge_token::load_edge_token, get_gateway_metadata, list_gateways, load_active_gateway,
     load_gateway_metadata, load_last_sandbox, save_last_sandbox,
 };
-use openshell_cli::agent::ContextSection;
 use openshell_cli::completers;
 use openshell_cli::run;
 use openshell_cli::tls::TlsOptions;
@@ -430,56 +429,7 @@ const DOCTOR_HELP: &str = "\x1b[1mALIAS\x1b[0m
 
 const AGENT_EXAMPLES: &str = "\x1b[1mEXAMPLES\x1b[0m
   $ openshell agent context
-  $ openshell agent context sandboxes
-  $ openshell agent context sandbox create
 ";
-
-/// Sections for `openshell agent context`. Each one groups the commands an
-/// agent usually needs together for one workflow, so a single call returns a
-/// useful slice of the CLI. Every visible command must belong to a section;
-/// the `agent_sections_cover_every_command` test enforces this.
-const AGENT_SECTIONS: &[ContextSection] = &[
-    ContextSection {
-        name: "sandboxes",
-        summary: "Create, run, connect to, and inspect sandboxes, copy files, and read logs.",
-        commands: &["sandbox", "logs"],
-    },
-    ContextSection {
-        name: "templates",
-        summary: "Define reusable sandbox workload templates.",
-        commands: &["sandbox template"],
-    },
-    ContextSection {
-        name: "providers",
-        summary: "Store credentials as providers, manage provider profiles, and attach providers to sandboxes.",
-        commands: &["provider", "profile", "sandbox provider"],
-    },
-    ContextSection {
-        name: "policies",
-        summary: "Control what sandboxes can reach, and change sandbox and gateway settings.",
-        commands: &["policy", "settings"],
-    },
-    ContextSection {
-        name: "ports",
-        summary: "Forward local ports to sandboxes and expose sandbox services.",
-        commands: &["forward", "service"],
-    },
-    ContextSection {
-        name: "gateways",
-        summary: "Register, select, and sign in to gateways, and check gateway status and identity.",
-        commands: &["gateway", "status", "whoami"],
-    },
-    ContextSection {
-        name: "workspaces",
-        summary: "Create workspaces and manage their members.",
-        commands: &["workspace"],
-    },
-    ContextSection {
-        name: "tools",
-        summary: "Local utilities: this agent reference, the terminal UI, and shell completions.",
-        commands: &["agent", "term", "completions"],
-    },
-];
 
 /// `OpenShell` CLI - agent execution and management.
 #[derive(Parser, Debug)]
@@ -1498,21 +1448,15 @@ enum GatewayCommands {
 
 #[derive(Subcommand, Debug)]
 enum AgentCommands {
-    /// Print a plain-text CLI reference for coding agents.
+    /// Print a compact reference of every command and flag for coding agents.
     ///
-    /// Without arguments, prints global flags and an overview of every
-    /// command, grouped into sections of commands that are used together.
-    /// Pass a section name for the usage, flags, and examples of every command
-    /// in that section, or a command path for one command or command group.
-    /// The reference is generated from this binary's command definitions, so
-    /// it always matches the installed version.
+    /// Lists each command with its usage line and description, and each flag
+    /// with its description, allowed values, default, and environment
+    /// variable. The reference is generated from this binary's command
+    /// definitions, so it always matches the installed version. Use `--help`
+    /// on a command for flag constraints, such as which flags conflict.
     #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
-    Context {
-        /// Section name, such as `sandboxes`, or command path, such as
-        /// `sandbox create`.
-        #[arg(value_name = "SECTION|COMMAND")]
-        target: Vec<String>,
-    },
+    Context,
 }
 
 // -----------------------------------------------------------------------
@@ -4175,10 +4119,9 @@ async fn run_async() -> Result<()> {
             .await?;
         }
         Some(Commands::Agent {
-            command: Some(AgentCommands::Context { target }),
+            command: Some(AgentCommands::Context),
         }) => {
-            let reference =
-                openshell_cli::agent::render_context(&Cli::command(), AGENT_SECTIONS, &target)?;
+            let reference = openshell_cli::agent::render_context(&Cli::command());
             write_stdout(reference.as_bytes())
                 .map_err(|e| miette::miette!("failed to write agent context: {e}"))?;
         }
@@ -4471,13 +4414,37 @@ mod tests {
     }
 
     #[test]
-    fn agent_sections_cover_every_command() {
-        let problems = openshell_cli::agent::section_problems(&Cli::command(), AGENT_SECTIONS);
-        assert!(
-            problems.is_empty(),
-            "update AGENT_SECTIONS so every visible command has one section:\n{}",
-            problems.join("\n")
-        );
+    fn agent_context_lists_every_visible_command() {
+        fn leaf_paths(cmd: &clap::Command, prefix: &str, paths: &mut Vec<String>) {
+            let path = format!("{prefix} {}", cmd.get_name());
+            let mut children = cmd
+                .get_subcommands()
+                .filter(|c| !c.is_hide_set())
+                .peekable();
+            if children.peek().is_none() {
+                paths.push(path);
+            } else {
+                for child in children {
+                    leaf_paths(child, &path, paths);
+                }
+            }
+        }
+
+        let root = Cli::command();
+        let mut paths = Vec::new();
+        for command in root.get_subcommands().filter(|c| !c.is_hide_set()) {
+            leaf_paths(command, root.get_name(), &mut paths);
+        }
+        let reference = openshell_cli::agent::render_context(&root);
+
+        assert!(paths.len() > 50, "expected many commands, got {paths:?}");
+        for path in paths {
+            assert!(
+                reference.contains(&format!("\n{path}\n"))
+                    || reference.contains(&format!("\n{path} ")),
+                "agent context is missing `{path}`"
+            );
+        }
     }
 
     #[test]
