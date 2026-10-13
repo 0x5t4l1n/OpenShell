@@ -29,17 +29,18 @@ use openshell_core::proto::{
     MiddlewareSessionEndReason, RequestContext, http_preflight,
 };
 use tokio::sync::mpsc;
+use tokio::time::Instant;
 
 use super::pipeline::{
     self, BodyModeOffer, HTTP_BUFFERED_BODY_TIMEOUT, HttpBodyInput, HttpBodyOutput, HttpDirection,
-    HttpMiddlewareFailure, HttpPipelineFinish, HttpStageDiagnostics, Pipeline, PipelineSpec,
-    PipelineTimeouts, StageHead,
+    HttpFailureCode, HttpMiddlewareFailure, HttpPipelineFinish, HttpStageDiagnostics,
+    MiddlewareFailureDetail, Pipeline, PipelineSpec, PipelineTimeouts, StageHead,
 };
 use super::validate_head_input;
 use crate::headers::HeaderAuthority;
 use crate::{
-    ChainRunner, DescribedChainEntry, HttpResponsePreflightInput, MiddlewareDenial,
-    MiddlewareSessionAdmission, MiddlewareSessionPermit, ensure_chain_capacity,
+    ChainRunner, DescribedChainEntry, HttpResponsePreflightInput, MAX_MIDDLEWARE_CHAIN_TIMEOUT,
+    MiddlewareDenial, ensure_chain_capacity,
 };
 
 /// How the relay delivers one response.
@@ -69,23 +70,24 @@ pub struct HttpResponsePipelinePreflight {
     pub allowed: bool,
     pub reason: String,
     pub denial: Option<MiddlewareDenial>,
+    /// Present when the chain failed closed for a reason the sandbox may see.
+    pub failure: Option<MiddlewareFailureDetail>,
     /// Head after every preflight mutation.
     pub headers: Vec<HttpHeader>,
     /// Present when a stage selected a body mode.
     pub session: Option<HttpResponsePipelineSession>,
     pub diagnostics: HttpStageDiagnostics,
-    /// Every persistent middleware session was in use, so the response
-    /// failed closed.
+    /// No HTTP session hook slot freed up within the chain deadline, so the
+    /// response failed closed.
     pub session_capacity_exhausted: bool,
 }
 
 /// Response body stages selected at preflight.
 ///
-/// The session holds one slot of the persistent middleware session budget
-/// until it ends.
+/// The session holds its HTTP session hook budget slots while its body
+/// stages run.
 pub struct HttpResponsePipelineSession {
     pipeline: Pipeline,
-    _session: MiddlewareSessionPermit,
 }
 
 impl HttpResponsePipelineSession {
@@ -274,6 +276,9 @@ impl StageHead for ResponseHead<'_> {
 impl ChainRunner {
     /// Run HTTP session hook response preflight over a described chain.
     /// Returns an error only for a chain over platform capacity.
+    ///
+    /// Preflight waits for an HTTP session hook slot within the chain
+    /// deadline, and the slot is released once no stage inspects the body.
     pub async fn preflight_http_response_pipeline(
         &self,
         described: Vec<DescribedChainEntry>,
@@ -287,16 +292,12 @@ impl ChainRunner {
         if let Err(reason) = validate_head_input(&input.context, &input.target, &input.headers) {
             return Ok(chain_failure(&described, input.headers, reason));
         }
-        let session = if described.iter().any(DescribedChainEntry::is_resolved) {
-            match self.try_reserve_middleware_session() {
-                MiddlewareSessionAdmission::Admitted(permit) => Some(permit),
-                MiddlewareSessionAdmission::AtCapacity => {
-                    return Ok(HttpResponsePipelinePreflight {
-                        session_capacity_exhausted: true,
-                        ..chain_failure(&described, input.headers, "session_capacity_exhausted")
-                    });
-                }
-            }
+        let chain_deadline = Instant::now() + MAX_MIDDLEWARE_CHAIN_TIMEOUT;
+        let slot = if described.iter().any(DescribedChainEntry::is_resolved) {
+            let Some(slot) = self.reserve_http_session(chain_deadline).await else {
+                return Ok(capacity_exhausted(&described, input.headers));
+            };
+            Some(slot)
         } else {
             None
         };
@@ -318,18 +319,25 @@ impl ChainRunner {
             input.headers.clone(),
             input.declared_body_length,
             &head,
+            chain_deadline,
         )
         .await;
-        let session = preflight
-            .pipeline
-            .map(|pipeline| HttpResponsePipelineSession {
-                pipeline,
-                _session: session.expect("a selected stage implies a resolved entry"),
-            });
+        let session = match preflight.pipeline {
+            Some(pipeline) => {
+                let slot = slot.expect("a selected stage implies a resolved entry");
+                let Some(pipeline) = self.admit_body(pipeline, slot, chain_deadline).await else {
+                    return Ok(capacity_exhausted(&described, input.headers));
+                };
+                Some(HttpResponsePipelineSession { pipeline })
+            }
+            // No stage inspects the body, so the slot is released here.
+            None => None,
+        };
         Ok(HttpResponsePipelinePreflight {
             allowed: preflight.allowed,
             reason: preflight.reason,
             denial: preflight.denial,
+            failure: preflight.failure,
             headers: preflight.headers,
             session,
             diagnostics: preflight.diagnostics,
@@ -356,6 +364,7 @@ fn outcome(
         allowed: true,
         reason: String::new(),
         denial: None,
+        failure: None,
         headers,
         session: None,
         diagnostics,
@@ -369,14 +378,35 @@ fn chain_failure(
     headers: Vec<HttpHeader>,
     reason: &str,
 ) -> HttpResponsePipelinePreflight {
-    let mut diagnostics = HttpStageDiagnostics::default();
-    if let Some(entry) = entries.first() {
-        diagnostics.extend(*pipeline::entry_failure(entry, reason).diagnostics);
-    }
+    let Some(entry) = entries.first() else {
+        return HttpResponsePipelinePreflight {
+            allowed: false,
+            reason: format!("middleware_failed: {reason}"),
+            ..outcome(headers, HttpStageDiagnostics::default())
+        };
+    };
+    let failure = pipeline::entry_failure(entry, reason);
     HttpResponsePipelinePreflight {
         allowed: false,
-        reason: format!("middleware_failed: {reason}"),
-        ..outcome(headers, diagnostics)
+        reason: failure.reason,
+        failure: failure.failure.map(|failure| *failure),
+        ..outcome(headers, *failure.diagnostics)
+    }
+}
+
+/// No HTTP session hook slot freed up within the chain deadline. No stage
+/// owns this failure.
+fn capacity_exhausted(
+    entries: &[DescribedChainEntry],
+    headers: Vec<HttpHeader>,
+) -> HttpResponsePipelinePreflight {
+    HttpResponsePipelinePreflight {
+        session_capacity_exhausted: true,
+        failure: Some(MiddlewareFailureDetail {
+            config_name: None,
+            code: HttpFailureCode::Unavailable,
+        }),
+        ..chain_failure(entries, headers, "session_capacity_exhausted")
     }
 }
 

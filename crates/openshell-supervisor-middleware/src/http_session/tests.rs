@@ -20,10 +20,14 @@ use openshell_core::proto::{
 };
 use tokio::sync::mpsc;
 
+use super::pipeline::entry_failure;
 use crate::{
-    ChainEntry, ChainRunner, HttpBodyInput, HttpBodyOutput, HttpRequestPreflightInput,
-    HttpRequestView, HttpResultStream, HttpStageOutcome, InProcessMiddleware, MiddlewareRegistry,
-    OnError, TransformedBodyPolicy, UninspectableTrafficInput, validate_manifest_bindings,
+    ChainEntry, ChainRunner, DescribedChainEntry, HttpBodyInput, HttpBodyOutput, HttpFailureCode,
+    HttpRequestPreflightInput, HttpRequestView, HttpResultStream, HttpStageOutcome,
+    InProcessMiddleware, MAX_CONCURRENT_HTTP_MIDDLEWARE_SESSIONS,
+    MAX_CONCURRENT_HTTP_MIDDLEWARE_STREAMS, MAX_MIDDLEWARE_CHAIN_TIMEOUT, MiddlewareFailureDetail,
+    MiddlewareRegistry, OnError, TransformedBodyPolicy, UninspectableTrafficInput,
+    validate_manifest_bindings,
 };
 
 fn binding(operation: SupervisorMiddlewareOperation) -> MiddlewareBinding {
@@ -392,7 +396,10 @@ fn mutation_values(mutations: &[HeaderMutation]) -> Vec<String> {
         .collect()
 }
 
-async fn run(stages: Vec<Arc<ScriptedStage>>, body: &[u8]) -> Run {
+/// A runner over `stages` and their chain, described in stage order.
+async fn scripted_chain(
+    stages: Vec<Arc<ScriptedStage>>,
+) -> (ChainRunner, Vec<DescribedChainEntry>) {
     let entries: Vec<_> = stages
         .iter()
         .zip(0..)
@@ -407,6 +414,11 @@ async fn run(stages: Vec<Arc<ScriptedStage>>, body: &[u8]) -> Run {
         .expect("registry");
     let runner = ChainRunner::from_registry(registry);
     let described = runner.describe_chain(&entries).await.expect("described");
+    (runner, described)
+}
+
+async fn run(stages: Vec<Arc<ScriptedStage>>, body: &[u8]) -> Run {
+    let (runner, described) = scripted_chain(stages).await;
     let preflight = runner
         .preflight_described_http_request(described, request_input(body))
         .await
@@ -727,4 +739,234 @@ async fn only_request_bindings_decide_about_uninspectable_traffic() {
         .await;
     assert!(!denied.allowed);
     assert_eq!(denied.reason, "middleware_failed: traffic_uninspectable");
+}
+
+fn scripted(name: &'static str, preflight: Preflight, body: Body) -> Arc<ScriptedStage> {
+    Arc::new(ScriptedStage::new(name, preflight, body))
+}
+
+/// Free HTTP session hook slots, then free STREAM slots.
+fn free_slots(runner: &ChainRunner) -> (usize, usize) {
+    (
+        runner.registry.http_session_admission.available_permits(),
+        runner.registry.http_stream_admission.available_permits(),
+    )
+}
+
+#[tokio::test]
+async fn a_message_holds_session_slots_only_while_a_stage_inspects_it() {
+    use HttpBodyMode::{Buffered, Stream};
+    let full = (
+        MAX_CONCURRENT_HTTP_MIDDLEWARE_SESSIONS,
+        MAX_CONCURRENT_HTTP_MIDDLEWARE_STREAMS,
+    );
+    for (case, stages, held) in [
+        (
+            "continue releases the slot after preflight",
+            vec![scripted("example/a", Preflight::Continue, Body::Unchanged)],
+            (full.0, full.1),
+        ),
+        (
+            "BUFFERED keeps the preflight slot",
+            vec![scripted(
+                "example/a",
+                Preflight::Inspect(Buffered),
+                Body::Unchanged,
+            )],
+            (full.0 - 1, full.1),
+        ),
+        (
+            "STREAM moves to the stream budget",
+            vec![scripted(
+                "example/a",
+                Preflight::Inspect(Stream),
+                Body::Uppercase,
+            )],
+            (full.0, full.1 - 1),
+        ),
+        (
+            "BUFFERED and STREAM hold both",
+            vec![
+                scripted("example/a", Preflight::Inspect(Buffered), Body::Unchanged),
+                scripted("example/b", Preflight::Inspect(Stream), Body::Uppercase),
+            ],
+            (full.0 - 1, full.1 - 1),
+        ),
+    ] {
+        let (runner, described) = scripted_chain(stages).await;
+        let preflight = runner
+            .preflight_described_http_request(described, request_input(b"hello"))
+            .await
+            .expect("preflight");
+        assert!(preflight.allowed, "{case}: {}", preflight.reason);
+        assert_eq!(free_slots(&runner), held, "{case}");
+        let Some(session) = preflight.session else {
+            continue;
+        };
+        let buffers = session.withholds_output();
+        let streams = session.streams();
+        let (input, inputs) = mpsc::channel(4);
+        input
+            .send(HttpBodyInput::Chunk(b"hello".to_vec()))
+            .await
+            .expect("queue body");
+        input
+            .send(HttpBodyInput::End {
+                trailers: Vec::new(),
+            })
+            .await
+            .expect("queue end");
+        let (output, mut outputs) = mpsc::channel(1);
+        let run =
+            session.run_with_body_policy(inputs, output, TransformedBodyPolicy::NotPolicyRelevant);
+        let check = async {
+            if buffers && streams {
+                // The BUFFERED stage ends while the output is not read, and
+                // its slot frees up before the STREAM stage ends.
+                tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                    while free_slots(&runner).0 != full.0 {
+                        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                    }
+                })
+                .await
+                .expect("the BUFFERED slot frees up");
+                assert_eq!(free_slots(&runner), (full.0, full.1 - 1), "{case}");
+            }
+            while outputs.recv().await.is_some() {}
+        };
+        let (finish, ()) = tokio::join!(run, check);
+        finish.expect("body run");
+        assert_eq!(free_slots(&runner), full, "{case}");
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn preflight_waits_for_a_session_slot_within_the_chain_deadline() {
+    let (runner, described) = scripted_chain(vec![scripted(
+        "example/a",
+        Preflight::Continue,
+        Body::Unchanged,
+    )])
+    .await;
+    let mut held = Arc::clone(&runner.registry.http_session_admission)
+        .acquire_many_owned(
+            u32::try_from(MAX_CONCURRENT_HTTP_MIDDLEWARE_SESSIONS).expect("slot count"),
+        )
+        .await
+        .expect("hold every slot");
+
+    let started = tokio::time::Instant::now();
+    let shed = runner
+        .preflight_described_http_request(described.clone(), request_input(b""))
+        .await
+        .expect("preflight");
+    assert!(!shed.allowed);
+    assert!(shed.session_capacity_exhausted);
+    assert_eq!(started.elapsed(), MAX_MIDDLEWARE_CHAIN_TIMEOUT);
+
+    let waiting = runner.preflight_described_http_request(described, request_input(b""));
+    tokio::pin!(waiting);
+    assert!(futures::poll!(waiting.as_mut()).is_pending());
+    drop(held.split(1));
+    let admitted = waiting.await.expect("preflight");
+    assert!(admitted.allowed, "{}", admitted.reason);
+    assert!(!admitted.session_capacity_exhausted);
+}
+
+#[tokio::test]
+async fn failures_name_the_failed_stage_and_a_platform_code() {
+    for (status, code) in [
+        (
+            tonic::Code::FailedPrecondition,
+            HttpFailureCode::CannotInspect,
+        ),
+        (tonic::Code::DeadlineExceeded, HttpFailureCode::Timeout),
+        (
+            tonic::Code::Unimplemented,
+            HttpFailureCode::LifecycleViolation,
+        ),
+        // The reason keeps an in-process service's status text; the code
+        // the sandbox sees does not.
+        (tonic::Code::Unavailable, HttpFailureCode::Unavailable),
+        (tonic::Code::Internal, HttpFailureCode::Unavailable),
+    ] {
+        let (runner, described) = scripted_chain(vec![scripted(
+            "example/a",
+            Preflight::Fail(status),
+            Body::Unchanged,
+        )])
+        .await;
+        let preflight = runner
+            .preflight_described_http_request(described, request_input(b"hello"))
+            .await
+            .expect("preflight");
+        assert!(!preflight.allowed, "{status:?}");
+        assert_eq!(
+            preflight.failure,
+            Some(MiddlewareFailureDetail {
+                config_name: Some("example/a-config".into()),
+                code,
+            }),
+            "{status:?}"
+        );
+    }
+
+    let (runner, described) = scripted_chain(vec![scripted(
+        "example/a",
+        Preflight::Reject("blocked_term"),
+        Body::Unchanged,
+    )])
+    .await;
+    let rejected = runner
+        .preflight_described_http_request(described, request_input(b"hello"))
+        .await
+        .expect("preflight");
+    assert!(rejected.denial.is_some());
+    assert!(rejected.failure.is_none());
+}
+
+#[tokio::test]
+async fn failure_reasons_map_to_a_closed_set_of_sandbox_codes() {
+    let (_, described) = scripted_chain(vec![scripted(
+        "example/a",
+        Preflight::Continue,
+        Body::Unchanged,
+    )])
+    .await;
+    for (reason, code) in [
+        ("middleware_cannot_inspect", "middleware_cannot_inspect"),
+        ("head_input_over_capacity", "middleware_cannot_inspect"),
+        (
+            "response_input_unrepresentable",
+            "middleware_cannot_inspect",
+        ),
+        ("middleware_timeout", "middleware_timeout"),
+        ("middleware_chain_timeout", "middleware_timeout"),
+        ("middleware_body_timeout", "middleware_timeout"),
+        ("middleware_stall_timeout", "stream_idle_timeout"),
+        ("binding_not_described", "middleware_unavailable"),
+        ("session_capacity_exhausted", "middleware_unavailable"),
+        ("buffered_input_over_capacity", "body_over_limit"),
+        ("buffered_output_over_capacity", "body_over_limit"),
+        ("request_output_over_capacity", "body_over_limit"),
+        (
+            "middleware_hook_versions_mixed",
+            "middleware_hook_versions_mixed",
+        ),
+        ("middleware_unimplemented", "middleware_lifecycle_violation"),
+        (
+            "middleware_result_stream_closed",
+            "middleware_lifecycle_violation",
+        ),
+        (
+            "stream_output_length_mismatch",
+            "middleware_lifecycle_violation",
+        ),
+        ("preflight_result_unknown", "middleware_lifecycle_violation"),
+    ] {
+        let failure = entry_failure(&described[0], reason)
+            .failure
+            .expect("failure detail");
+        assert_eq!(failure.code.as_str(), code, "{reason}");
+    }
 }

@@ -13,19 +13,54 @@ use openshell_ocsf::{
     ocsf_emit,
 };
 use openshell_supervisor_middleware::{
-    ChainHttpHookVersion, HttpBodyInput, HttpBodyOutput, HttpMiddlewareFailure, HttpPipelineFinish,
-    HttpRequestPreflightInput, HttpRequestSession, HttpStageDiagnostics,
+    ChainHttpHookVersion, HttpBodyInput, HttpBodyOutput, HttpFailureCode, HttpMiddlewareFailure,
+    HttpPipelineFinish, HttpRequestPreflightInput, HttpRequestSession, HttpStageDiagnostics,
+    MiddlewareFailureDetail,
 };
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
-use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::mpsc;
 
 /// How long the sandbox may stop sending a request body while a STREAM
 /// request middleware session is held. STREAM has no total deadline, so this
 /// bounds a paused upload; it matches the WebSocket message-assembly limit.
 pub const REQUEST_CLIENT_PROGRESS_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Longest the relay keeps discarding what the sandbox still sends after an
+/// early response.
+const EARLY_RESPONSE_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
+/// Longest the sandbox may send nothing before the relay stops discarding its
+/// input after an early response.
+const EARLY_RESPONSE_DRAIN_IDLE: Duration = Duration::from_secs(2);
+/// Most bytes the relay discards after an early response.
+const EARLY_RESPONSE_DRAIN_BYTES: usize = 8 * 1024 * 1024;
+
+/// Close the sandbox connection after answering a request before reading all
+/// of it, such as a middleware rejection before or during the upload.
+///
+/// Closing a socket with unread input resets the connection, and the sandbox
+/// may then never read the answer. Shut down writing first, then discard
+/// input until the sandbox closes, goes idle, or a time or byte bound is
+/// reached.
+pub async fn close_after_early_response<C: AsyncRead + AsyncWrite + Unpin>(
+    client: &mut C,
+) -> Result<()> {
+    client.shutdown().await.into_diagnostic()?;
+    let mut discard = vec![0u8; 16 * 1024];
+    let mut discarded = 0usize;
+    let _ = tokio::time::timeout(EARLY_RESPONSE_DRAIN_TIMEOUT, async {
+        while discarded < EARLY_RESPONSE_DRAIN_BYTES {
+            match tokio::time::timeout(EARLY_RESPONSE_DRAIN_IDLE, client.read(&mut discard)).await {
+                Ok(Ok(read)) if read > 0 => discarded += read,
+                _ => break,
+            }
+        }
+    })
+    .await;
+    Ok(())
+}
 
 pub enum MiddlewareApplyResult {
     Allowed(crate::l7::provider::L7Request),
@@ -37,6 +72,8 @@ pub enum MiddlewareApplyResult {
     },
     Denied {
         denial: Option<openshell_supervisor_middleware::MiddlewareDenial>,
+        /// Why an HTTP session hook chain failed closed, when it did.
+        failure: Option<MiddlewareFailureDetail>,
     },
     /// The platform's shared active-work and waiter capacities were both full.
     ///
@@ -143,17 +180,10 @@ impl HttpMiddlewareExchange {
         ctx: &'a L7EvalContext,
         scheme: &str,
     ) -> crate::l7::rest::HttpResponseMiddlewareRelay<'a> {
-        let sandbox = openshell_ocsf::ctx::ctx();
         crate::l7::rest::HttpResponseMiddlewareRelay {
             chain: &self.chain,
             runner: &self.runner,
-            request_context: openshell_core::proto::RequestContext {
-                request_id: self.request_id.clone(),
-                sandbox_id: sandbox.sandbox_id.clone(),
-                sandbox: sandbox.sandbox_name.clone(),
-                workspace: ctx.workspace.clone(),
-                originating_process: None,
-            },
+            request_context: middleware_request_context(ctx, &self.request_id),
             target: openshell_core::proto::HttpRequestTarget {
                 scheme: scheme.to_string(),
                 host: ctx.host.clone(),
@@ -225,21 +255,8 @@ pub async fn uninspectable_traffic_decision(
     if !decides {
         return uninspectable_traffic_gate(chain);
     }
-    let sandbox = openshell_ocsf::ctx::ctx();
     let input = openshell_supervisor_middleware::UninspectableTrafficInput {
-        context: openshell_core::proto::RequestContext {
-            request_id: uuid::Uuid::new_v4().to_string(),
-            sandbox_id: sandbox.sandbox_id.clone(),
-            sandbox: sandbox.sandbox_name.clone(),
-            workspace: ctx.workspace.clone(),
-            originating_process: (!ctx.binary_path.is_empty()).then(|| {
-                openshell_core::proto::Process {
-                    binary: ctx.binary_path.clone(),
-                    pid: 0,
-                    ancestors: ctx.ancestors.clone(),
-                }
-            }),
-        },
+        context: middleware_request_context(ctx, &uuid::Uuid::new_v4().to_string()),
         host: ctx.host.clone(),
         port: ctx.port,
         endpoint: ctx.policy_name.clone(),
@@ -257,6 +274,29 @@ pub async fn uninspectable_traffic_decision(
         UninspectableTrafficGate::BypassWithFinding
     } else {
         UninspectableTrafficGate::Allowed
+    }
+}
+
+/// Sandbox and originating process identity shown to HTTP session hook
+/// middleware. The process is the one the connection's network policy
+/// resolved, without its pid.
+pub fn middleware_request_context(
+    ctx: &L7EvalContext,
+    request_id: &str,
+) -> openshell_core::proto::RequestContext {
+    let sandbox = openshell_ocsf::ctx::ctx();
+    openshell_core::proto::RequestContext {
+        request_id: request_id.to_string(),
+        sandbox_id: sandbox.sandbox_id.clone(),
+        sandbox: sandbox.sandbox_name.clone(),
+        workspace: ctx.workspace.clone(),
+        originating_process: (!ctx.binary_path.is_empty()).then(|| {
+            openshell_core::proto::Process {
+                binary: ctx.binary_path.clone(),
+                pid: 0,
+                ancestors: ctx.ancestors.clone(),
+            }
+        }),
     }
 }
 
@@ -822,7 +862,13 @@ pub async fn apply_middleware_chain_for_scheme_with_request_id_and_delivery<
         }
         ChainHttpHookVersion::Mixed => {
             emit_mixed_protocol_denial(ctx, &req, &chain);
-            Ok(MiddlewareApplyResult::Denied { denial: None })
+            Ok(MiddlewareApplyResult::Denied {
+                denial: None,
+                failure: Some(MiddlewareFailureDetail {
+                    config_name: None,
+                    code: HttpFailureCode::HookVersionsMixed,
+                }),
+            })
         }
         ChainHttpHookVersion::Session => {
             // A body-aware policy re-checks every replaced body, so the
@@ -910,6 +956,7 @@ async fn apply_protocol1_middleware_chain<C: AsyncRead + AsyncWrite + Unpin + Se
         } else {
             MiddlewareApplyResult::Denied {
                 denial: outcome.denial,
+                failure: None,
             }
         });
     };
@@ -958,6 +1005,7 @@ async fn apply_protocol1_middleware_chain<C: AsyncRead + AsyncWrite + Unpin + Se
     if !outcome.allowed {
         return Ok(MiddlewareApplyResult::Denied {
             denial: outcome.denial,
+            failure: None,
         });
     }
     let rebuilt = crate::l7::rest::rebuild_request_with_buffered_body(
@@ -984,7 +1032,7 @@ async fn apply_pipeline_middleware_chain<C: AsyncRead + AsyncWrite + Unpin + Sen
     delivery: RequestBodyDelivery,
 ) -> Result<MiddlewareApplyResult> {
     let head = &req.raw_header[..request_header_end(&req.raw_header)];
-    let input = request_preflight_input(openshell_ocsf::ctx::ctx(), scheme, &req, ctx, request_id)?;
+    let input = request_preflight_input(scheme, &req, ctx, request_id)?;
     let mut preflight = runner
         .preflight_described_http_request(chain, input)
         .await?;
@@ -1008,6 +1056,7 @@ async fn apply_pipeline_middleware_chain<C: AsyncRead + AsyncWrite + Unpin + Sen
         );
         return Ok(MiddlewareApplyResult::Denied {
             denial: preflight.denial,
+            failure: preflight.failure,
         });
     }
     let Some(session) = preflight.session.take() else {
@@ -1083,7 +1132,13 @@ async fn apply_pipeline_middleware_chain<C: AsyncRead + AsyncWrite + Unpin + Sen
                 None,
                 HttpStageDiagnostics::default(),
             );
-            return Ok(MiddlewareApplyResult::Denied { denial: None });
+            return Ok(MiddlewareApplyResult::Denied {
+                denial: None,
+                failure: Some(MiddlewareFailureDetail {
+                    config_name: None,
+                    code: HttpFailureCode::BodyOverLimit,
+                }),
+            });
         }
         (Err(error), _) => return events.body_failed(error),
         (Ok(finish), Some(collected)) => (finish, collected),
@@ -1104,7 +1159,6 @@ async fn apply_pipeline_middleware_chain<C: AsyncRead + AsyncWrite + Unpin + Sen
 
 /// Request head and framing shown to request middleware.
 fn request_preflight_input(
-    sandbox: &openshell_ocsf::EventContext,
     scheme: &str,
     req: &crate::l7::provider::L7Request,
     ctx: &L7EvalContext,
@@ -1113,13 +1167,7 @@ fn request_preflight_input(
     let head = &req.raw_header[..request_header_end(&req.raw_header)];
     let headers = safe_middleware_headers(head)?;
     Ok(HttpRequestPreflightInput {
-        context: openshell_core::proto::RequestContext {
-            request_id: request_id.to_string(),
-            sandbox_id: sandbox.sandbox_id.clone(),
-            sandbox: sandbox.sandbox_name.clone(),
-            workspace: ctx.workspace.clone(),
-            originating_process: None,
-        },
+        context: middleware_request_context(ctx, request_id),
         target: openshell_core::proto::HttpRequestTarget {
             scheme: scheme.to_string(),
             host: ctx.host.clone(),
@@ -1333,6 +1381,7 @@ impl RequestEvents {
                 );
                 Ok(MiddlewareApplyResult::Denied {
                     denial: failure.denial,
+                    failure: failure.failure.map(|failure| *failure),
                 })
             }
             BodyRunError::ClientTimeout => {
@@ -1446,6 +1495,7 @@ impl RequestBodyStream {
             BodyRunError::Middleware(failure) => crate::l7::rest::LiveRequestFailure::Middleware {
                 reason: failure.reason.clone(),
                 denial: failure.denial.clone(),
+                failure: failure.failure.as_deref().cloned(),
             },
             BodyRunError::ClientTimeout => crate::l7::rest::LiveRequestFailure::ClientTimeout,
             BodyRunError::Client(_) => {
@@ -1581,11 +1631,15 @@ pub(super) fn mixed_protocol_events(
     )
 }
 
+/// Answer a request that middleware rejected or failed, then close the
+/// connection without resetting it while the sandbox may still be sending
+/// the body.
 pub async fn send_middleware_rejection_response<C: AsyncRead + AsyncWrite + Unpin + Send>(
     req: &crate::l7::provider::L7Request,
     client: &mut C,
     ctx: &L7EvalContext,
     denial: Option<&openshell_supervisor_middleware::MiddlewareDenial>,
+    failure: Option<&MiddlewareFailureDetail>,
     redacted_target: &str,
 ) -> Result<()> {
     let context = Some(crate::l7::rest::DenyResponseContext::from_l7_context(ctx));
@@ -1598,19 +1652,23 @@ pub async fn send_middleware_rejection_response<C: AsyncRead + AsyncWrite + Unpi
             Some(redacted_target),
             context,
         )
-        .await
+        .await?;
     } else {
         crate::l7::rest::send_middleware_failure_response(
             req,
             &ctx.policy_name,
+            failure,
             client,
             Some(redacted_target),
             context,
         )
-        .await
+        .await?;
     }
+    close_after_early_response(client).await
 }
 
+/// Answer 503 when middleware admission is exhausted before the request body
+/// is read, then close the connection without resetting it.
 pub async fn send_middleware_admission_exhausted_response<
     C: AsyncRead + AsyncWrite + Unpin + Send,
 >(
@@ -1626,12 +1684,13 @@ pub async fn send_middleware_admission_exhausted_response<
         Some(redacted_target),
         Some(crate::l7::rest::DenyResponseContext::from_l7_context(ctx)),
     )
-    .await
+    .await?;
+    close_after_early_response(client).await
 }
 
 /// Answer 408 when the sandbox stops sending a request body that request
 /// middleware is processing.
-pub async fn send_request_timeout_response<C: AsyncWrite + Unpin>(
+pub async fn send_request_timeout_response<C: AsyncRead + AsyncWrite + Unpin>(
     action: &str,
     client: &mut C,
     ctx: &L7EvalContext,
@@ -1652,7 +1711,7 @@ pub async fn send_request_timeout_response<C: AsyncWrite + Unpin>(
         Some(crate::l7::rest::DenyResponseContext::from_l7_context(ctx)),
     )
     .await?;
-    client.shutdown().await.into_diagnostic()
+    close_after_early_response(client).await
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1742,7 +1801,10 @@ pub(super) fn resolve_unbuffered_body(
         return MiddlewareApplyResult::Allowed(req);
     }
     emit_middleware_body_unavailable(ctx, true);
-    MiddlewareApplyResult::Denied { denial: None }
+    MiddlewareApplyResult::Denied {
+        denial: None,
+        failure: None,
+    }
 }
 
 fn emit_middleware_body_unavailable(ctx: &L7EvalContext, denied: bool) {
@@ -1966,12 +2028,15 @@ fn emit_middleware_events(
 #[cfg(test)]
 mod tests {
     use super::{
-        middleware_admission_exhausted_event, safe_middleware_headers,
-        send_middleware_rejection_response, websocket_coverage_events,
-        websocket_message_finding_events, websocket_preflight_finding_events,
+        EARLY_RESPONSE_DRAIN_BYTES, EARLY_RESPONSE_DRAIN_IDLE, EARLY_RESPONSE_DRAIN_TIMEOUT,
+        close_after_early_response, middleware_admission_exhausted_event,
+        middleware_request_context, safe_middleware_headers, send_middleware_rejection_response,
+        websocket_coverage_events, websocket_message_finding_events,
+        websocket_preflight_finding_events,
     };
     use crate::l7::relay::L7EvalContext;
-    use tokio::io::AsyncReadExt;
+    use openshell_supervisor_middleware::{HttpFailureCode, MiddlewareFailureDetail};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     #[test]
     fn admission_exhaustion_event_contains_only_platform_context() {
@@ -2137,16 +2202,27 @@ mod tests {
         };
         let (mut client, mut server) = tokio::io::duplex(4096);
 
-        send_middleware_rejection_response(&req, &mut server, &ctx, Some(&denial), "/v1/messages")
-            .await
-            .expect("send denial");
-        drop(server);
-
-        let mut response = Vec::new();
-        client
-            .read_to_end(&mut response)
-            .await
-            .expect("read denial");
+        let read = async {
+            let mut response = Vec::new();
+            client
+                .read_to_end(&mut response)
+                .await
+                .expect("read denial");
+            drop(client);
+            response
+        };
+        let (sent, response) = tokio::join!(
+            send_middleware_rejection_response(
+                &req,
+                &mut server,
+                &ctx,
+                Some(&denial),
+                None,
+                "/v1/messages",
+            ),
+            read
+        );
+        sent.expect("send denial");
         let response = String::from_utf8(response).expect("UTF-8 response");
         let (_, body) = response.split_once("\r\n\r\n").expect("HTTP response");
         let body: serde_json::Value = serde_json::from_str(body).expect("JSON response");
@@ -2229,16 +2305,31 @@ mod tests {
         };
         let (mut client, mut server) = tokio::io::duplex(4096);
 
-        send_middleware_rejection_response(&req, &mut server, &ctx, None, "/v1/messages")
-            .await
-            .expect("send failure");
-        drop(server);
-
-        let mut response = Vec::new();
-        client
-            .read_to_end(&mut response)
-            .await
-            .expect("read failure");
+        let failure = MiddlewareFailureDetail {
+            config_name: Some("guard".into()),
+            code: HttpFailureCode::CannotInspect,
+        };
+        let read = async {
+            let mut response = Vec::new();
+            client
+                .read_to_end(&mut response)
+                .await
+                .expect("read failure");
+            drop(client);
+            response
+        };
+        let (sent, response) = tokio::join!(
+            send_middleware_rejection_response(
+                &req,
+                &mut server,
+                &ctx,
+                None,
+                Some(&failure),
+                "/v1/messages",
+            ),
+            read
+        );
+        sent.expect("send failure");
         let response = String::from_utf8(response).expect("UTF-8 response");
         let (_, body) = response.split_once("\r\n\r\n").expect("HTTP response");
         let body: serde_json::Value = serde_json::from_str(body).expect("JSON response");
@@ -2247,10 +2338,124 @@ mod tests {
             body["detail"],
             "Request could not be processed by configured middleware"
         );
+        // The failed stage and the platform-owned code reach the sandbox.
+        assert_eq!(body["middleware"], "guard");
+        assert_eq!(body["failure_code"], "middleware_cannot_inspect");
+        assert!(body.get("reason_code").is_none());
         assert!(body.get("rule").is_none());
         assert!(body.get("rule_missing").is_none());
         assert!(body.get("next_steps").is_none());
         assert!(body.get("agent_guidance").is_none());
+    }
+
+    #[tokio::test]
+    async fn early_response_reads_the_unsent_body_before_closing() {
+        let ctx = L7EvalContext {
+            host: "api.example.test".into(),
+            port: 443,
+            policy_name: "api-policy".into(),
+            ..Default::default()
+        };
+        let req = crate::l7::provider::L7Request {
+            action: "POST".into(),
+            target: "/upload".into(),
+            query_params: std::collections::HashMap::new(),
+            raw_header: Vec::new(),
+            body_length: crate::l7::provider::BodyLength::ContentLength(1024 * 1024),
+        };
+        let (mut client, mut server) = tokio::io::duplex(4096);
+        // The sandbox keeps uploading and reads the answer only after its
+        // upload completes, as git and curl without Expect do. The upload
+        // completes only because the relay reads it.
+        let upload = async {
+            client
+                .write_all(&vec![b'x'; 1024 * 1024])
+                .await
+                .expect("upload completes while the relay drains it");
+            let mut response = Vec::new();
+            client.read_to_end(&mut response).await.expect("read 403");
+            drop(client);
+            response
+        };
+        let (sent, response) = tokio::join!(
+            send_middleware_rejection_response(&req, &mut server, &ctx, None, None, "/upload"),
+            upload
+        );
+        sent.expect("send failure");
+        let response = String::from_utf8(response).expect("UTF-8 response");
+        assert!(
+            response.starts_with("HTTP/1.1 403 Forbidden\r\n"),
+            "{response}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn early_response_drain_is_bounded() {
+        // A sandbox that neither sends nor closes is released once idle.
+        let (_client, mut server) = tokio::io::duplex(4096);
+        let started = tokio::time::Instant::now();
+        close_after_early_response(&mut server)
+            .await
+            .expect("close idle client");
+        assert_eq!(started.elapsed(), EARLY_RESPONSE_DRAIN_IDLE);
+
+        // A sandbox that keeps trickling input is released at the deadline.
+        let (mut client, mut server) = tokio::io::duplex(4096);
+        let trickle = tokio::spawn(async move {
+            loop {
+                if client.write_all(b"x").await.is_err() {
+                    break;
+                }
+                tokio::time::sleep(EARLY_RESPONSE_DRAIN_IDLE / 2).await;
+            }
+        });
+        let started = tokio::time::Instant::now();
+        close_after_early_response(&mut server)
+            .await
+            .expect("close trickling client");
+        assert_eq!(started.elapsed(), EARLY_RESPONSE_DRAIN_TIMEOUT);
+        drop(server);
+        trickle.await.expect("trickle stops once the relay closes");
+
+        // A sandbox that floods input is released after the byte bound.
+        let (mut client, mut server) = tokio::io::duplex(64 * 1024);
+        let flood = tokio::spawn(async move {
+            let chunk = vec![b'x'; 64 * 1024];
+            let mut sent = 0usize;
+            while client.write_all(&chunk).await.is_ok() {
+                sent += chunk.len();
+            }
+            sent
+        });
+        let started = tokio::time::Instant::now();
+        close_after_early_response(&mut server)
+            .await
+            .expect("close flooding client");
+        assert!(started.elapsed() < EARLY_RESPONSE_DRAIN_IDLE);
+        drop(server);
+        let sent = flood.await.expect("flood stops once the relay closes");
+        assert!(sent >= EARLY_RESPONSE_DRAIN_BYTES, "{sent}");
+        assert!(sent < 2 * EARLY_RESPONSE_DRAIN_BYTES, "{sent}");
+    }
+
+    #[test]
+    fn middleware_context_names_the_originating_binary() {
+        let ctx = L7EvalContext {
+            workspace: "wrks-default".into(),
+            binary_path: "/usr/bin/git".into(),
+            ancestors: vec!["/usr/bin/bash".into()],
+            ..Default::default()
+        };
+        let context = middleware_request_context(&ctx, "request-1");
+        assert_eq!(context.request_id, "request-1");
+        assert_eq!(context.workspace, "wrks-default");
+        let process = context.originating_process.expect("originating process");
+        assert_eq!(process.binary, "/usr/bin/git");
+        assert_eq!(process.ancestors, vec!["/usr/bin/bash".to_string()]);
+        assert_eq!(process.pid, 0);
+
+        let unresolved = middleware_request_context(&L7EvalContext::default(), "request-2");
+        assert!(unresolved.originating_process.is_none());
     }
 
     #[test]

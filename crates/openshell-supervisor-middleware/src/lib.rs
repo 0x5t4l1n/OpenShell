@@ -11,13 +11,13 @@ mod websocket;
 
 pub use http_session::{
     ChainHttpHookVersion, HTTP_BUFFERED_BODY_TIMEOUT, HTTP_STREAM_IDLE_TIMEOUT, HttpBodyInput,
-    HttpBodyOutput, HttpMiddlewareFailure, HttpPipelineFinish, HttpRequestPreflightInput,
-    HttpRequestPreflightOutcome, HttpRequestSession, HttpResponseDelivery,
-    HttpResponsePipelinePreflight, HttpResponsePipelineSession, HttpStageDiagnostics,
-    HttpStageInvocation, HttpStageOutcome, MAX_HTTP_REQUEST_WITHHELD_BYTES,
+    HttpBodyOutput, HttpFailureCode, HttpMiddlewareFailure, HttpPipelineFinish,
+    HttpRequestPreflightInput, HttpRequestPreflightOutcome, HttpRequestSession,
+    HttpResponseDelivery, HttpResponsePipelinePreflight, HttpResponsePipelineSession,
+    HttpStageDiagnostics, HttpStageInvocation, HttpStageOutcome, MAX_HTTP_REQUEST_WITHHELD_BYTES,
     MAX_HTTP_STREAM_UNIT_BYTES, MIDDLEWARE_CANNOT_INSPECT, MIDDLEWARE_HOOK_VERSIONS_MIXED,
-    UninspectableInvocation, UninspectableOutcome, UninspectableTrafficInput,
-    chain_http_hook_version,
+    MiddlewareFailureDetail, UninspectableInvocation, UninspectableOutcome,
+    UninspectableTrafficInput, chain_http_hook_version,
 };
 
 pub use response::{
@@ -296,15 +296,26 @@ impl MiddlewareWorkAdmissionOutcome {
     }
 }
 
-/// One slot in the shared persistent middleware session budget.
+/// One slot in a persistent middleware session budget.
 ///
 /// Protocol-specific session runners retain this guard while at least one
 /// streaming stage remains active. Registry replacement preserves the shared
-/// admission state so future streaming HTTP middleware can use the same
-/// process-wide bound.
+/// admission state, so each budget stays process-wide.
 #[derive(Debug)]
 struct MiddlewareSessionPermit {
     _session: OwnedSemaphorePermit,
+}
+
+/// Wait until `deadline` for one slot of `budget`.
+async fn reserve_until(
+    budget: &Arc<Semaphore>,
+    deadline: tokio::time::Instant,
+) -> Option<MiddlewareSessionPermit> {
+    tokio::time::timeout_at(deadline, Arc::clone(budget).acquire_owned())
+        .await
+        .ok()?
+        .ok()
+        .map(|permit| MiddlewareSessionPermit { _session: permit })
 }
 
 enum MiddlewareSessionAdmission {
@@ -313,11 +324,12 @@ enum MiddlewareSessionAdmission {
 }
 
 pub use openshell_core::middleware::{
-    DEFAULT_MIDDLEWARE_TIMEOUT, MAX_CONCURRENT_MIDDLEWARE_SESSIONS, MAX_CONCURRENT_MIDDLEWARE_WORK,
-    MAX_MIDDLEWARE_CHAIN_FINDINGS, MAX_MIDDLEWARE_CHAIN_STAGES, MAX_MIDDLEWARE_CHAIN_TIMEOUT,
-    MAX_MIDDLEWARE_CONFIGS, MAX_MIDDLEWARE_FINDINGS_PER_STAGE, MAX_MIDDLEWARE_PREFLIGHT_TIMEOUT,
-    MAX_MIDDLEWARE_SELECTOR_PATTERNS, MAX_MIDDLEWARE_TIMEOUT, MIN_MIDDLEWARE_TIMEOUT,
-    middleware_timeout_or_default, parse_middleware_timeout,
+    DEFAULT_MIDDLEWARE_TIMEOUT, MAX_CONCURRENT_HTTP_MIDDLEWARE_SESSIONS,
+    MAX_CONCURRENT_HTTP_MIDDLEWARE_STREAMS, MAX_CONCURRENT_MIDDLEWARE_SESSIONS,
+    MAX_CONCURRENT_MIDDLEWARE_WORK, MAX_MIDDLEWARE_CHAIN_FINDINGS, MAX_MIDDLEWARE_CHAIN_STAGES,
+    MAX_MIDDLEWARE_CHAIN_TIMEOUT, MAX_MIDDLEWARE_CONFIGS, MAX_MIDDLEWARE_FINDINGS_PER_STAGE,
+    MAX_MIDDLEWARE_PREFLIGHT_TIMEOUT, MAX_MIDDLEWARE_SELECTOR_PATTERNS, MAX_MIDDLEWARE_TIMEOUT,
+    MIN_MIDDLEWARE_TIMEOUT, middleware_timeout_or_default, parse_middleware_timeout,
 };
 
 /// Largest logical payload or replacement accepted by the middleware platform.
@@ -925,6 +937,8 @@ pub struct MiddlewareRegistry {
     work_admission: Arc<Semaphore>,
     work_admission_waiters: Arc<Semaphore>,
     session_admission: Arc<Semaphore>,
+    http_session_admission: Arc<Semaphore>,
+    http_stream_admission: Arc<Semaphore>,
 }
 
 impl std::fmt::Debug for MiddlewareRegistry {
@@ -941,6 +955,14 @@ impl std::fmt::Debug for MiddlewareRegistry {
             .field(
                 "available_session_permits",
                 &self.session_admission.available_permits(),
+            )
+            .field(
+                "available_http_session_permits",
+                &self.http_session_admission.available_permits(),
+            )
+            .field(
+                "available_http_stream_permits",
+                &self.http_stream_admission.available_permits(),
             )
             .finish()
     }
@@ -962,6 +984,10 @@ impl Default for MiddlewareRegistry {
             work_admission: Arc::new(Semaphore::new(MAX_CONCURRENT_MIDDLEWARE_WORK)),
             work_admission_waiters: Arc::new(Semaphore::new(MAX_QUEUED_MIDDLEWARE_WORK)),
             session_admission: Arc::new(Semaphore::new(MAX_CONCURRENT_MIDDLEWARE_SESSIONS)),
+            http_session_admission: Arc::new(Semaphore::new(
+                MAX_CONCURRENT_HTTP_MIDDLEWARE_SESSIONS,
+            )),
+            http_stream_admission: Arc::new(Semaphore::new(MAX_CONCURRENT_HTTP_MIDDLEWARE_STREAMS)),
         }
     }
 }
@@ -1476,6 +1502,10 @@ impl MiddlewareRegistry {
             work_admission: Arc::new(Semaphore::new(MAX_CONCURRENT_MIDDLEWARE_WORK)),
             work_admission_waiters: Arc::new(Semaphore::new(MAX_QUEUED_MIDDLEWARE_WORK)),
             session_admission: Arc::new(Semaphore::new(MAX_CONCURRENT_MIDDLEWARE_SESSIONS)),
+            http_session_admission: Arc::new(Semaphore::new(
+                MAX_CONCURRENT_HTTP_MIDDLEWARE_SESSIONS,
+            )),
+            http_stream_admission: Arc::new(Semaphore::new(MAX_CONCURRENT_HTTP_MIDDLEWARE_STREAMS)),
         })
     }
 
@@ -1692,6 +1722,12 @@ impl ChainRunner {
                 work_admission: Arc::new(Semaphore::new(MAX_CONCURRENT_MIDDLEWARE_WORK)),
                 work_admission_waiters: Arc::new(Semaphore::new(MAX_QUEUED_MIDDLEWARE_WORK)),
                 session_admission: Arc::new(Semaphore::new(MAX_CONCURRENT_MIDDLEWARE_SESSIONS)),
+                http_session_admission: Arc::new(Semaphore::new(
+                    MAX_CONCURRENT_HTTP_MIDDLEWARE_SESSIONS,
+                )),
+                http_stream_admission: Arc::new(Semaphore::new(
+                    MAX_CONCURRENT_HTTP_MIDDLEWARE_STREAMS,
+                )),
             }),
         }
     }
@@ -1718,6 +1754,8 @@ impl ChainRunner {
         registry.work_admission = Arc::clone(&self.registry.work_admission);
         registry.work_admission_waiters = Arc::clone(&self.registry.work_admission_waiters);
         registry.session_admission = Arc::clone(&self.registry.session_admission);
+        registry.http_session_admission = Arc::clone(&self.registry.http_session_admission);
+        registry.http_stream_admission = Arc::clone(&self.registry.http_stream_admission);
         Self::from_registry(registry)
     }
 
@@ -1770,6 +1808,23 @@ impl ChainRunner {
             .map_or(MiddlewareSessionAdmission::AtCapacity, |permit| {
                 MiddlewareSessionAdmission::Admitted(MiddlewareSessionPermit { _session: permit })
             })
+    }
+
+    /// Wait until `deadline` for one HTTP session hook slot, held through
+    /// preflight and BUFFERED bodies. `None` when none freed up in time.
+    async fn reserve_http_session(
+        &self,
+        deadline: tokio::time::Instant,
+    ) -> Option<MiddlewareSessionPermit> {
+        reserve_until(&self.registry.http_session_admission, deadline).await
+    }
+
+    /// Wait until `deadline` for one HTTP session hook STREAM slot.
+    async fn reserve_http_stream(
+        &self,
+        deadline: tokio::time::Instant,
+    ) -> Option<MiddlewareSessionPermit> {
+        reserve_until(&self.registry.http_stream_admission, deadline).await
     }
 
     async fn manifests(&self) -> Result<Vec<(Arc<MiddlewareServiceState>, MiddlewareManifest)>> {
@@ -4123,6 +4178,10 @@ mod tests {
             work_admission: Arc::new(Semaphore::new(MAX_CONCURRENT_MIDDLEWARE_WORK)),
             work_admission_waiters: Arc::new(Semaphore::new(MAX_QUEUED_MIDDLEWARE_WORK)),
             session_admission: Arc::new(Semaphore::new(MAX_CONCURRENT_MIDDLEWARE_SESSIONS)),
+            http_session_admission: Arc::new(Semaphore::new(
+                MAX_CONCURRENT_HTTP_MIDDLEWARE_SESSIONS,
+            )),
+            http_stream_admission: Arc::new(Semaphore::new(MAX_CONCURRENT_HTTP_MIDDLEWARE_STREAMS)),
         }
     }
 

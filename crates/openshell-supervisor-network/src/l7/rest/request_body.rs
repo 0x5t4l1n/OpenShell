@@ -544,6 +544,7 @@ pub enum LiveRequestFailure {
     Middleware {
         reason: String,
         denial: Option<openshell_supervisor_middleware::MiddlewareDenial>,
+        failure: Option<openshell_supervisor_middleware::MiddlewareFailureDetail>,
     },
     /// The sandbox stopped sending the request body.
     #[error("request body client progress timeout")]

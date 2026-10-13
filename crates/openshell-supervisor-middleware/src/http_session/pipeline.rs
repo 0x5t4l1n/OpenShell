@@ -42,11 +42,11 @@ use openshell_core::proto::{
 
 use crate::headers::{self, HeaderAuthority};
 use crate::{
-    DescribedChainEntry, EXTERNAL_FINDING_LABEL, HttpHookVersion, HttpResultStream,
-    MAX_MIDDLEWARE_CHAIN_TIMEOUT, MAX_MIDDLEWARE_FINDING_BYTES, MAX_MIDDLEWARE_FINDINGS_PER_STAGE,
-    MAX_MIDDLEWARE_METADATA_BYTES, MAX_MIDDLEWARE_METADATA_ENTRIES, MAX_MIDDLEWARE_PAYLOAD_BYTES,
-    MAX_MIDDLEWARE_REASON_BYTES, MAX_MIDDLEWARE_REASON_CODE_BYTES, MiddlewareDenial,
-    MiddlewareDiagnosticPolicy, MiddlewareInvocation, NamespacedFinding, OnError,
+    ChainRunner, DescribedChainEntry, EXTERNAL_FINDING_LABEL, HttpHookVersion, HttpResultStream,
+    MAX_MIDDLEWARE_FINDING_BYTES, MAX_MIDDLEWARE_FINDINGS_PER_STAGE, MAX_MIDDLEWARE_METADATA_BYTES,
+    MAX_MIDDLEWARE_METADATA_ENTRIES, MAX_MIDDLEWARE_PAYLOAD_BYTES, MAX_MIDDLEWARE_REASON_BYTES,
+    MAX_MIDDLEWARE_REASON_CODE_BYTES, MiddlewareDenial, MiddlewareDiagnosticPolicy,
+    MiddlewareInvocation, MiddlewareSessionPermit, NamespacedFinding, OnError,
     TransformedBodyPolicy, is_stable_reason_code, is_stale_http_response_integrity_header,
     middleware_denial_reason, safe_reason,
 };
@@ -71,6 +71,84 @@ pub const MIDDLEWARE_CANNOT_INSPECT: &str = "middleware_cannot_inspect";
 /// Failure reason for a chain that selects v1 and HTTP session hook stages for the
 /// same HTTP message.
 pub const MIDDLEWARE_HOOK_VERSIONS_MIXED: &str = "middleware_hook_versions_mixed";
+
+/// Why an HTTP session hook exchange failed closed, in terms the sandbox can
+/// act on: retry when the middleware is unavailable or slow, but not when it
+/// cannot inspect the message.
+///
+/// The set is closed and platform-owned. It never carries service text, so it
+/// is safe to return to the sandbox and to record.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HttpFailureCode {
+    /// The stage ended its stream with `FAILED_PRECONDITION`, or the message
+    /// head cannot be shown to middleware.
+    CannotInspect,
+    /// A stage missed its binding timeout, the chain deadline, or the
+    /// BUFFERED whole-body deadline.
+    Timeout,
+    /// A STREAM stage stalled.
+    StreamIdleTimeout,
+    /// The middleware was unreachable, failed with an RPC status, or had no
+    /// capacity.
+    Unavailable,
+    /// The stage broke the exchange contract, such as an unexpected result,
+    /// an unimplemented RPC, or output that does not match its declared
+    /// length.
+    LifecycleViolation,
+    /// A body exceeded the selected limit.
+    BodyOverLimit,
+    /// A header or trailer mutation broke a header change rule; carries the
+    /// rule's code, such as `header_mutation_protected_header`.
+    HeaderMutation(&'static str),
+    /// The chain selects v1 HTTP hook and HTTP session hook entries.
+    HookVersionsMixed,
+}
+
+impl HttpFailureCode {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::CannotInspect => MIDDLEWARE_CANNOT_INSPECT,
+            Self::Timeout => "middleware_timeout",
+            Self::StreamIdleTimeout => "stream_idle_timeout",
+            Self::Unavailable => "middleware_unavailable",
+            Self::LifecycleViolation => "middleware_lifecycle_violation",
+            Self::BodyOverLimit => "body_over_limit",
+            Self::HeaderMutation(code) => code,
+            Self::HookVersionsMixed => MIDDLEWARE_HOOK_VERSIONS_MIXED,
+        }
+    }
+
+    /// Code for a platform-owned failure reason that is not an RPC status or
+    /// a header mutation error.
+    fn of_reason(reason: &str) -> Self {
+        match reason {
+            MIDDLEWARE_CANNOT_INSPECT
+            | "head_input_over_capacity"
+            | "response_input_unrepresentable" => Self::CannotInspect,
+            "middleware_timeout" | "middleware_chain_timeout" | "middleware_body_timeout" => {
+                Self::Timeout
+            }
+            "middleware_stall_timeout" => Self::StreamIdleTimeout,
+            "binding_not_described" | "session_capacity_exhausted" => Self::Unavailable,
+            "buffered_input_over_capacity"
+            | "buffered_output_over_capacity"
+            | "request_output_over_capacity" => Self::BodyOverLimit,
+            MIDDLEWARE_HOOK_VERSIONS_MIXED => Self::HookVersionsMixed,
+            _ => Self::LifecycleViolation,
+        }
+    }
+}
+
+/// Why a chain failed closed, as the sandbox sees it. Both fields are
+/// platform-owned.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MiddlewareFailureDetail {
+    /// Policy config name of the stage that failed, when one stage owns the
+    /// failure.
+    pub config_name: Option<String>,
+    pub code: HttpFailureCode,
+}
 
 /// Body input to a pipeline: chunks, then exactly one `End`.
 #[derive(Debug)]
@@ -221,6 +299,9 @@ pub struct HttpMiddlewareFailure {
     pub reason: String,
     /// Present only when a stage rejected the exchange.
     pub denial: Option<MiddlewareDenial>,
+    /// Present when the exchange failed closed for a reason the sandbox may
+    /// see.
+    pub failure: Option<Box<MiddlewareFailureDetail>>,
     /// Session end every stage received.
     pub end_reason: MiddlewareSessionEndReason,
     pub diagnostics: Box<HttpStageDiagnostics>,
@@ -423,6 +504,7 @@ pub struct Preflight {
     pub allowed: bool,
     pub reason: String,
     pub denial: Option<MiddlewareDenial>,
+    pub failure: Option<MiddlewareFailureDetail>,
     /// Head after every preflight mutation.
     pub headers: Vec<HttpHeader>,
     /// Preflight mutations in chain order.
@@ -519,15 +601,16 @@ pub(super) fn preflight_event(
     }
 }
 
-/// Run preflight for `entries` in chain order.
+/// Run preflight for `entries` in chain order, each stage within its binding
+/// timeout and `chain_deadline`.
 pub async fn preflight(
     entries: &[DescribedChainEntry],
     spec: PipelineSpec,
     headers: Vec<HttpHeader>,
     declared_input_bytes: Option<u64>,
     head: &impl StageHead,
+    chain_deadline: Instant,
 ) -> Preflight {
-    let chain_deadline = Instant::now() + MAX_MIDDLEWARE_CHAIN_TIMEOUT;
     let mut state = PreflightState {
         headers,
         header_mutations: Vec::new(),
@@ -676,11 +759,13 @@ pub async fn preflight(
         head: headers.clone(),
         stages,
         declared_input_bytes,
+        admission: BodyAdmission::default(),
     });
     Preflight {
         allowed: true,
         reason: String::new(),
         denial: None,
+        failure: None,
         headers,
         header_mutations,
         pipeline,
@@ -703,6 +788,7 @@ impl PreflightState {
         let HttpMiddlewareFailure {
             reason,
             denial,
+            failure,
             diagnostics,
             ..
         } = failure;
@@ -711,6 +797,7 @@ impl PreflightState {
             allowed: false,
             reason,
             denial,
+            failure: failure.map(|failure| *failure),
             headers: self.headers,
             header_mutations: self.header_mutations,
             pipeline: None,
@@ -726,6 +813,42 @@ pub struct Pipeline {
     head: Vec<HttpHeader>,
     stages: Vec<Stage>,
     declared_input_bytes: Option<u64>,
+    admission: BodyAdmission,
+}
+
+/// Session budget slots one message holds while its body stages run.
+#[derive(Default)]
+struct BodyAdmission {
+    /// The preflight slot, kept until every BUFFERED stage ends.
+    buffered: Option<MiddlewareSessionPermit>,
+    /// A STREAM slot, kept until the pipeline ends.
+    stream: Option<MiddlewareSessionPermit>,
+}
+
+impl ChainRunner {
+    /// Move a message whose stages selected body modes from its preflight
+    /// `slot` onto the budgets its body runs under. A STREAM stage needs a
+    /// stream slot, waited for until `deadline`. The preflight slot stays
+    /// only while a BUFFERED stage runs. When no stream slot frees up in time,
+    /// every stage is cancelled and `None` is returned.
+    pub(super) async fn admit_body(
+        &self,
+        mut pipeline: Pipeline,
+        slot: MiddlewareSessionPermit,
+        deadline: Instant,
+    ) -> Option<Pipeline> {
+        if pipeline.streams() {
+            let Some(stream) = self.reserve_http_stream(deadline).await else {
+                pipeline.end(MiddlewareSessionEndReason::Cancellation).await;
+                return None;
+            };
+            pipeline.admission.stream = Some(stream);
+        }
+        if pipeline.buffers() {
+            pipeline.admission.buffered = Some(slot);
+        }
+        Some(pipeline)
+    }
 }
 
 impl Pipeline {
@@ -738,6 +861,10 @@ impl Pipeline {
 
     /// True when a BUFFERED stage withholds the head until its body result.
     pub fn withholds_output(&self) -> bool {
+        self.buffers()
+    }
+
+    fn buffers(&self) -> bool {
         self.stages
             .iter()
             .any(|stage| matches!(stage.mode, StageMode::Buffered { .. }))
@@ -809,8 +936,14 @@ impl Pipeline {
             head,
             stages,
             declared_input_bytes,
+            mut admission,
         } = self;
         let count = stages.len();
+        let buffered: Vec<bool> = stages
+            .iter()
+            .map(|stage| matches!(stage.mode, StageMode::Buffered { .. }))
+            .collect();
+        let mut buffering = buffered.iter().filter(|buffered| **buffered).count();
         let limits: Vec<usize> = stages
             .iter()
             .map(input_unit_limit)
@@ -905,7 +1038,17 @@ impl Pipeline {
                 },
             };
             match result {
-                Ok(TaskDone::Stage(index, stage)) => done[index] = Some(stage),
+                Ok(TaskDone::Stage(index, stage)) => {
+                    done[index] = Some(stage);
+                    if buffered[index] {
+                        buffering -= 1;
+                        // The last BUFFERED stage delivered its body, so the
+                        // message no longer holds buffered input.
+                        if buffering == 0 {
+                            admission.buffered = None;
+                        }
+                    }
+                }
                 Ok(TaskDone::Sink(value)) => trailers = Some(value),
                 Err(TaskError::Failed(error)) if failure.is_none() => {
                     abort.send_replace(Some(error.end_reason));
@@ -1161,6 +1304,7 @@ async fn run_checkpoint(
             return Err(TaskError::Failed(HttpMiddlewareFailure {
                 reason,
                 denial: None,
+                failure: None,
                 end_reason: MiddlewareSessionEndReason::PolicyDenial,
                 diagnostics: Box::default(),
             }));
@@ -1862,7 +2006,13 @@ fn status_failure(entry: &DescribedChainEntry, status: &tonic::Status) -> HttpMi
         // The service does not implement the HTTP session hook RPC its binding
         // selected.
         tonic::Code::Unimplemented => entry_failure(entry, "middleware_unimplemented"),
-        _ => entry_failure(entry, &diagnostic_policy(entry).error_reason(status)),
+        // The reason may carry an in-process service's status text, so the
+        // sandbox sees only that the middleware failed.
+        _ => entry_failure_with_code(
+            entry,
+            &diagnostic_policy(entry).error_reason(status),
+            HttpFailureCode::Unavailable,
+        ),
     }
 }
 
@@ -1879,9 +2029,10 @@ fn mutation_failure(
     entry: &DescribedChainEntry,
     error: &headers::HeaderMutationError,
 ) -> HttpMiddlewareFailure {
-    entry_failure(
+    entry_failure_with_code(
         entry,
         &diagnostic_policy(entry).header_mutation_error_reason(error),
+        HttpFailureCode::HeaderMutation(error.code()),
     )
 }
 
@@ -2039,6 +2190,7 @@ pub(super) fn rejection(
     HttpMiddlewareFailure {
         reason: middleware_denial_reason(&denial.config_name, denial.reason_code.as_deref()),
         denial: Some(denial),
+        failure: None,
         end_reason: MiddlewareSessionEndReason::MiddlewareDenial,
         diagnostics: Box::new(retained),
     }
@@ -2046,6 +2198,15 @@ pub(super) fn rejection(
 
 /// The stage failed and the exchange fails closed.
 pub fn entry_failure(entry: &DescribedChainEntry, reason: &str) -> HttpMiddlewareFailure {
+    entry_failure_with_code(entry, reason, HttpFailureCode::of_reason(reason))
+}
+
+/// The stage failed with `reason`, which the sandbox sees as `code`.
+fn entry_failure_with_code(
+    entry: &DescribedChainEntry,
+    reason: &str,
+    code: HttpFailureCode,
+) -> HttpMiddlewareFailure {
     let mut diagnostics = HttpStageDiagnostics::default();
     diagnostics.invocations.push(HttpStageInvocation {
         failed: true,
@@ -2055,6 +2216,10 @@ pub fn entry_failure(entry: &DescribedChainEntry, reason: &str) -> HttpMiddlewar
     HttpMiddlewareFailure {
         reason: format!("middleware_failed: {reason}"),
         denial: None,
+        failure: Some(Box::new(MiddlewareFailureDetail {
+            config_name: Some(entry.entry.name.clone()),
+            code,
+        })),
         end_reason: MiddlewareSessionEndReason::MiddlewareFailure,
         diagnostics: Box::new(diagnostics),
     }
@@ -2065,6 +2230,7 @@ pub fn platform_failure(reason: &str) -> HttpMiddlewareFailure {
     HttpMiddlewareFailure {
         reason: format!("middleware_failed: {reason}"),
         denial: None,
+        failure: None,
         end_reason: MiddlewareSessionEndReason::MiddlewareFailure,
         diagnostics: Box::default(),
     }
@@ -2074,6 +2240,7 @@ fn cancelled(reason: &str) -> HttpMiddlewareFailure {
     HttpMiddlewareFailure {
         reason: format!("middleware_cancelled: {reason}"),
         denial: None,
+        failure: None,
         end_reason: MiddlewareSessionEndReason::Cancellation,
         diagnostics: Box::default(),
     }

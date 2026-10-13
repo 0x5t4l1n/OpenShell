@@ -2901,16 +2901,39 @@ pub(crate) async fn send_middleware_deny_response<C: AsyncWrite + Unpin>(
 ///
 /// Unlike an L7 policy denial, a middleware failure does not indicate a
 /// missing policy rule. The response therefore omits policy-advisor guidance
-/// and does not include the middleware runtime's diagnostic text.
+/// and does not include the middleware runtime's diagnostic text. An HTTP
+/// session hook failure carries its platform-owned code and stage.
 pub(crate) async fn send_middleware_failure_response<C: AsyncWrite + Unpin>(
     req: &L7Request,
     policy_name: &str,
+    failure: Option<&openshell_supervisor_middleware::MiddlewareFailureDetail>,
     client: &mut C,
     redacted_target: Option<&str>,
     context: Option<DenyResponseContext<'_>>,
 ) -> Result<()> {
-    let body = middleware_failure_response_body(req, policy_name, redacted_target, context);
+    let mut body = middleware_failure_response_body(req, policy_name, redacted_target, context);
+    if let Some(failure) = failure {
+        insert_middleware_failure(&mut body, failure);
+    }
     send_forbidden_json(policy_name, body, client).await
+}
+
+/// Add a middleware failure's stage and platform-owned code to a response
+/// body.
+pub(crate) fn insert_middleware_failure(
+    body: &mut serde_json::Value,
+    failure: &openshell_supervisor_middleware::MiddlewareFailureDetail,
+) {
+    let serde_json::Value::Object(fields) = body else {
+        return;
+    };
+    if let Some(config_name) = &failure.config_name {
+        fields.insert("middleware".to_string(), serde_json::json!(config_name));
+    }
+    fields.insert(
+        "failure_code".to_string(),
+        serde_json::json!(failure.code.as_str()),
+    );
 }
 
 /// Send a platform-owned availability response when shared middleware work
@@ -2922,7 +2945,14 @@ pub(crate) async fn send_middleware_unavailable_response<C: AsyncWrite + Unpin>(
     redacted_target: Option<&str>,
     context: Option<DenyResponseContext<'_>>,
 ) -> Result<()> {
-    let body = middleware_failure_response_body(req, policy_name, redacted_target, context);
+    let mut body = middleware_failure_response_body(req, policy_name, redacted_target, context);
+    insert_middleware_failure(
+        &mut body,
+        &openshell_supervisor_middleware::MiddlewareFailureDetail {
+            config_name: None,
+            code: openshell_supervisor_middleware::HttpFailureCode::Unavailable,
+        },
+    );
     send_json_response(policy_name, body, client, "503 Service Unavailable").await
 }
 

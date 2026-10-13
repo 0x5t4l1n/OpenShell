@@ -36,6 +36,10 @@ use tonic::{Request, Response, Status};
 use crate::guard::{GuardConfig, MAX_PAYLOAD_BYTES};
 
 const MANIFEST_NAME: &str = "example/content-guard-service";
+/// gRPC message limit for a 4 MiB payload plus the rest of its event or
+/// result. A `buffered_body` event or `replacement` at the 4 MiB platform
+/// limit exceeds tonic's 4 MiB default once encoded.
+const MAX_GRPC_MESSAGE_BYTES: usize = 4 * 1024 * 1024 + 512 * 1024;
 
 #[derive(Debug, Parser)]
 #[command(about = "Run the example OpenShell supervisor middleware service")]
@@ -163,7 +167,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
     println!("serving {MANIFEST_NAME} on http://{}", cli.bind);
     Server::builder()
-        .add_service(SupervisorMiddlewareServer::new(ContentGuard))
+        .add_service(
+            SupervisorMiddlewareServer::new(ContentGuard)
+                .max_decoding_message_size(MAX_GRPC_MESSAGE_BYTES)
+                .max_encoding_message_size(MAX_GRPC_MESSAGE_BYTES),
+        )
         .serve(cli.bind)
         .await?;
     Ok(())

@@ -6300,21 +6300,24 @@ async fn handle_forward_proxy(
                     "Request body was not received in time",
                 );
                 respond(client, &response).await?;
+                crate::l7::middleware::close_after_early_response(client).await?;
                 return Ok(());
             }
-            crate::l7::middleware::MiddlewareApplyResult::Denied { denial, .. } => {
+            crate::l7::middleware::MiddlewareApplyResult::Denied { denial, failure } => {
                 emit_activity_simple(activity_tx, true, "middleware");
                 let response = denial.as_ref().map_or_else(
-                    || build_middleware_failure_response(&l7_ctx.policy_name),
+                    || build_middleware_failure_response(&l7_ctx.policy_name, failure.as_ref()),
                     |denial| build_middleware_deny_response(&l7_ctx.policy_name, denial),
                 );
                 respond(client, &response).await?;
+                crate::l7::middleware::close_after_early_response(client).await?;
                 return Ok(());
             }
             crate::l7::middleware::MiddlewareApplyResult::AdmissionExhausted => {
                 emit_activity_simple(activity_tx, true, "middleware");
                 let response = build_middleware_unavailable_response(&l7_ctx.policy_name);
                 respond(client, &response).await?;
+                crate::l7::middleware::close_after_early_response(client).await?;
                 return Ok(());
             }
         };
@@ -6356,7 +6359,7 @@ async fn handle_forward_proxy(
         crate::l7::middleware::emit_websocket_preflight_events(&l7_ctx, &preflight);
         if preflight.terminal_reason.is_some() {
             let response = preflight.denial.as_ref().map_or_else(
-                || build_middleware_failure_response(&l7_ctx.policy_name),
+                || build_middleware_failure_response(&l7_ctx.policy_name, None),
                 |denial| build_middleware_deny_response(&l7_ctx.policy_name, denial),
             );
             respond(client, &response).await?;
@@ -6937,20 +6940,37 @@ fn build_middleware_deny_response(
     .into_bytes()
 }
 
-fn build_middleware_failure_response(policy_name: &str) -> Vec<u8> {
-    build_middleware_platform_response(policy_name, "403 Forbidden")
+fn build_middleware_failure_response(
+    policy_name: &str,
+    failure: Option<&openshell_supervisor_middleware::MiddlewareFailureDetail>,
+) -> Vec<u8> {
+    build_middleware_platform_response(policy_name, "403 Forbidden", failure)
 }
 
 fn build_middleware_unavailable_response(policy_name: &str) -> Vec<u8> {
-    build_middleware_platform_response(policy_name, "503 Service Unavailable")
+    build_middleware_platform_response(
+        policy_name,
+        "503 Service Unavailable",
+        Some(&openshell_supervisor_middleware::MiddlewareFailureDetail {
+            config_name: None,
+            code: openshell_supervisor_middleware::HttpFailureCode::Unavailable,
+        }),
+    )
 }
 
-fn build_middleware_platform_response(policy_name: &str, status: &str) -> Vec<u8> {
-    let body = serde_json::json!({
+fn build_middleware_platform_response(
+    policy_name: &str,
+    status: &str,
+    failure: Option<&openshell_supervisor_middleware::MiddlewareFailureDetail>,
+) -> Vec<u8> {
+    let mut body = serde_json::json!({
         "error": "middleware_failed",
         "detail": "Request could not be processed by configured middleware",
         "policy": policy_name,
     });
+    if let Some(failure) = failure {
+        crate::l7::rest::insert_middleware_failure(&mut body, failure);
+    }
     let body_str = body.to_string();
     format!(
         "HTTP/1.1 {status}\r\n\
@@ -9715,7 +9735,7 @@ network_policies:
 
     #[test]
     fn middleware_failure_response_uses_platform_text_without_policy_guidance() {
-        let response = build_middleware_failure_response("api-policy");
+        let response = build_middleware_failure_response("api-policy", None);
         let response = String::from_utf8(response).expect("UTF-8 error response");
         let (_, body) = response.split_once("\r\n\r\n").expect("HTTP response");
         let body: serde_json::Value = serde_json::from_str(body).expect("JSON response");
@@ -9749,6 +9769,7 @@ network_policies:
         let body: serde_json::Value = serde_json::from_str(body).expect("JSON response");
         assert_eq!(body["error"], "middleware_failed");
         assert_eq!(body["policy"], "api-policy");
+        assert_eq!(body["failure_code"], "middleware_unavailable");
         assert!(body.get("middleware").is_none());
         assert!(body.get("reason_code").is_none());
     }
@@ -10523,7 +10544,7 @@ network_policies:
             .expect("forward middleware pipeline");
 
         match outcome {
-            crate::l7::middleware::MiddlewareApplyResult::Denied { denial } => {
+            crate::l7::middleware::MiddlewareApplyResult::Denied { denial, .. } => {
                 assert!(denial.is_none());
             }
             crate::l7::middleware::MiddlewareApplyResult::Allowed(_) => {

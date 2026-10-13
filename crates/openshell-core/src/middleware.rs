@@ -346,12 +346,29 @@ pub const MAX_MIDDLEWARE_CHAIN_TIMEOUT: Duration = Duration::from_secs(30);
 pub const MAX_MIDDLEWARE_PREFLIGHT_TIMEOUT: Duration = Duration::from_secs(1);
 /// Process-wide safety valve for concurrently buffered middleware work.
 pub const MAX_CONCURRENT_MIDDLEWARE_WORK: usize = 32;
-/// Process-wide safety valve for retained streaming middleware sessions.
+/// Process-wide safety valve for retained WebSocket and v1 HTTP response
+/// middleware sessions.
 ///
-/// A session consumes one permit regardless of its protocol or stage fan-out.
-/// Persistent middleware protocols must acquire from this shared budget before
-/// opening streams and retain the permit while any stage remains active.
+/// A session consumes one permit regardless of its stage fan-out. These
+/// protocols acquire from this shared budget before opening streams and retain
+/// the permit while any stage remains active. HTTP session hooks use
+/// [`MAX_CONCURRENT_HTTP_MIDDLEWARE_SESSIONS`] and
+/// [`MAX_CONCURRENT_HTTP_MIDDLEWARE_STREAMS`] instead.
 pub const MAX_CONCURRENT_MIDDLEWARE_SESSIONS: usize = 32;
+/// Process-wide bound on HTTP session hook messages in preflight or in a
+/// BUFFERED body.
+///
+/// A request and its response each hold one slot, and only while a stage
+/// inspects them: a message whose stages all continue at preflight releases
+/// its slot then. A message waits for a slot within its chain deadline.
+pub const MAX_CONCURRENT_HTTP_MIDDLEWARE_SESSIONS: usize = 64;
+/// Process-wide bound on HTTP session hook messages with a STREAM stage.
+///
+/// A STREAM body has no total deadline, so a server-sent events response can
+/// hold its slot indefinitely. This separate budget keeps such streams from
+/// starving short messages. It allows a request and a response stream for each
+/// of the 96 network streams the `OpenShell` sandbox runtime relays at once.
+pub const MAX_CONCURRENT_HTTP_MIDDLEWARE_STREAMS: usize = 256;
 
 /// Largest number of middleware configurations accepted in one sandbox policy.
 pub const MAX_MIDDLEWARE_CONFIGS: usize = 10;

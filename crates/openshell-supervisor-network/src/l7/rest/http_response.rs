@@ -347,6 +347,7 @@ where
                 request_method,
                 middleware.policy_name,
                 &middleware.target,
+                None,
             )
             .await?;
             return Ok(Some(RelayOutcome::Consumed));
@@ -387,6 +388,7 @@ where
                 request_method,
                 middleware.policy_name,
                 &middleware.target,
+                None,
             )
             .await?;
             return Ok(Some(RelayOutcome::Consumed));
@@ -432,6 +434,7 @@ where
                 request_method,
                 middleware.policy_name,
                 &middleware.target,
+                None,
             )
             .await?;
             return Ok(Some(RelayOutcome::Consumed));
@@ -484,6 +487,7 @@ where
                 request_method,
                 middleware.policy_name,
                 &middleware.target,
+                None,
             )
             .await?;
         }
@@ -538,6 +542,7 @@ where
                     request_method,
                     middleware.policy_name,
                     &middleware.target,
+                    None,
                 )
                 .await?;
                 return Ok(Some(RelayOutcome::Consumed));
@@ -686,6 +691,7 @@ where
                     request_method,
                     middleware.policy_name,
                     &middleware.target,
+                    None,
                 )
                 .await?;
             }
@@ -744,6 +750,7 @@ where
                     request_method,
                     middleware.policy_name,
                     &middleware.target,
+                    None,
                 )
                 .await?;
             }
@@ -2026,13 +2033,16 @@ async fn send_response_middleware_denial<C: AsyncWrite + Unpin>(
     Ok(())
 }
 
+/// Answer a response that middleware failed before its head was committed.
+/// An HTTP session hook failure carries its platform-owned code and stage.
 async fn send_response_delivery_failure<C: AsyncWrite + Unpin>(
     client: &mut C,
     request_method: &str,
     policy_name: &str,
     target: &HttpRequestTarget,
+    failure: Option<&openshell_supervisor_middleware::MiddlewareFailureDetail>,
 ) -> Result<()> {
-    let body = serde_json::to_vec(&serde_json::json!({
+    let mut body = serde_json::json!({
         "error": "response_delivery_failed",
         "detail": "The upstream request may have completed, but OpenShell could not deliver its response. Retrying may repeat upstream side effects.",
         "policy": policy_name,
@@ -2041,8 +2051,11 @@ async fn send_response_delivery_failure<C: AsyncWrite + Unpin>(
         "path": target.path,
         "host": target.host,
         "port": target.port,
-    }))
-    .into_diagnostic()?;
+    });
+    if let Some(failure) = failure {
+        insert_middleware_failure(&mut body, failure);
+    }
+    let body = serde_json::to_vec(&body).into_diagnostic()?;
     let head = format!(
         "HTTP/1.1 502 Bad Gateway\r\nContent-Type: application/json\r\nContent-Length: {}\r\nX-OpenShell-Policy: {policy_name}\r\nConnection: close\r\n\r\n",
         body.len()

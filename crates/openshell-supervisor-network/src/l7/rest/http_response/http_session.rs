@@ -147,6 +147,7 @@ where
                 request_method,
                 middleware.policy_name,
                 &middleware.target,
+                None,
             )
             .await?;
             return Ok(Some(RelayOutcome::Consumed));
@@ -189,6 +190,7 @@ where
                 request_method,
                 middleware.policy_name,
                 &middleware.target,
+                preflight.failure.as_ref(),
             )
             .await?;
         }
@@ -233,6 +235,7 @@ where
             request_method,
             middleware.policy_name,
             &middleware.target,
+            None,
         )
         .await?;
         return Ok(Some(RelayOutcome::Consumed));
@@ -362,6 +365,7 @@ where
                 request_method,
                 middleware.policy_name,
                 &middleware.target,
+                None,
             )
             .await?;
             Ok(Some(RelayOutcome::Consumed))
@@ -401,6 +405,7 @@ where
                     request_method,
                     middleware.policy_name,
                     &middleware.target,
+                    failure.failure.as_deref(),
                 )
                 .await?;
             }

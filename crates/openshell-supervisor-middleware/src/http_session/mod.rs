@@ -20,9 +20,9 @@ use prost::Message as _;
 
 pub use pipeline::{
     HTTP_BUFFERED_BODY_TIMEOUT, HTTP_STREAM_IDLE_TIMEOUT, HttpBodyInput, HttpBodyOutput,
-    HttpMiddlewareFailure, HttpPipelineFinish, HttpStageDiagnostics, HttpStageInvocation,
-    HttpStageOutcome, MAX_HTTP_STREAM_UNIT_BYTES, MIDDLEWARE_CANNOT_INSPECT,
-    MIDDLEWARE_HOOK_VERSIONS_MIXED,
+    HttpFailureCode, HttpMiddlewareFailure, HttpPipelineFinish, HttpStageDiagnostics,
+    HttpStageInvocation, HttpStageOutcome, MAX_HTTP_STREAM_UNIT_BYTES, MIDDLEWARE_CANNOT_INSPECT,
+    MIDDLEWARE_HOOK_VERSIONS_MIXED, MiddlewareFailureDetail,
 };
 pub use request::{
     HttpRequestPreflightInput, HttpRequestPreflightOutcome, HttpRequestSession,

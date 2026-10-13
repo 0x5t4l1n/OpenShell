@@ -41,7 +41,7 @@ After the result that ends its part of the exchange (`continue_without_body`, `b
 The preflight describes the message before OpenShell reads any body byte:
 
 - `subject` is the request head (target and headers), the final response head (target, status, and headers), or an [uninspectable connection](#uninspectable-traffic).
-- `context`, `middleware_name`, and `config` identify the sandbox, the middleware, and the validated `config` from the policy entry.
+- `context`, `middleware_name`, and `config` identify the sandbox, the middleware, and the validated `config` from the policy entry. When OpenShell resolved the process that opened the connection, `context.originating_process` carries its binary and ancestors, with `pid` set to `0`.
 - `permitted_body_modes` lists the modes this message allows. `unavailable_body_modes` lists each mode that OpenShell removed, with the reason. Select a permitted mode your service supports, or continue or reject when none suits it.
 - `limits` carries the chunk size, the largest buffered body, queue sizes, and the STREAM idle timeout.
 - `declared_body_bytes` is the declared length of the original body, when known. An earlier stage may replace the body, so enforce your limits on the body you receive.
@@ -73,7 +73,7 @@ OpenShell offers only the modes a message allows. For requests, it removes BUFFE
 | `OPEN_ENDED` | `text/event-stream` or `multipart/x-mixed-replace` content. | BUFFERED |
 | `OVER_LIMIT` | The declared length exceeds the stage's payload limit. | BUFFERED |
 
-When no mode is permitted, your service can continue or reject. Use the reason to tell a bodyless response, which has nothing to inspect, from a body your service cannot inspect. To fail because your service cannot inspect a message, end the stream with gRPC status `FAILED_PRECONDITION`. OpenShell fails closed with the reason `middleware_cannot_inspect` and does not record your status message.
+When no mode is permitted, your service can continue or reject. Use the reason to tell a bodyless response, which has nothing to inspect, from a body your service cannot inspect. To fail because your service cannot inspect a message, end the stream with gRPC status `FAILED_PRECONDITION`. OpenShell fails closed, and the sandbox receives `failure_code: middleware_cannot_inspect`. OpenShell never records or returns your status message.
 
 ## Headers and Delivery
 
@@ -92,12 +92,15 @@ Until every stage returns its terminal result, OpenShell holds back what would c
 | Limit | Value |
 | --- | --- |
 | Preflight | The binding timeout for each stage, within the 30-second chain budget. |
+| Concurrent messages | 64 messages in preflight or in a BUFFERED body, and 256 messages with a STREAM stage, in each sandbox. A message waits for capacity within the 30-second chain budget. A message whose stages all continue at preflight stops counting once preflight ends. |
 | BUFFERED body | The stage's payload limit, up to 4 MiB. |
 | BUFFERED time | 2 minutes to receive, process, and deliver one body. Each exchange is also bounded by the binding timeout. |
 | STREAM size and time | No total limit. |
 | STREAM middleware stall | 30 seconds. A stage fails when it does not accept the next input in time, or returns nothing within 30 seconds after `input_end`. Time the sandbox or the external service takes to produce input does not count. |
 | STREAM request upload stall | 30 seconds without progress from the sandbox. The sandbox receives `408 Request Timeout` with `error: request_timeout`. |
 | Body chunk | 64 KiB, or the stage's payload limit if smaller. |
+
+A `buffered_body` event or a `replacement` at the 4 MiB limit is larger than 4 MiB once encoded, which most gRPC servers reject by default. If your service advertises a payload limit near 4 MiB, raise its receive and send message limits to at least 4.5 MiB, for example with `max_decoding_message_size` and `max_encoding_message_size` in tonic.
 
 ## Uninspectable Traffic
 
@@ -111,9 +114,24 @@ Because HTTP session hook request middleware decides for itself, a policy can at
 
 The HTTP session hooks always fail closed, and `on_error` does not apply to them. A stage error, timeout, unknown or undecodable result, `UNIMPLEMENTED` status, invalid header mutation, oversized body, or lifecycle violation fails the message:
 
-- A request receives `403 Forbidden` with `error: middleware_denied` for a rejection, or `error: middleware_failed` for a failure. A request that fails at preflight or in a BUFFERED stage never reaches the external service. When a STREAM stage fails after the request head reached the external service, OpenShell also closes that connection before the request body completes.
+- A request receives `403 Forbidden` with `error: middleware_denied` for a rejection, or `error: middleware_failed` for a failure. A request that fails at preflight or in a BUFFERED stage never reaches the external service. When a STREAM stage fails after the request head reached the external service, OpenShell also closes that connection before the request body completes. A request that finds no capacity within the chain budget receives `503 Service Unavailable` with `error: middleware_failed`.
 - A response receives `403 Forbidden` with `error: middleware_denied` for a rejection, or `502 Bad Gateway` with `error: response_delivery_failed` for a failure, while its head is not yet committed. After commit, OpenShell aborts delivery without completing the response or sending an error body, and records a high-severity finding.
 - An uninspectable connection is refused.
+
+A rejection carries `middleware`, the name of the policy entry, and the `reason_code` your service set. A failure carries `middleware`, when one stage failed, and a `failure_code` that tells the sandbox whether retrying can help:
+
+| `failure_code` | Cause |
+| --- | --- |
+| `middleware_cannot_inspect` | The stage ended its stream with `FAILED_PRECONDITION`, or OpenShell cannot show the message head to middleware. |
+| `middleware_timeout` | A stage missed its binding timeout, the chain budget, or the BUFFERED time limit. |
+| `stream_idle_timeout` | A STREAM stage stalled. |
+| `middleware_unavailable` | The service was unreachable or failed with a gRPC status, or OpenShell had no capacity for the message. |
+| `middleware_lifecycle_violation` | The stage broke the exchange lifecycle, for example with an unexpected result, an unimplemented RPC, or output that does not match its declared length. |
+| `body_over_limit` | A body exceeded the selected limit. |
+| `header_mutation_*` | A header or trailer mutation broke a [header change rule](/extensibility/supervisor-middleware/operations#requests), for example `header_mutation_protected_header`. |
+| `middleware_hook_versions_mixed` | The chain mixes v1 HTTP hook and HTTP session hook entries. |
+
+The codes come from this fixed set and never include text from your service.
 
 The gateway rejects `on_error: fail_open` on any entry whose service runs HTTP session hooks, including a service that also has WebSocket bindings. A policy stored before its service moved to HTTP session hooks still loads. Supervisors run its HTTP traffic fail-closed once they reach the service, and follow its `on_error` while they cannot.
 

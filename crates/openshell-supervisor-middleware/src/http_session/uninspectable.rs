@@ -23,8 +23,8 @@ use super::pipeline::{
 };
 use crate::{
     ChainEntry, ChainRunner, DescribedChainEntry, HttpHookVersion, MAX_MIDDLEWARE_CHAIN_TIMEOUT,
-    MiddlewareDenial, MiddlewareWorkAdmissionOutcome, NamespacedFinding, OnError,
-    sort_chain_entries, uninspectable_traffic_binding,
+    MiddlewareDenial, NamespacedFinding, OnError, sort_chain_entries,
+    uninspectable_traffic_binding,
 };
 
 /// A connection `OpenShell` cannot show to middleware as HTTP messages.
@@ -110,7 +110,7 @@ impl ChainRunner {
             ..UninspectableOutcome::default()
         };
         let chain_deadline = tokio::time::Instant::now() + MAX_MIDDLEWARE_CHAIN_TIMEOUT;
-        let mut work = None;
+        let mut slot = None;
         for entry in entries {
             if !self.decides_uninspectable_traffic(&entry.implementation) {
                 let protocol = self.http_hook_version_of(&entry.implementation);
@@ -132,17 +132,13 @@ impl ChainRunner {
                 }
                 continue;
             }
-            if work.is_none() {
-                match self.reserve_middleware_work().await {
-                    Ok(MiddlewareWorkAdmissionOutcome::Admitted(admission)) => {
-                        work = Some(admission);
-                    }
-                    Ok(MiddlewareWorkAdmissionOutcome::QueueExhausted) | Err(_) => {
-                        outcome
-                            .invocations
-                            .push(failed(&entry, "admission_exhausted"));
-                        return outcome.deny("middleware_failed: admission_exhausted", None);
-                    }
+            if slot.is_none() {
+                slot = self.reserve_http_session(chain_deadline).await;
+                if slot.is_none() {
+                    outcome
+                        .invocations
+                        .push(failed(&entry, "session_capacity_exhausted"));
+                    return outcome.deny("middleware_failed: session_capacity_exhausted", None);
                 }
             }
             let Some(described) = self.describe_uninspectable_entry(&entry).await else {

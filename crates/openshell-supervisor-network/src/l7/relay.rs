@@ -859,7 +859,7 @@ where
 
 /// Answer a streamed request body that request middleware rejected or failed,
 /// or that the sandbox stopped sending, then close the client connection.
-async fn reject_live_request_body<C: AsyncWrite + Unpin>(
+async fn reject_live_request_body<C: AsyncRead + AsyncWrite + Unpin>(
     client: &mut C,
     ctx: &L7EvalContext,
     request: &crate::l7::provider::L7Request,
@@ -877,7 +877,9 @@ async fn reject_live_request_body<C: AsyncWrite + Unpin>(
     };
     let context = Some(crate::l7::rest::DenyResponseContext::from_l7_context(ctx));
     match failure {
-        crate::l7::rest::LiveRequestFailure::Middleware { denial, .. } => {
+        crate::l7::rest::LiveRequestFailure::Middleware {
+            denial, failure, ..
+        } => {
             if let Some(observer) = observer {
                 observer.observe(EndpointResult::PolicyDenied);
             }
@@ -895,6 +897,7 @@ async fn reject_live_request_body<C: AsyncWrite + Unpin>(
                 crate::l7::rest::send_middleware_failure_response(
                     &rejected,
                     &ctx.policy_name,
+                    failure.as_ref(),
                     client,
                     Some(&redacted_target),
                     context,
@@ -913,9 +916,8 @@ async fn reject_live_request_body<C: AsyncWrite + Unpin>(
             .await?;
         }
     }
-    // Signal EOF before the caller tears down the tunnel: the client may
-    // still be sending the body.
-    client.shutdown().await.into_diagnostic()
+    // The client may still be sending the body.
+    crate::l7::middleware::close_after_early_response(client).await
 }
 
 /// Credential signing and body rewriting need the complete request body
@@ -1558,7 +1560,7 @@ where
                     .await?;
                     return Ok(());
                 }
-                MiddlewareApplyResult::Denied { denial, .. } => {
+                MiddlewareApplyResult::Denied { denial, failure } => {
                     if let Some(observer) = observer.as_ref() {
                         observer.observe(EndpointResult::PolicyDenied);
                     }
@@ -1574,6 +1576,7 @@ where
                         client,
                         ctx,
                         denial.as_ref(),
+                        failure.as_ref(),
                         &redacted_target,
                     )
                     .await?;
@@ -1621,6 +1624,7 @@ where
                         client,
                         ctx,
                         preflight.denial.as_ref(),
+                        None,
                         &redacted_target,
                     )
                     .await?;
@@ -2317,7 +2321,7 @@ where
                     .await?;
                     return Ok(());
                 }
-                MiddlewareApplyResult::Denied { denial, .. } => {
+                MiddlewareApplyResult::Denied { denial, failure } => {
                     let denied_request = crate::l7::provider::L7Request {
                         action: request_info.action.clone(),
                         target: redacted_target.clone(),
@@ -2330,6 +2334,7 @@ where
                         client,
                         ctx,
                         denial.as_ref(),
+                        failure.as_ref(),
                         &redacted_target,
                     )
                     .await?;
@@ -2377,6 +2382,7 @@ where
                         client,
                         ctx,
                         preflight.denial.as_ref(),
+                        None,
                         &redacted_target,
                     )
                     .await?;
@@ -2752,7 +2758,7 @@ where
                         "body-aware request middleware must collect the request body"
                     ));
                 }
-                MiddlewareApplyResult::Denied { denial, .. } => {
+                MiddlewareApplyResult::Denied { denial, failure } => {
                     if let Some(observer) = observer.as_ref() {
                         observer.observe(EndpointResult::PolicyDenied);
                     }
@@ -2768,6 +2774,7 @@ where
                         client,
                         ctx,
                         denial.as_ref(),
+                        failure.as_ref(),
                         &redacted_target,
                     )
                     .await?;
@@ -3035,7 +3042,7 @@ where
                         "body-aware request middleware must collect the request body"
                     ));
                 }
-                MiddlewareApplyResult::Denied { denial, .. } => {
+                MiddlewareApplyResult::Denied { denial, failure } => {
                     let denied_request = crate::l7::provider::L7Request {
                         action: request_info.action.clone(),
                         target: redacted_target.clone(),
@@ -3048,6 +3055,7 @@ where
                         client,
                         ctx,
                         denial.as_ref(),
+                        failure.as_ref(),
                         &redacted_target,
                     )
                     .await?;
@@ -3755,7 +3763,7 @@ where
                     .await?;
                     return Ok(());
                 }
-                MiddlewareApplyResult::Denied { denial, .. } => {
+                MiddlewareApplyResult::Denied { denial, failure } => {
                     let denied_request = crate::l7::provider::L7Request {
                         action: "HTTP".into(),
                         target: redacted_target.clone(),
@@ -3768,6 +3776,7 @@ where
                         client,
                         ctx,
                         denial.as_ref(),
+                        failure.as_ref(),
                         &redacted_target,
                     )
                     .await?;
@@ -4511,6 +4520,7 @@ mod tests {
             "Request could not be processed by configured middleware"
         );
         assert_eq!(body["policy"], policy_name);
+        assert_eq!(body["failure_code"], "middleware_unavailable");
         assert!(body.get("middleware").is_none());
         assert!(body.get("reason_code").is_none());
         assert!(body.get("rule_missing").is_none());
@@ -5934,12 +5944,6 @@ network_policies:
         .await
         .expect("send headers without body");
 
-        tokio::time::timeout(std::time::Duration::from_secs(1), relay)
-            .await
-            .expect("relay should shed immediately")
-            .expect("join relay")
-            .expect("relay returns a complete HTTP response");
-
         let mut response = Vec::new();
         tokio::time::timeout(
             std::time::Duration::from_secs(1),
@@ -5950,6 +5954,15 @@ network_policies:
         .expect("read client response");
         let response = String::from_utf8(response).expect("UTF-8 response");
         assert_middleware_unavailable_response(&response, "rest_api");
+
+        // The relay keeps reading until the client closes, so an unsent body
+        // cannot reset the connection before the client reads the 503.
+        drop(app);
+        tokio::time::timeout(std::time::Duration::from_secs(1), relay)
+            .await
+            .expect("relay should shed immediately")
+            .expect("join relay")
+            .expect("relay returns a complete HTTP response");
 
         let mut upstream_bytes = Vec::new();
         tokio::time::timeout(
