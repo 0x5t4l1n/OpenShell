@@ -35,7 +35,7 @@ On a CLI without `agent context`, walk `openshell --help`, then `openshell <grou
 - **Gateway**: the control plane. Register it with `gateway add`, pick one with `gateway select`, and check it with `status` and `whoami`.
 - **Sandbox**: runs one canonical main process, by default `/bin/bash -l`. `sandbox create` attaches to it unless you pass `--detach`. `sandbox connect` reattaches to it, and `sandbox exec` starts a separate process. `stop` keeps the workspace, `start` relaunches, and `delete` removes everything.
 - **Provider**: credentials and configuration built from a profile. `profile list` shows the profiles the gateway imported, and `--type` must match a profile ID exactly. Attach providers with `--provider` at create time or with `sandbox provider attach`.
-- **Policy**: `filesystem_policy`, `landlock`, and `process` are fixed once the sandbox starts. `network_policies` and `network_middlewares` change live through `policy update` or `policy set`.
+- **Policy**: `filesystem_policy`, `landlock`, and `process` are fixed once the sandbox starts. `network_policies` and `network_middlewares` change live through `policy update` or `policy set`. Check a policy file locally with `policy validate` before you apply it.
 - **Access**: `forward start` forwards a local port to the same port in the sandbox. `forward service` maps any local port to a loopback service in the sandbox. `service expose` publishes an HTTP endpoint through the gateway.
 - **Rule proposals**: agents in a sandbox can propose network rules. Review them with `openshell rule` (`get`, `approve`, `reject`, `history`). This command is hidden from the map and from `--help`.
 

@@ -2187,6 +2187,19 @@ enum PolicyCommands {
         timeout: u64,
     },
 
+    /// Check a policy file without contacting a gateway.
+    ///
+    /// Parses the file and runs the schema and safety validation the gateway
+    /// also applies to a submitted policy, then prints every violation. The
+    /// gateway runs more checks when the policy is applied, including
+    /// endpoint ambiguity, provider composition, and registered middleware.
+    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
+    Validate {
+        /// Path to the policy YAML or JSON file.
+        #[arg(long, value_hint = ValueHint::FilePath)]
+        policy: String,
+    },
+
     /// Incrementally update policy on a live sandbox.
     #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
     Update {
@@ -3066,6 +3079,12 @@ async fn run_async() -> Result<()> {
         // -----------------------------------------------------------
         // Top-level policy (was `sandbox policy`)
         // -----------------------------------------------------------
+        // Local validation needs no gateway, so it runs before gateway resolution.
+        Some(Commands::Policy {
+            command: Some(PolicyCommands::Validate { policy }),
+        }) => {
+            run::policy_validate(&policy)?;
+        }
         Some(Commands::Policy {
             command: Some(policy_cmd),
         }) => {
@@ -3211,6 +3230,9 @@ async fn run_async() -> Result<()> {
                         )
                         .await?;
                     }
+                }
+                PolicyCommands::Validate { .. } => {
+                    unreachable!("policy validate runs before gateway resolution")
                 }
                 PolicyCommands::Delete { global, yes } => {
                     if !global {

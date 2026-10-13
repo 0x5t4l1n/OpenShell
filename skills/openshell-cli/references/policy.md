@@ -103,9 +103,14 @@ and `debug-openshell-cluster` to investigate middleware failures.
 
 ### Step 5: Push the updated policy
 
+Check the file locally, then push it:
+
 ```bash
+openshell policy validate --policy current-policy.yaml
 openshell policy set dev --policy current-policy.yaml --wait
 ```
+
+`policy validate` runs the gateway's schema and safety checks without contacting it and prints every violation.
 
 The gateway validates the complete effective candidate—including attached
 provider-profile policy—before it stores a direct update, incremental merge,
