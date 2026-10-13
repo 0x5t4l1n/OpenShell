@@ -61,14 +61,14 @@ Common findings:
 
 ### Step 2: Identify the Compute Platform
 
-Use gateway metadata, deployment values, or the user's setup notes to identify the driver, then read only the matching reference. When a task needs several references, such as a platform reference and [references/gateway-startup.md](references/gateway-startup.md), read them together in one step.
+Use gateway metadata, deployment values, or the user's setup notes to identify the driver, then read only the matching reference. When a task needs several references, such as a platform reference and [references/gateway-startup.md](references/gateway-startup.md), read them in the same step with one call per file; printed together, they are too large for one tool result.
 
 | Platform | Primary checks | Reference |
 |---|---|---|
 | Docker | Gateway process logs, Docker daemon health, sandbox containers, image pulls, GPU CDI devices. | [references/docker.md](references/docker.md) |
 | Podman | Podman socket, rootless networking, user namespaces, sandbox containers, image pulls. | [references/podman.md](references/podman.md) |
-| Kubernetes | Helm release, gateway workload, service, secrets, sandbox pods, events. | [references/kubernetes.md](references/kubernetes.md) |
-| OpenShift | Same as Kubernetes, plus SecurityContextConstraints (SCCs) and, for external access, an OpenShift `Route`. Detect OpenShift by the presence of the `route.openshift.io` API group (`oc api-resources --api-group=route.openshift.io`). | [references/kubernetes.md](references/kubernetes.md) |
+| Kubernetes | Helm release, gateway workload, service, secrets, sandbox pods, events. Multi-replica relay, TLS, and certificates. | [references/kubernetes.md](references/kubernetes.md), [references/kubernetes-tls-and-replicas.md](references/kubernetes-tls-and-replicas.md) |
+| OpenShift | Same as Kubernetes, plus SecurityContextConstraints (SCCs) and, for external access, an OpenShift `Route`. Detect OpenShift by the presence of the `route.openshift.io` API group (`oc api-resources --api-group=route.openshift.io`). | [references/kubernetes.md](references/kubernetes.md), [references/kubernetes-tls-and-replicas.md](references/kubernetes-tls-and-replicas.md) |
 | VM | VM driver logs, rootfs availability, host tools, host virtualization support. | [references/vm.md](references/vm.md) |
 | Extension | External driver process, Unix socket ownership/mode, configured driver name, capability handshake, gateway logs. | [references/gateway-startup.md](references/gateway-startup.md) |
 

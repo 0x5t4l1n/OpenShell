@@ -17,7 +17,7 @@ The map lists every command of the installed CLI with its usage line and summary
 
 Each step costs a round trip, so batch your reads:
 
-- Run the map and read every [workflow reference](#workflow-references) your task needs in the same step.
+- Run the map and read every [workflow reference](#workflow-references) your task needs in the same step, with one call per file. Printed together, they are too large for one tool result.
 - Run `openshell <group> <cmd> --help` only when the map and references leave a flag's meaning unclear, and combine those calls into one command.
 
 On a CLI without `agent context`, walk `openshell --help`, then `openshell <group> --help`, then `openshell <group> <cmd> --help`.
