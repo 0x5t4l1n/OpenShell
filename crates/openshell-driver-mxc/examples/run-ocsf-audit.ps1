@@ -53,6 +53,88 @@ $PSNativeCommandUseErrorActionPreference = $false
 try { [Console]::OutputEncoding = [System.Text.Encoding]::UTF8 } catch {}
 $OutputEncoding = [System.Text.Encoding]::UTF8
 
+function Quote-NativeArgument([string]$value) {
+    if ($value.Length -gt 0 -and $value -notmatch '[\s"]') { return $value }
+
+    $quoted = New-Object System.Text.StringBuilder
+    [void]$quoted.Append('"')
+    $backslashes = 0
+    foreach ($ch in $value.ToCharArray()) {
+        if ($ch -eq '\') {
+            $backslashes++
+            continue
+        }
+        if ($ch -eq '"') {
+            [void]$quoted.Append(('\' * (2 * $backslashes + 1)))
+            [void]$quoted.Append('"')
+        } else {
+            if ($backslashes -gt 0) { [void]$quoted.Append(('\' * $backslashes)) }
+            [void]$quoted.Append($ch)
+        }
+        $backslashes = 0
+    }
+    if ($backslashes -gt 0) { [void]$quoted.Append(('\' * (2 * $backslashes))) }
+    [void]$quoted.Append('"')
+    return $quoted.ToString()
+}
+
+function Invoke-NativeCaptured([string]$filePath, [string[]]$argumentList, [int]$timeoutSeconds = 0) {
+    $startInfo = New-Object System.Diagnostics.ProcessStartInfo
+    $startInfo.FileName = $filePath
+    $startInfo.Arguments = (($argumentList | ForEach-Object { Quote-NativeArgument $_ }) -join ' ')
+    $startInfo.UseShellExecute = $false
+    $startInfo.CreateNoWindow = $true
+    $startInfo.RedirectStandardOutput = $true
+    $startInfo.RedirectStandardError = $true
+
+    $process = New-Object System.Diagnostics.Process
+    $process.StartInfo = $startInfo
+    try {
+        if (-not $process.Start()) { throw "failed to start $filePath" }
+    } catch {
+        $message = $_.Exception.Message
+        if ($message -match '(?i)Application Control policy has blocked this file') {
+            $sha256 = try { (Get-FileHash -LiteralPath $filePath -Algorithm SHA256).Hash } catch { "unavailable" }
+            $signature = try { (Get-AuthenticodeSignature -LiteralPath $filePath).Status } catch { "unavailable" }
+            throw "Application Control blocked CLI launch '$filePath' (SHA256=$sha256; Authenticode=$signature). Review CodeIntegrity/Operational event 3077 to identify the blocking policy, then deploy or allow an approved binary. Original error: $message"
+        }
+        throw
+    }
+    $stdout = $process.StandardOutput.ReadToEndAsync()
+    $stderr = $process.StandardError.ReadToEndAsync()
+    if ($timeoutSeconds -gt 0 -and -not $process.WaitForExit($timeoutSeconds * 1000)) {
+        $process.Kill()
+    }
+    $process.WaitForExit()
+
+    return @{
+        ExitCode = $process.ExitCode
+        Output = @($stdout.Result, $stderr.Result) | Where-Object { $_ }
+    }
+}
+
+# Coverage comes from structured ETW-origin event messages, independent of the
+# console formatter. Class checks prevent unrelated log text from satisfying it.
+function Get-MxcAuditCoverage([object[]] $Events) {
+  $rules = [ordered]@{
+    "sandbox lifecycle (start)" = @(6002, "MXC sandbox '*' created with policy enforcement")
+    "OS policy enforced" = @(5019, "MXC sandbox OS policy enforced")
+    "OS policy configured" = @(5019, "MXC sandbox OS policy configured")
+    "win32k lockdown applied" = @(5019, "MXC sandbox win32k lockdown applied")
+    "UI restrictions applied" = @(5019, "MXC sandbox UI restrictions applied")
+    "console reference plumbed" = @(5019, "MXC sandbox console reference plumbed")
+    "process launch (executable identity)" = @(1007, "MXC sandbox launched process: *")
+  }
+  $coverage = [ordered]@{}
+  foreach ($name in $rules.Keys) {
+    $rule = $rules[$name]
+    $coverage[$name] = @($Events | Where-Object {
+      $_.class_uid -eq $rule[0] -and $_.message -like $rule[1]
+    }).Count -gt 0
+  }
+  return $coverage
+}
+
 $here = if ($PSScriptRoot) { $PSScriptRoot } else { (Get-Location).Path }
 
 # Results bundle (everything we hand back) ------------------------------------
@@ -192,8 +274,10 @@ $tomlSrc = Join-Path $here "mxc-ocsf-audit.toml"
 $toml    = Join-Path $resultDir "mxc-ocsf-audit.used.toml"   # disposable patched copy (bundled)
 $helloPath = Join-Path $ShareDir "hello.txt"
 
+$secretDir = Join-Path $here ('audit-keys-' + [guid]::NewGuid().ToString('N'))
 $gw       = $null
 $gatewayEtwSessions = @()
+$createdSandboxes = @()
 $passed   = $true
 
 try {
@@ -221,6 +305,21 @@ try {
   }
   Info "wxc-exec: $WxcExecPath"
 
+  # Supervisor sessions require gateway-minted JWTs. Keep disposable private
+  # keys outside the results bundle and restrict them to this test account.
+  $openssl = (Get-Command openssl -ErrorAction Stop).Source
+  New-Item -ItemType Directory $secretDir | Out-Null
+  $ownerSid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+  & icacls.exe $secretDir /inheritance:r /grant:r "*$($ownerSid):(OI)(CI)F" | Out-Null
+  if ($LASTEXITCODE -ne 0) { throw 'cannot protect disposable audit signing keys' }
+  foreach ($keyArgs in @(
+    @('genpkey', '-algorithm', 'ED25519', '-out', (Join-Path $secretDir 'signing.pem')),
+    @('pkey', '-in', (Join-Path $secretDir 'signing.pem'), '-pubout', '-out', (Join-Path $secretDir 'public.pem'))
+  )) {
+    if ((Invoke-NativeCaptured $openssl $keyArgs).ExitCode -ne 0) { throw 'audit signing-key generation failed' }
+  }
+  Set-Content (Join-Path $secretDir 'kid') -Value 'mxc-ocsf-audit' -Encoding ASCII
+
   # 2. Patch the disposable gateway config and derive a sandbox policy whose
   #    filesystem grant matches -ShareDir.
   Step "Prepare gateway config and sandbox policy (disposable copies)"
@@ -233,6 +332,17 @@ try {
   } else {
     $tomlText = [regex]::Replace($tomlText, '(?m)^\[openshell\.drivers\.mxc\]\s*$', "[openshell.drivers.mxc]`r`netw_audit = true")
   }
+  $tomlText += @"
+
+[openshell.gateway.auth]
+allow_unauthenticated_users = true
+
+[openshell.gateway.gateway_jwt]
+signing_key_path = '$(Join-Path $secretDir 'signing.pem')'
+public_key_path = '$(Join-Path $secretDir 'public.pem')'
+kid_path = '$(Join-Path $secretDir 'kid')'
+gateway_id = 'mxc-ocsf-audit'
+"@
   Set-Content $toml -Value $tomlText -Encoding UTF8
 
   $shareDirPolicy = $ShareDir.Replace('\', '/')
@@ -248,20 +358,15 @@ try {
   $cmdExe = Join-Path $env:SystemRoot "System32\cmd.exe"
   if (-not (Test-Path $cmdExe -PathType Leaf)) { throw "cmd.exe not found at '$cmdExe'" }
   $helloPathCommand = $helloPath.Replace('\', '/')
+  New-Item -ItemType Directory -Force $ShareDir | Out-Null
+  $batch = Join-Path $ShareDir 'audit-workload.cmd'
+  Set-Content -LiteralPath $batch -Encoding ASCII -Value ('@echo hello from openshell ocsf audit > "{0}"' -f $helloPathCommand)
   $driverConfig = @{
     mxc = @{
-      command = @($cmdExe, "/c", "echo hello from openshell ocsf audit 1>`"$helloPathCommand`"")
+      command = @($cmdExe, '/d', '/c', $batch)
       cwd = $shareDirPolicy
     }
   } | ConvertTo-Json -Compress -Depth 4
-  # Windows PowerShell 5.1 strips embedded quotes when constructing a native
-  # command line. Escape them so openshell.exe receives valid JSON.
-  $driverConfigArg = if ($PSVersionTable.PSVersion.Major -lt 7) {
-    $driverConfig.Replace('"', '\"')
-  } else {
-    $driverConfig
-  }
-
   Info "backend=process_container  etw_audit=true  runtime=supervisor+sandbox"
   Info "workload cwd=$shareDirPolicy  policy grant=$shareDirPolicy"
 
@@ -342,23 +447,38 @@ try {
 
   # 9. Register CLI -> gateway.
   Step "Register CLI -> gateway"
-  & $cli gateway add "http://127.0.0.1:$Port" --local --name $GatewayName 2>&1 | ForEach-Object { Info $_ }
-  if ($LASTEXITCODE -ne 0) { throw "gateway add failed (exit $LASTEXITCODE)" }
-  & $cli gateway select $GatewayName 2>&1 | ForEach-Object { Info $_ }
-  if ($LASTEXITCODE -ne 0) { throw "gateway select failed (exit $LASTEXITCODE)" }
+  foreach ($cliArgs in @(
+    @('gateway', 'add', "http://127.0.0.1:$Port", '--local', '--name', $GatewayName),
+    @('gateway', 'select', $GatewayName)
+  )) {
+    $cliResult = Invoke-NativeCaptured $cli $cliArgs 30
+    $cliResult.Output | ForEach-Object { Info $_ }
+    if ($cliResult.ExitCode -ne 0) { throw "gateway registration failed (exit $($cliResult.ExitCode))" }
+  }
   Ok "selected gateway '$GatewayName'"
 
   # 10. Create N sandboxes. Each drives the Sandboxing provider -> a full OCSF
-  #     event burst. The post-create interactive attach failure is EXPECTED on
-  #     MXC (no in-sandbox supervisor) and harmless - the agent already ran.
+  #     event burst through the authenticated supervisor and sandbox runtime.
   Step "Create $SandboxCount sandbox(es) (drives the Sandboxing provider)"
   for ($i = 1; $i -le $SandboxCount; $i++) {
     $name = "ocsf$i"
     Info "-- creating $name --"
-    try { & $cli sandbox create --name $name --policy $policy --driver-config-json $driverConfigArg --no-tty 2>&1 | ForEach-Object { Info $_ } }
-    catch { Info "sandbox create attach: $($_.Exception.Message) (expected on MXC - agent ran in-driver; continuing)" }
+    Remove-Item -LiteralPath $helloPath -Force -ErrorAction SilentlyContinue
+    $created = Invoke-NativeCaptured $cli @('sandbox', 'create', '--name', $name,
+      '--policy', $policy, '--driver-config-json', $driverConfig, '--detach') 90
+    $created.Output | ForEach-Object { Info $_ }
+    if ($created.ExitCode -ne 0) { throw "sandbox create failed (exit $($created.ExitCode))" }
+    $createdSandboxes += $name
+    $workloadDeadline = (Get-Date).AddSeconds(30)
+    while (-not (Test-Path -LiteralPath $helloPath -PathType Leaf) -and (Get-Date) -lt $workloadDeadline) {
+      Start-Sleep -Milliseconds 200
+    }
+    if (-not (Test-Path -LiteralPath $helloPath -PathType Leaf)) { throw 'audit workload did not produce its artifact' }
+    # Give real-time ETW delivery time to complete before retiring attribution.
     Start-Sleep -Seconds 3
-    try { & $cli sandbox delete $name 2>&1 | Out-Null } catch {}
+    $deleted = Invoke-NativeCaptured $cli @('sandbox', 'delete', $name) 30
+    if ($deleted.ExitCode -ne 0) { throw "sandbox delete failed (exit $($deleted.ExitCode)): $($deleted.Output)" }
+    $createdSandboxes = @($createdSandboxes | Where-Object { $_ -ne $name })
   }
 }
 catch {
@@ -366,6 +486,14 @@ catch {
   $passed = $false
 }
 finally {
+  # A failed artifact/coverage check must not orphan a created runtime or leave
+  # inherited log handles open when the gateway is stopped and results zipped.
+  if (-not $KeepRunning -and $gw -and -not $gw.HasExited) {
+    foreach ($name in $createdSandboxes) {
+      try { $null = Invoke-NativeCaptured $cli @('sandbox', 'delete', $name) 30 }
+      catch { Info "cleanup of $name failed: $($_.Exception.Message)" }
+    }
+  }
   if (-not $KeepRunning -and $gw -and $gatewayEtwSessions.Count -eq 0) {
     $gatewayEtwSessions = @(Get-MxcEtwSessions | Where-Object { $_.Pid -eq $gw.Id })
   }
@@ -384,6 +512,13 @@ finally {
     foreach ($session in $gatewayEtwSessions) {
       logman stop $session.Name -ets 2>&1 | Out-Null
     }
+  }
+
+  if (-not $KeepRunning -and (Test-Path -LiteralPath $secretDir)) {
+    foreach ($keyFile in @('signing.pem', 'public.pem', 'kid')) {
+      Remove-Item -LiteralPath (Join-Path $secretDir $keyFile) -Force -ErrorAction SilentlyContinue
+    }
+    Remove-Item -LiteralPath $secretDir -ErrorAction SilentlyContinue
   }
 
   # ---- summarise the OCSF audit trail --------------------------------------
@@ -405,13 +540,14 @@ finally {
   $jsonlPath  = if ($jsonlFiles.Count) { $jsonlFiles[0].FullName } else { $null }
   $classNames = @{ 6002 = "Application Lifecycle"; 5019 = "Device Config State Change"; 1007 = "Process Activity"; 2004 = "Detection Finding" }
   $classCounts = @{ 6002 = 0; 5019 = 0; 1007 = 0; 2004 = 0 }
-  $jsonlCount = 0; $jsonlBad = 0; $sids = @(); $hosts = @()
+  $jsonlCount = 0; $jsonlBad = 0; $sids = @(); $hosts = @(); $auditEvents = @()
   if ($jsonlPath) {
     $raw = @(Get-Content $jsonlPath -ErrorAction SilentlyContinue | Where-Object { $_.Trim() -ne "" })
     $jsonlCount = $raw.Count
     foreach ($line in $raw) {
       try {
         $o = $line | ConvertFrom-Json
+        $auditEvents += $o
         if ($o.class_uid -ne $null -and $classCounts.ContainsKey([int]$o.class_uid)) { $classCounts[[int]$o.class_uid]++ }
         if ($o.metadata -and $o.metadata.uid) { $sids += [string]$o.metadata.uid }
         if ($o.device -and $o.device.hostname) { $hosts += [string]$o.device.hostname }
@@ -421,28 +557,19 @@ finally {
     $hosts = @($hosts | Select-Object -Unique)
   }
 
-  # Event-type coverage (detected from the human-readable shorthand lines).
-  function Seen([string]$pat) { [bool]($logText | Select-String -Pattern $pat -Quiet) }
-
-  # Expected happy-path ETW->OCSF event types for THIS run. The egress-proxy
-  # event only fires when the proxy is enabled, so it only counts toward the
-  # expected total when -NoProxy was NOT passed.
-  $coreEvents = [ordered]@{
-    "sandbox lifecycle (start)"     = Seen "(?i)ocsf:.*LIFECYCLE:"
-    "OS policy enforced"            = Seen "(?i)ocsf:.*OS policy enforced"
-    "OS policy configured"          = Seen "(?i)ocsf:.*OS policy configured"
-    "win32k lockdown applied"       = Seen "(?i)ocsf:.*win32k lockdown"
-    "UI restrictions applied"       = Seen "(?i)ocsf:.*UI restrictions"
-    "console reference plumbed"     = Seen "(?i)ocsf:.*console reference plumbed"
-    "process launch (executable identity)" = Seen "(?i)ocsf:.*PROC:LAUNCH"
+  # Require all seven ETW event types in durable structured output.
+  $coreEvents = Get-MxcAuditCoverage $auditEvents
+  function SeenFinding([string] $Kind) {
+    @($auditEvents | Where-Object {
+      $_.class_uid -eq 2004 -and $_.message -like "*$Kind*"
+    }).Count -gt 0
   }
-  if ($proxyOn) { $coreEvents["egress proxy configured"] = Seen "(?i)ocsf:.*proxy configured" }
 
   # Findings are anomaly / fallback signals - reported separately, NOT part of
   # the expected-coverage denominator (a clean run may emit none).
   $findingEvents = [ordered]@{
-    "ActivityError finding" = Seen "(?i)ocsf:.*ActivityError"
-    "FallbackError finding" = Seen "(?i)ocsf:.*FallbackError"
+    "ActivityError finding" = SeenFinding "ActivityError"
+    "FallbackError finding" = SeenFinding "FallbackError"
   }
 
   $coreExpected     = $coreEvents.Count
@@ -467,7 +594,7 @@ user             : $env:USERNAME   (admin=$admin  perfLogUsers=$plu)
 verdict          : $verdict
 event coverage   : $coreObserved of $coreExpected expected event types fired   (+ $findingsObserved anomaly finding(s))
 queue overload   : $(if ($consumerOverloaded) { 'YES - ETW records dropped; audit coverage gap' } else { 'no dropped ETW records observed' })
-proxy            : $(if ($proxyOn) { 'on (full event set)' } else { 'off (-NoProxy; omits egress proxy event)' })
+proxy            : authenticated supervisor proxy (ETW proxy event is not required)
 workload output  : $(if ($workloadCompleted) { $helloPath } else { '(missing)' })
 wxc_exec         : $WxcExecPath
 backend          : process_container
@@ -499,7 +626,7 @@ started, decoded the Sandboxing provider, attributed each event to a sandbox_id,
 reported no callback-queue overload, mapped events to OCSF, and wrote a durable
 JSONL audit log covering all $coreExpected
 expected event types across $classesSeen OCSF class(es) - the full Windows OCSF path
-end-to-end, at parity with the Linux pipeline.
+end-to-end for the Sandboxing provider event types listed above.
 "@
   Set-Content -Path (Join-Path $resultDir "summary.txt") -Value $summary -Encoding UTF8
   Write-Host $summary -ForegroundColor ($(if ($passed) { "Green" } else { "Red" }))

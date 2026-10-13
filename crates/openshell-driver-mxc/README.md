@@ -321,3 +321,17 @@ workaround has been established.
 Provider environment publications reject case-insensitive duplicate names,
 invalid environment entries, and names reserved for the six injected TLS trust
 variables before installing them. Rejected updates retain the prior revision.
+
+For live ETW audit coverage, set `OPENSHELL_WXC_EXEC_PATH` and run
+`mise run --skip-tools windows:test:mxc-audit` after building native release
+binaries. This requires elevation or Performance Log Users membership. It checks
+the shipped config and coverage classifier before requiring all seven event types
+in the durable JSONL output; the ordinary E2E scenarios do not check this path.
+
+On the ARM64 test host (Windows build 28120, MXC 1.0.0), Sandboxing ETW records
+come from the shared Appinfo broker rather than the driver-owned executor.
+The consumer cannot correlate these records using the executor's PID and process
+generation, so live audit qualification currently fails even though the workload
+completes. The executor diagnostic log redacts its container identity. A trusted
+broker-to-launch correlation is needed; treating the shared broker PID as a
+sandbox identity would misattribute concurrent sandboxes and is not supported.

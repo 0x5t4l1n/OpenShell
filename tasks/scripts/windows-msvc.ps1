@@ -6,7 +6,7 @@
 [CmdletBinding()]
 param(
     [Parameter(Mandatory = $true, Position = 0)]
-    [ValidateSet("check", "lint", "build", "build-mxc-fixtures", "test", "test-precommit", "test-unsupported", "test-mxc-real", "test-mxc-boundary", "test-mxc-loopback", "test-mxc-network", "artifacts", "ci")]
+    [ValidateSet("check", "lint", "build", "build-mxc-fixtures", "test", "test-precommit", "test-unsupported", "test-mxc-real", "test-mxc-boundary", "test-mxc-loopback", "test-mxc-network", "test-mxc-audit", "artifacts", "ci")]
     [string] $Action,
 
     [Parameter(Position = 1)]
@@ -657,7 +657,7 @@ if ($Action -in @("test", "test-precommit", "test-unsupported", "test-mxc-real")
     }
 }
 
-if ($Action -in @("check", "lint", "build", "build-mxc-fixtures", "test", "test-precommit", "test-unsupported", "test-mxc-real", "test-mxc-boundary", "test-mxc-loopback", "test-mxc-network", "ci")) {
+if ($Action -in @("check", "lint", "build", "build-mxc-fixtures", "test", "test-precommit", "test-unsupported", "test-mxc-real", "test-mxc-boundary", "test-mxc-loopback", "test-mxc-network", "test-mxc-audit", "ci")) {
     $z3Features = Configure-Z3
     $Z3WorkspaceFeatures = $z3Features.WorkspaceFeatures
     $Z3ServerFeatures = $z3Features.ServerFeatures
@@ -731,6 +731,33 @@ switch ($Action) {
                     -CargoArgs "cargo test --release -p openshell-driver-mxc --test wxc_exec_real --target $rustTarget $testName -- --ignored --exact --test-threads=1 --nocapture" `
                     -LogName "test-$rustTarget-$testName.log"
             }
+        }
+    }
+    "test-mxc-audit" {
+        foreach ($rustTarget in $targets) {
+            Assert-NativeTestTarget $rustTarget
+            Invoke-VsCargo -RustTarget $rustTarget `
+                -CargoArgs "cargo test --release -p openshell-driver-mxc --lib --target $rustTarget etw_consumer::tests -- --test-threads=1 --nocapture" `
+                -LogName "test-$rustTarget-mxc-audit-attribution.log"
+            Invoke-VsCargo -RustTarget $rustTarget `
+                -CargoArgs "cargo test --release -p openshell-server --lib --target $rustTarget $Z3ServerFeatures mxc_audit_example -- --nocapture" `
+                -LogName "test-$rustTarget-mxc-audit-config.log"
+            Invoke-VsCargo -RustTarget $rustTarget `
+                -CargoArgs "cargo test --release -p openshell-driver-mxc --test windows_demo_examples --target $rustTarget -- --test-threads=1 --nocapture" `
+                -LogName "test-$rustTarget-mxc-audit-examples.log"
+            $package = Join-Path $TargetDir "mxc-ocsf-qualification-$rustTarget"
+            New-Item -ItemType Directory -Force $package | Out-Null
+            foreach ($binary in @('openshell-gateway.exe', 'openshell.exe', 'openshell-supervisor.exe', 'openshell-windows-sandbox.exe', 'libz3.dll')) {
+                Copy-Item -LiteralPath (Join-Path $TargetDir "$rustTarget/release/$binary") -Destination $package -Force
+            }
+            foreach ($artifact in @('run-ocsf-audit.ps1', 'mxc-ocsf-audit.toml', 'ocsf-audit.yaml')) {
+                Copy-Item -LiteralPath (Join-Path $RepoRoot "crates/openshell-driver-mxc/examples/$artifact") -Destination $package -Force
+            }
+            $wxc = $env:OPENSHELL_WXC_EXEC_PATH
+            if (-not $wxc) { throw 'Set OPENSHELL_WXC_EXEC_PATH to the real MXC executor.' }
+            & powershell.exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $package 'run-ocsf-audit.ps1') `
+                -WxcExecPath $wxc -ShareDir (Join-Path $package 'work')
+            if ($LASTEXITCODE -ne 0) { throw "Live MXC audit qualification failed; results are in $package" }
         }
     }
     "test-mxc-real" {

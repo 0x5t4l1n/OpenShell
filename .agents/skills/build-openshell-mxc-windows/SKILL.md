@@ -544,3 +544,11 @@ The MSVC wrapper selects native test architecture from the machine environment,
 so an emulated SSH PowerShell does not incorrectly reject ARM64 qualification.
 Keep Windows kernel calls in the boundary library and retain shared supervisor
 unsafe-code bans, per-generation proxy authentication, and executable digests.
+
+Use `windows:test:mxc-audit` to validate the shipped audit gateway config with
+its real parser, test JSONL coverage classification, and run the live seven-event
+ETW qualification. Build native release binaries first and set
+`OPENSHELL_WXC_EXEC_PATH`. The runner requires elevation or Performance Log Users
+membership and leaves a results bundle under the target directory. Ordinary MXC
+E2E success does not establish ETW audit coverage. Coverage must use structured
+JSONL and fail when an expected event is absent or has the wrong OCSF class.

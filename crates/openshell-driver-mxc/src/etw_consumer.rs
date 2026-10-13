@@ -1567,6 +1567,9 @@ impl EtwEventProcessor {
                 // instant `wxc-exec` starts, which can beat the driver's
                 // `register_launch`. Hold the event for replay instead of dropping
                 // it (see `drain_and_emit`).
+                tracing::debug!(target: "mxc_etw", pid = ev.process_id,
+                    process_start_key = ?ev.process_start_key,
+                    "buffering uncorrelated MXC audit event");
                 idx.buffer_unresolved(ev);
                 None
             }
@@ -2067,6 +2070,30 @@ mod tests {
             event_name: Some(name.to_string()),
             props: Vec::new(),
         }
+    }
+
+    #[tokio::test]
+    async fn live_child_process_generation_is_stable_and_distinct() {
+        let mut keys = Vec::new();
+        for _ in 0..2 {
+            let mut child = tokio::process::Command::new("powershell.exe")
+                .args(["-NoProfile", "-Command", "Start-Sleep -Seconds 30"])
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .expect("spawn owned telemetry probe");
+            let first = child_process_start_key(&child);
+            let second = child_process_start_key(&child);
+            child.kill().await.expect("stop owned telemetry probe");
+            let first = first.expect("live driver-owned handle has a generation key");
+            assert_eq!(first, second.unwrap());
+            keys.push(first);
+        }
+        assert_ne!(
+            keys[0], keys[1],
+            "different children require different generation keys"
+        );
     }
 
     #[test]

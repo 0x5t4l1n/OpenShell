@@ -12,7 +12,7 @@ WHAT THIS PROVES / PRODUCES
 
   The deliverable is the OCSF log: openshell-ocsf.<date>.log, one OCSF event
   object per line - the same schema and medium the Linux OpenShell pipeline
-  produces (Windows is at functional parity).
+  produces.
 
   OCSF classes you will see:
     [6002] Application Lifecycle        - sandbox created
@@ -22,7 +22,8 @@ WHAT THIS PROVES / PRODUCES
 
 PREREQUISITES (on this test box)
   - wxc-exec.exe present (default expected: C:\mxc-kit\bin\wxc-exec.exe)
-  - process_container backend live (it was for our earlier runs)
+  - process_container backend live
+  - OpenSSL on PATH to generate disposable supervisor signing keys
   - Run ELEVATED (Run as administrator) OR from an account in the
     'Performance Log Users' group. Opening the real-time ETW session needs this;
     without it the run fails fast with a clear message.
@@ -46,6 +47,9 @@ WHAT YOU GET BACK
 FILES IN THIS PACKAGE
   openshell-gateway.exe    the gateway (self-contained; needs only VC++ runtime)
   openshell.exe            the CLI
+  openshell-supervisor.exe host supervisor
+  openshell-windows-sandbox.exe sandbox runtime
+  libz3.dll                matching native Z3 runtime
   mxc-ocsf-audit.toml      gateway/driver config (process_container, etw_audit=true, egress proxy)
   ocsf-audit.yaml          sandbox policy (read-write grant to the share dir)
   run-ocsf-audit.ps1       the orchestrator you run
@@ -54,9 +58,6 @@ FILES IN THIS PACKAGE
 
 USEFUL OPTIONS
   -SandboxCount <n>   Create n sandboxes (default 2). More sandboxes = more events.
-  -NoProxy            Skip the per-sandbox egress proxy. This omits ONLY the
-                      SandboxProxyConfigured config event; everything else is
-                      still produced. (Default is proxy ON for the full set.)
   -ShareDir <path>    Host folder granted read-write to the workload. The script
                       derives a disposable policy and per-sandbox config for it.
   -WxcExecPath <path> Path to wxc-exec.exe on this box.
@@ -65,10 +66,10 @@ USEFUL OPTIONS
   -KeepRunning        Leave the gateway running afterward for inspection.
 
 NOTES
+  - Disposable supervisor signing keys are protected outside the results bundle
+    and removed after the gateway stops (retained with -KeepRunning).
   - The control plane between CLI and gateway runs with --disable-tls on loopback;
     that is unrelated to the OCSF audit path this example exercises.
-  - A "supervisor session not connected" / ssh 255 message during sandbox create
-    is EXPECTED on MXC and harmless - the agent already ran in-driver.
   - The proxy path requires the host-side CONNECT proxy and an absolute agent
     binary (the packaged config uses C:\Windows\System32\cmd.exe); the run script
     handles this for you.
@@ -78,3 +79,15 @@ NOTES
   - MXC process audit events record the executable basename only. Command-line
     arguments are omitted from OCSF JSON and shorthand because they can contain
     credentials, signed URLs, or PII.
+
+COVERAGE
+  All seven required ETW event types must be present in structured JSONL.
+  Console shorthand formatting does not affect coverage. The supervisor proxy
+  is always provisioned; an OS proxy-configuration event is not required.
+
+CURRENT QUALIFICATION LIMITATION
+  On the ARM64 Windows build 28120 / MXC 1.0.0 test host, the Sandboxing provider
+  emits from the shared Appinfo broker. The consumer's executor PID/generation
+  anchor cannot correlate those records, so this qualification remains FAIL.
+  Captured records are not sufficient: all seven attributed JSONL event types
+  are still required. Do not use the shared broker PID as a sandbox identity.

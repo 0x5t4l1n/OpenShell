@@ -266,3 +266,74 @@ if (-not $rejected) { throw 'conflicting runtimes accepted' }
         String::from_utf8_lossy(&output.stderr)
     );
 }
+
+#[test]
+fn audit_coverage_uses_structured_events_and_rejects_missing_or_wrong_classes() {
+    let script = r#"
+$ErrorActionPreference = 'Stop'
+$tokens = $null; $errors = $null
+$ast = [System.Management.Automation.Language.Parser]::ParseFile(
+    $env:OPENSHELL_MXC_RUNNER, [ref]$tokens, [ref]$errors)
+if ($errors.Count) { throw "parse errors: $errors" }
+$function = $ast.Find({ param($node)
+    $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+    $node.Name -eq 'Get-MxcAuditCoverage'
+}, $true)
+if (!$function) { throw 'missing coverage function' }
+Invoke-Expression $function.Extent.Text
+foreach ($name in @('Quote-NativeArgument', 'Invoke-NativeCaptured')) {
+    $helper = $ast.Find({ param($node)
+        $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq $name
+    }, $true)
+    if (!$helper) { throw "missing $name" }
+    Invoke-Expression $helper.Extent.Text
+}
+foreach ($code in @(0, 7)) {
+    $result = Invoke-NativeCaptured 'powershell.exe' @('-NoProfile', '-Command',
+        "[Console]::Error.WriteLine('status on stderr'); exit $code") 10
+    if ($result.ExitCode -ne $code -or ($result.Output -join '') -notmatch 'status on stderr') {
+        throw 'native stderr must be captured without hiding the exit code'
+    }
+}
+$events = @(
+    @{ class_uid=6002; message="MXC sandbox 'test' created with policy enforcement" },
+    @{ class_uid=5019; message='MXC sandbox OS policy enforced' },
+    @{ class_uid=5019; message='MXC sandbox OS policy configured' },
+    @{ class_uid=5019; message='MXC sandbox win32k lockdown applied' },
+    @{ class_uid=5019; message='MXC sandbox UI restrictions applied' },
+    @{ class_uid=5019; message='MXC sandbox console reference plumbed' },
+    @{ class_uid=1007; message='MXC sandbox launched process: cmd.exe' }
+) | ForEach-Object { $_ | ConvertTo-Json -Compress | ConvertFrom-Json }
+$coverage = Get-MxcAuditCoverage $events
+if ($coverage.Count -ne 7 -or @($coverage.Values | Where-Object { $_ }).Count -ne 7) {
+    throw 'complete structured audit must satisfy seven event types'
+}
+foreach ($index in 0..6) {
+    $subset = @(for ($i=0; $i -lt 7; $i++) { if ($i -ne $index) { $events[$i] } })
+    if (@((Get-MxcAuditCoverage $subset).Values | Where-Object { $_ }).Count -ne 6) {
+        throw "missing event $index must fail coverage"
+    }
+}
+$events[6].class_uid = 5019
+if ((Get-MxcAuditCoverage $events)['process launch (executable identity)']) {
+    throw 'matching text with wrong class must not pass'
+}
+if (@((Get-MxcAuditCoverage @()).Values | Where-Object { $_ }).Count -ne 0) {
+    throw 'empty audit must not pass'
+}
+"#;
+    let output = Command::new("powershell.exe")
+        .args(["-NoProfile", "-Command", script])
+        .env(
+            "OPENSHELL_MXC_RUNNER",
+            examples().join("run-ocsf-audit.ps1"),
+        )
+        .output()
+        .expect("launch PowerShell coverage regression");
+    assert!(
+        output.status.success(),
+        "{} {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}

@@ -1473,6 +1473,18 @@ ssh_gateway_port = 8080
     }
 
     #[test]
+    fn mxc_audit_example_loads_with_workload_opt_in() {
+        let path = Path::new(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../openshell-driver-mxc/examples/mxc-ocsf-audit.toml"
+        ));
+        let file = load(path).expect("shipped MXC audit config must load");
+        let driver = &file.openshell.drivers["mxc"];
+        assert_eq!(driver["allow_driver_config"].as_bool(), Some(true));
+        assert_eq!(driver["etw_audit"].as_bool(), Some(true));
+    }
+
+    #[test]
     fn rejects_missing_version_in_nonempty_file() {
         let tmp = write_raw_tmp("[openshell]\n\n[openshell.gateway]\nname = \"test\"\n");
         assert!(matches!(

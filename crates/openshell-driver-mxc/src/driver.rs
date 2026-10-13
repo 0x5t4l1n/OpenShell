@@ -767,17 +767,30 @@ async fn run_lifecycle_inner(
         .map_err(|error| format!("start MXC ProcessContainer: {error}"))?;
     attach_child_logs(&context.sandbox.name, "sandbox", &mut boundary);
     attach_child_logs(&context.sandbox.name, "supervisor", &mut supervisor);
-    if context.config.etw_audit
-        && let Some(pid) = boundary.id()
-        && let Ok(process_start_key) = crate::etw_consumer::child_process_start_key(&boundary)
-        && let Ok(mut attribution) = context.attribution.lock()
-    {
-        attribution.register_launch(
-            &context.sandbox.id,
-            &context.sandbox.name,
-            pid,
-            process_start_key,
-        );
+    if context.config.etw_audit {
+        match boundary
+            .id()
+            .ok_or_else(|| "MXC child PID is unavailable".to_string())
+            .and_then(|pid| {
+                crate::etw_consumer::child_process_start_key(&boundary).map(|key| (pid, key))
+            }) {
+            Ok((pid, process_start_key)) => {
+                let mut attribution = context
+                    .attribution
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                attribution.register_launch(
+                    &context.sandbox.id,
+                    &context.sandbox.name,
+                    pid,
+                    process_start_key,
+                );
+                tracing::debug!(target: "mxc_etw", pid, process_start_key,
+                    sandbox_id = %context.sandbox.id, "registered driver-owned MXC audit launch");
+            }
+            Err(error) => tracing::warn!(sandbox_id = %context.sandbox.id, %error,
+                "MXC ETW audit launch registration failed"),
+        }
     }
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
     let (terminated_tx, terminated_rx) = watch::channel(false);

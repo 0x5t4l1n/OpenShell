@@ -120,3 +120,8 @@ run_windows = "powershell -NoProfile -ExecutionPolicy Bypass -File tasks/scripts
 description = "Qualify real HTTPS and child socket-owner policy against native MXC (requires Internet)"
 run = "echo 'windows:* tasks require a Windows MSVC host' && exit 1"
 run_windows = "powershell -NoProfile -ExecutionPolicy Bypass -File tasks/scripts/windows-msvc.ps1 test-mxc-network native"
+
+["windows:test:mxc-audit"]
+description = "Validate MXC audit fixtures and real seven-event JSONL coverage (requires ETW privileges and native release binaries)"
+run = "echo 'windows:* tasks require a Windows MSVC host' && exit 1"
+run_windows = "powershell -NoProfile -ExecutionPolicy Bypass -File tasks/scripts/windows-msvc.ps1 test-mxc-audit native"
