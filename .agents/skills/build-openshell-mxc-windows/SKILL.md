@@ -452,7 +452,19 @@ variable by default). Require both a nonempty response and the OpenShell proxy
 CA issuer; never replace these assertions with an insecure TLS request. This
 fixture permits unavailable CRL information using best-effort Schannel revocation
 for the ephemeral private CA; this is not revocation qualification. This
-scenario is not part of the default six offline-capable E2E scenarios.
+scenario is not part of the default seven offline-capable E2E scenarios.
+
+The default `host-service` scenario runs the HTTP fixture on an active host LAN
+IPv4 address and a dynamic port, then checks two nonce-bound replies from curl
+inside MXC through the authenticated proxy. Its `/32` allowlist and explicit
+GET paths permit only the intended service; a denied path must yield HTTP 403
+(curl exit 22) and never reach the host request log. Host-side readiness and
+request proofs stay outside the workload's writable directory. The service is
+stopped even after failed runs. Use `-Scenario host-service` for focused checks.
+No Internet access or firewall modification is required; an absent usable host
+IPv4 address or failed host health check is a failure, not a successful denial.
+Loopback remains blocked by the shared proxy, so do not broaden SSRF controls
+to run this test.
 
 When reporting `windows:ci`, distinguish these categories:
 

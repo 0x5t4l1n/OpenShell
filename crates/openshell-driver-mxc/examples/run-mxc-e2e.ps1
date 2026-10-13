@@ -36,6 +36,7 @@
 #   network-policy   - supervisor-owned network policy permits admission.
 #   forwarding       - two TCP request/reply exchanges through OpenShell ingress.
 #   service-forwarding - named HTTP service routing and endpoint deletion.
+#   host-service     - workload reaches a host HTTP service; denied path never arrives.
 #   https-ca         - opt-in outbound HTTPS using the injected proxy CA.
 
 [CmdletBinding()]
@@ -384,6 +385,46 @@ function Wait-File([string]$path, [int]$seconds) {
     return (Test-Path $path)
 }
 
+function Get-HostServiceAddress {
+    foreach ($adapter in [Net.NetworkInformation.NetworkInterface]::GetAllNetworkInterfaces()) {
+        if ($adapter.OperationalStatus -ne [Net.NetworkInformation.OperationalStatus]::Up) { continue }
+        foreach ($unicast in $adapter.GetIPProperties().UnicastAddresses) {
+            $ip = $unicast.Address
+            if ($ip.AddressFamily -eq [Net.Sockets.AddressFamily]::InterNetwork -and
+                -not [Net.IPAddress]::IsLoopback($ip) -and
+                -not $ip.ToString().StartsWith('169.254.') -and $ip.ToString() -ne '0.0.0.0') {
+                return $ip.ToString()
+            }
+        }
+    }
+    throw 'host-service requires an active host IPv4 address outside loopback and link-local ranges'
+}
+
+function Test-HostServiceResult([string]$work, [string]$nonce, [string]$requestLog) {
+    if (-not (Wait-File (Join-Path $work 'host-service.done') 60)) { throw 'host-service workload did not complete' }
+    if ((Get-Content -LiteralPath (Join-Path $work 'host-service.done') -Raw).Trim() -ne $nonce) {
+        throw 'host-service completion marker does not match this workload'
+    }
+    foreach ($name in @('one', 'two')) {
+        $body = Get-Content -LiteralPath (Join-Path $work "host-service.$name.body") -Raw
+        $exitCode = (Get-Content -LiteralPath (Join-Path $work "host-service.$name.exit") -Raw).Trim()
+        if ($exitCode -ne '0' -or $body -ne "${nonce}:/allowed/$name") {
+            throw "host-service allowed request $name did not return the exact host response"
+        }
+    }
+    $deniedExit = (Get-Content -LiteralPath (Join-Path $work 'host-service.denied.exit') -Raw).Trim()
+    $deniedStatus = (Get-Content -LiteralPath (Join-Path $work 'host-service.denied.status') -Raw).Trim()
+    if ($deniedExit -ne '22' -or $deniedStatus -ne '403') {
+        throw "host-service denied request must receive policy HTTP 403 (curl exit 22), got $deniedStatus / $deniedExit"
+    }
+    $requests = @(Get-Content -LiteralPath $requestLog)
+    if ($requests.Count -ne 3 -or $requests[0] -ne '/health' -or
+        $requests[1] -ne '/allowed/one' -or $requests[2] -ne '/allowed/two') {
+        throw "host-service received unexpected requests: $($requests -join ', ')"
+    }
+    return 'two exact host responses; denied request returned HTTP 403 and never reached the service'
+}
+
 # Exercise the public gRPC forward path, never dial the workload port directly.
 # The nonce identifies this workload, not an unrelated host-loopback listener.
 function Test-Forwarding([string]$sandboxName, [string]$readyFile, [string]$nonce) {
@@ -610,6 +651,7 @@ function Probe-Backend([string] $backendName, [string] $wxc) {
 
 $results      = @()
 $gw           = $null
+$hostService  = $null
 $harnessError = $null
 $backendProbe = @{ Live = $false; Reason = "not probed" }
 # Unique per-run suffix so a stale sandbox record from an earlier run can never
@@ -750,10 +792,15 @@ try {
             Backends = "process_container"; Kind = "service-forwarding"
             ReadyFile = (Join-Path $DemoDir "service-forwarding-port.txt")
             Description = "named HTTP service routes two requests into MXC and stops routing after deletion"
+        },
+        @{
+            Name = 'host-service'; PolicyFile = Join-Path $policyDir 'host-service.yaml'
+            SandboxId = 'host'; Backends = 'process_container'; Kind = 'host-service'
+            Description = 'workload HTTP egress reaches a host service only for explicitly allowed paths'
         }
     )
 
-    # External connectivity is deliberately opt-in; the default six scenarios
+    # External connectivity is deliberately opt-in; the default seven scenarios
     # remain runnable without Internet access. Use the same authenticated
     # gateway launch path as every other workload, not a bare driver fixture.
     if ($Scenario -eq 'https-ca') {
@@ -826,6 +873,30 @@ try {
                 $DemoDir.Replace('\', '/')
             )
             $curlExe = [IO.Path]::Combine([IO.Path]::GetDirectoryName($cmdExe), 'curl.exe')
+            if ($sc.Kind -eq 'host-service') {
+                $hostIp = Get-HostServiceAddress
+                $hostNonce = [guid]::NewGuid().ToString('N')
+                # The workload has write access only to DemoDir, not these host-side proofs.
+                $hostReady = Join-Path $resultDir 'host-service.port'
+                $hostRequests = Join-Path $resultDir 'host-service.requests'
+                $fixture = Join-Path $BinaryDir 'mxc-forwarding-agent.exe'
+                if (-not (Test-Path -LiteralPath $fixture)) { $fixture = Join-Path $BinaryDir 'examples/mxc-forwarding-agent.exe' }
+                if (-not (Test-Path -LiteralPath $fixture)) { throw 'Missing host-service fixture; run windows:build:mxc-fixtures' }
+                $hostArguments = @($hostReady, $hostNonce, 'http', $hostIp, $hostRequests)
+                $hostService = Start-Process -FilePath $fixture -PassThru -WindowStyle Hidden `
+                    -ArgumentList (($hostArguments | ForEach-Object { Quote-NativeArgument $_ }) -join ' ') `
+                    -RedirectStandardOutput (Join-Path $resultDir 'host-service.stdout.log') `
+                    -RedirectStandardError (Join-Path $resultDir 'host-service.stderr.log')
+                if (-not (Wait-File $hostReady 10) -or $hostService.HasExited) { throw 'host-service fixture did not start' }
+                $hostPort = [int](Get-Content -LiteralPath $hostReady -Raw).Trim()
+                $hostUrl = "http://${hostIp}:$hostPort"
+                $health = Invoke-NativeCaptured $curlExe @('--disable', '--proxy', '', '--noproxy', '*',
+                    '--fail', '--silent', '--show-error', '--max-time', '10', "$hostUrl/health") 15
+                if ($health.ExitCode -ne 0 -or ($health.Output -join '').Trim() -ne "${hostNonce}:/health") {
+                    throw 'host-service health check failed before sandbox launch'
+                }
+                $policyText = $policyText.Replace('__HOST_SERVICE_IP__', $hostIp).Replace('__HOST_SERVICE_PORT__', "$hostPort")
+            }
             # Preserve the exact Windows executable path used in the launch;
             # network binary identities are compared as strings, not FS paths.
             $policyText = $policyText.Replace('__CURL_EXE__', $curlExe.Replace("'", "''"))
@@ -852,6 +923,20 @@ try {
                 } else {
                     $command = @($cmdExe, "/c", "echo denied 1> $denied")
                 }
+            } elseif ($sc.Kind -eq 'host-service') {
+                Remove-Item -Path (Join-Path $DemoDir 'host-service.*') -Force -ErrorAction SilentlyContinue
+                $batch = Join-Path $DemoDir 'host-service.cmd'
+                $lines = @('@echo off')
+                foreach ($name in @('one', 'two')) {
+                    $lines += '"{0}" --disable --proxy "%HTTP_PROXY%" --noproxy "" --fail --silent --show-error --max-time 15 --output "{1}" "{2}/allowed/{3}"' -f $curlExe, (Join-Path $DemoDir "host-service.$name.body"), $hostUrl, $name
+                    $lines += 'echo %errorlevel%> "{0}"' -f (Join-Path $DemoDir "host-service.$name.exit")
+                }
+                $lines += '"{0}" --disable --proxy "%HTTP_PROXY%" --noproxy "" --fail --silent --show-error --max-time 15 --output "{1}" --write-out "%%{{http_code}}" "{2}/denied" > "{3}"' -f $curlExe, (Join-Path $DemoDir 'host-service.denied.body'), $hostUrl, (Join-Path $DemoDir 'host-service.denied.status')
+                $lines += 'echo %errorlevel%> "{0}"' -f (Join-Path $DemoDir 'host-service.denied.exit')
+                $lines += 'echo {0}> "{1}"' -f $hostNonce, (Join-Path $DemoDir 'host-service.done')
+                $lines += 'exit /b 0'
+                Set-Content -LiteralPath $batch -Value ($lines -join "`r`n") -Encoding ASCII
+                $command = @($cmdExe, '/d', '/c', $batch)
             } elseif ($sc.Kind -eq 'socket-owner') {
                 Remove-Item -LiteralPath $sc.PosTarget, $sc.ControlTarget, $sc.ErrorTarget -Force -ErrorAction SilentlyContinue
                 $child = 'echo launched > "{0}" && "{1}" --disable --fail --silent --show-error --max-time 30 --ssl-revoke-best-effort --cacert "%CURL_CA_BUNDLE%" --stderr "{2}" --output "{3}" https://example.com/' -f $sc.ControlTarget, $curlExe, $sc.ErrorTarget, $sc.PosTarget
@@ -916,12 +1001,13 @@ try {
             # Run sandbox create; require artifact evidence for live workload tests.
             $createOut = $null; $createExitCode = 0
             try {
-                $createResult = Invoke-NativeCaptured $cli @(
+                $createArguments = @(
                     "sandbox", "create", "--name", $sandboxName,
                     "--policy", [string]$policyUsed,
-                    "--driver-config-json", $driverConfig,
-                    "--no-tty"
+                    "--driver-config-json", $driverConfig
                 )
+                $createArguments += if ($sc.Kind -eq 'host-service') { '--detach' } else { '--no-tty' }
+                $createResult = Invoke-NativeCaptured $cli $createArguments
                 $createOut = $createResult.Output
                 $createExitCode = $createResult.ExitCode
             } catch {
@@ -933,7 +1019,18 @@ try {
             $gwText = (Get-Content $gwLog, $gwErrLog -Raw -ErrorAction SilentlyContinue) -join "`n"
 
             # Evaluate.
-            if ($sc.Kind -eq 'socket-owner') {
+            if ($sc.Kind -eq 'host-service') {
+                try {
+                    if ($createExitCode -ne 0) { throw "host-service sandbox creation failed: $createOutStr" }
+                    if ($hostService.HasExited) { throw 'host-service fixture exited before scoring' }
+                    $reason = Test-HostServiceResult $DemoDir $hostNonce $hostRequests
+                    Ok "host-service: $reason"
+                    $results += [pscustomobject]@{ Scenario = $sc.Name; Result = 'PASS'; Reason = $reason }
+                } catch {
+                    Bad "host-service: $($_.Exception.Message)"
+                    $results += [pscustomobject]@{ Scenario = $sc.Name; Result = 'FAIL'; Reason = $_.Exception.Message }
+                }
+            } elseif ($sc.Kind -eq 'socket-owner') {
                 try {
                     if (-not (Wait-File $sc.ControlTarget 30)) { throw "parent cmd did not launch: $createOutStr" }
                     $deadline = (Get-Date).AddSeconds(45)
@@ -1079,6 +1176,10 @@ catch {
     Bad "harness error: $harnessError"
 }
 finally {
+    if ($hostService -and -not $hostService.HasExited) {
+        Stop-Process -Id $hostService.Id -Force -ErrorAction SilentlyContinue
+        $hostService.WaitForExit()
+    }
     # --- Summary + results bundle ---------------------------------------------
     Step "Summary"
     $results | Format-Table -AutoSize
@@ -1121,6 +1222,8 @@ through OpenShell. Service forwarding verifies two HTTP replies and HTTP 404
 after endpoint deletion. Missing coverage exits non-zero; network-policy proves
 admission and execution, not network enforcement. Forwarding proves managed
 ingress works, not that direct host ingress is blocked.
+Host-service verifies two exact workload-to-host HTTP replies and HTTP 403 for
+a denied path, with a host-side request log proving that denied request never arrived.
 "@
     Set-Content -Path (Join-Path $resultDir "summary.txt") -Value $summary -Encoding UTF8
     Write-Host $summary -ForegroundColor ($(if ($verdict -eq "PASS") { "Green" } else { "Red" }))

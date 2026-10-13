@@ -270,7 +270,7 @@ explicitly loads the boundary-injected CA bundle and records the peer certificat
 success requires a nonempty response and the OpenShell proxy CA issuer. It does
 not install a host trust root or disable CA/hostname verification. The fixture
 uses best-effort Schannel revocation because the ephemeral private CA has no CRL
-distribution point; it does not qualify revocation enforcement. The default six E2E
+distribution point; it does not qualify revocation enforcement. The default seven E2E
 scenarios remain independent of Internet access.
 
 The `forwarding` scenario starts a TCP listener inside MXC, then verifies two
@@ -287,12 +287,22 @@ unique GET responses through gateway host-based routing. It deletes the endpoint
 and requires HTTP 404 afterward. Requests connect only to the gateway with the
 exposed URL's Host header, so no wildcard DNS setup is required.
 
+The default `host-service` scenario runs an HTTP fixture on the Windows host's
+active LAN IPv4 address and a dynamic port. A real MXC workload uses curl through
+the authenticated supervisor proxy, with that exact address allowed by a `/32`
+policy. Two GETs must return the fixture's nonce; a disallowed path must return
+HTTP 403 with curl exit 22 and never appear in the host-side request log. The
+host service is checked before launch and stopped after testing. Missing host
+IPv4 connectivity fails the scenario. This uses the host's LAN address because
+the shared proxy always rejects loopback destinations. Select it with
+`-Scenario host-service`; no Internet access or firewall changes are required.
+
 The `ws-agent.yaml` and `openclaw-gateway.yaml` policies preserve the Windows
 branch's workload grants. `inference.yaml` is a template: replace its filesystem,
 curl executable, inference host, and port placeholders before use. Authorize
 curl, which owns the network socket, not its cmd launcher. These policies have
 parser/mapper regression coverage; they do not add live WebSocket, OpenClaw,
-or provider-backed inference scenarios to the six-scenario E2E runner.
+or provider-backed inference scenarios to the seven-scenario E2E runner.
 
 With `-KeepRunning`, the runner restores the caller's environment but retains
 the disposable CLI/runtime directory for the live gateway and prints its path.

@@ -1,0 +1,23 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+version: 1
+filesystem_policy:
+  include_workdir: false
+  read_only: []
+  read_write:
+    - "C:/work/openshell-mxc-e2e"
+network_policies:
+  host_service:
+    name: host-service
+    endpoints:
+      - host: '__HOST_SERVICE_IP__'
+        port: __HOST_SERVICE_PORT__
+        allowed_ips: ['__HOST_SERVICE_IP__/32']
+        protocol: rest
+        enforcement: enforce
+        rules:
+          - allow:
+              method: GET
+              path: /allowed/*
+    binaries:
+      - path: '__CURL_EXE__'

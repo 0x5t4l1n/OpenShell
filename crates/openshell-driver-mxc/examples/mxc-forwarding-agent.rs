@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Test-only TCP fixture for real MXC ingress E2E; not a shipped runtime binary.
+//! Test-only TCP/HTTP fixture for real MXC E2E; not a shipped runtime binary.
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpListener;
@@ -9,14 +9,25 @@ use std::time::Duration;
 
 fn main() -> std::io::Result<()> {
     let arguments: Vec<String> = std::env::args().collect();
-    if !(arguments.len() == 3 || (arguments.len() == 4 && arguments[3] == "http")) {
+    if !(arguments.len() == 3 || (matches!(arguments.len(), 4 | 6) && arguments[3] == "http")) {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
-            "usage: mxc-forwarding-agent READY_FILE NONCE [http]",
+            "usage: mxc-forwarding-agent READY_FILE NONCE [http [BIND_IPV4 REQUEST_LOG]]",
         ));
     }
-    let http_mode = arguments.len() == 4;
-    let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))?;
+    let http_mode = arguments.len() >= 4;
+    let bind_ip = if arguments.len() == 6 {
+        arguments[4]
+            .parse::<std::net::Ipv4Addr>()
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?
+    } else {
+        std::net::Ipv4Addr::LOCALHOST
+    };
+    let request_log = arguments.get(5);
+    if let Some(path) = request_log {
+        std::fs::write(path, "")?;
+    }
+    let listener = TcpListener::bind((bind_ip, 0))?;
     let ready_file = std::path::Path::new(&arguments[1]);
     let staged_ready = ready_file.with_extension("tmp");
     std::fs::write(&staged_ready, listener.local_addr()?.port().to_string())?;
@@ -59,6 +70,10 @@ fn main() -> std::io::Result<()> {
             let target = fields.next().ok_or_else(|| {
                 std::io::Error::new(std::io::ErrorKind::InvalidData, "missing HTTP target")
             })?;
+            if let Some(path) = request_log {
+                let mut log = std::fs::OpenOptions::new().append(true).open(path)?;
+                writeln!(log, "{target}")?;
+            }
             let body = format!("{}:{target}", arguments[2]);
             write!(
                 socket,

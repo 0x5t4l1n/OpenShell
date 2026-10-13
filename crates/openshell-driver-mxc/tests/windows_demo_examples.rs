@@ -67,6 +67,69 @@ fn https_fixture_authorizes_direct_curl_with_read_only_https() {
 }
 
 #[test]
+fn host_service_scoring_rejects_transport_failures_and_unenforced_requests() {
+    let root = tempfile::tempdir().unwrap();
+    let script = r#"
+$ErrorActionPreference = 'Stop'
+Set-StrictMode -Version Latest
+$tokens = $null; $errors = $null
+$ast = [System.Management.Automation.Language.Parser]::ParseFile(
+    $env:OPENSHELL_MXC_RUNNER, [ref]$tokens, [ref]$errors)
+if ($errors.Count) { throw "runner parse errors: $($errors.Message -join '; ')" }
+foreach ($name in @('Wait-File', 'Test-HostServiceResult')) {
+    $helper = $ast.Find({ param($node)
+        $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq $name
+    }, $true)
+    if (!$helper) { throw "missing $name" }
+    Invoke-Expression $helper.Extent.Text
+}
+$work = Join-Path $env:OPENSHELL_MXC_SCORE_ROOT 'work with spaces'
+New-Item -ItemType Directory $work | Out-Null
+$requestLog = Join-Path $env:OPENSHELL_MXC_SCORE_ROOT 'host.requests'
+$nonce = 'unique-host-service-response'
+function Reset-Proofs {
+    foreach ($name in @('one', 'two')) {
+        [IO.File]::WriteAllText((Join-Path $work "host-service.$name.body"), "${nonce}:/allowed/$name")
+        [IO.File]::WriteAllText((Join-Path $work "host-service.$name.exit"), '0')
+    }
+    [IO.File]::WriteAllText((Join-Path $work 'host-service.denied.exit'), '22')
+    [IO.File]::WriteAllText((Join-Path $work 'host-service.denied.status'), '403')
+    [IO.File]::WriteAllText((Join-Path $work 'host-service.done'), $nonce)
+    [IO.File]::WriteAllText($requestLog, "/health`n/allowed/one`n/allowed/two`n")
+}
+Reset-Proofs
+if ((Test-HostServiceResult $work $nonce $requestLog) -notmatch 'never reached') { throw 'valid host-service run must pass' }
+foreach ($case in @('transport', 'denial-reached-host', 'wrong-response', 'wrong-workload')) {
+    Reset-Proofs
+    switch ($case) {
+        'transport' {
+            [IO.File]::WriteAllText((Join-Path $work 'host-service.denied.exit'), '7')
+            [IO.File]::WriteAllText((Join-Path $work 'host-service.denied.status'), '000')
+        }
+        'denial-reached-host' { [IO.File]::AppendAllText($requestLog, "/denied`n") }
+        'wrong-response' { [IO.File]::WriteAllText((Join-Path $work 'host-service.one.body'), 'unrelated service') }
+        'wrong-workload' { [IO.File]::WriteAllText((Join-Path $work 'host-service.done'), 'stale-run') }
+    }
+    $rejected = $false
+    try { Test-HostServiceResult $work $nonce $requestLog | Out-Null } catch { $rejected = $true }
+    if (!$rejected) { throw "invalid run $case must fail" }
+}
+"#;
+    let output = Command::new("powershell.exe")
+        .args(["-NoProfile", "-Command", script])
+        .env("OPENSHELL_MXC_RUNNER", examples().join("run-mxc-e2e.ps1"))
+        .env("OPENSHELL_MXC_SCORE_ROOT", root.path())
+        .output()
+        .expect("launch PowerShell host-service regression");
+    assert!(
+        output.status.success(),
+        "{} {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
 fn openclaw_fixture_preserves_explicit_ui_and_node_network_grants() {
     let yaml =
         std::fs::read_to_string(examples().join("e2e-policies/openclaw-gateway.yaml")).unwrap();
