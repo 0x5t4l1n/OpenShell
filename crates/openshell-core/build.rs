@@ -4,8 +4,8 @@
 use std::env;
 use std::path::{Path, PathBuf};
 
-#[path = "build_support/git.rs"]
-mod git;
+mod build_git;
+mod build_version;
 
 const PROTO_REL: &str = "../../proto";
 
@@ -16,8 +16,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // the binary falls back to CARGO_PKG_VERSION (which is already sed-patched
     // by the build pipeline).
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR")?);
-    git::emit_rerun_if_changed(&manifest_dir);
-    if let Some(version) = git::version(&manifest_dir) {
+    build_git::emit_rerun_if_changed(&manifest_dir);
+    if let Some(version) = build_git::version(&manifest_dir) {
         println!("cargo:rustc-env=OPENSHELL_GIT_VERSION={version}");
     }
 

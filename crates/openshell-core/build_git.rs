@@ -5,16 +5,23 @@ use std::collections::BTreeSet;
 use std::path::Path;
 use std::process::Command;
 
-#[path = "../build_version.rs"]
-mod build_version;
+use crate::build_version;
 
 /// Track Git's resolved metadata, including creation of previously packed refs.
 pub fn emit_rerun_if_changed(manifest_dir: &Path) {
-    // refs/ must be watched as a directory: a packed branch has no loose file
+    // Ref directories must be watched whole: a packed branch has no loose file
     // until its next update. Watching only existing individual refs misses it.
-    // reftable/ serves the same purpose for repositories using that ref backend.
+    // Only heads and tags feed the version; remotes and stash would rebuild
+    // on every fetch or stash. reftable/ covers that ref backend.
     let mut paths = BTreeSet::new();
-    for name in ["HEAD", "refs", "packed-refs", "reftable", "shallow"] {
+    for name in [
+        "HEAD",
+        "refs/heads",
+        "refs/tags",
+        "packed-refs",
+        "reftable",
+        "shallow",
+    ] {
         let Some(path) = git_output(manifest_dir, &["rev-parse", "--git-path", name]) else {
             continue;
         };

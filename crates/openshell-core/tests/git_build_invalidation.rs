@@ -141,7 +141,6 @@ impl Fixture {
 
     fn install_crate(&self) {
         fs::create_dir_all(self.checkout.join("src")).unwrap();
-        fs::create_dir_all(self.checkout.join("build_support")).unwrap();
         fs::write(self.checkout.join("Cargo.toml"), "[package]\nname = \"git-version-probe\"\nversion = \"9.8.7\"\nedition = \"2021\"\n[workspace]\n").unwrap();
         fs::write(
             self.checkout.join("src/main.rs"),
@@ -149,8 +148,8 @@ impl Fixture {
         )
         .unwrap();
         fs::write(
-            self.checkout.join("build_support/git.rs"),
-            include_bytes!("../build_support/git.rs"),
+            self.checkout.join("build_git.rs"),
+            include_bytes!("../build_git.rs"),
         )
         .unwrap();
         fs::write(
@@ -159,16 +158,16 @@ impl Fixture {
         )
         .unwrap();
         fs::write(self.checkout.join("build.rs"), r#"
-#[path = "build_support/git.rs"]
-mod git;
+mod build_git;
+mod build_version;
 use std::io::Write;
 fn main() {
     let manifest = std::env::var("CARGO_MANIFEST_DIR").unwrap();
     let manifest = std::path::Path::new(&manifest);
     // Stand in for the core build script's explicit protobuf input tracking.
     println!("cargo:rerun-if-changed=build.rs");
-    git::emit_rerun_if_changed(manifest);
-    let version = git::version(manifest).unwrap_or_else(|| "9.8.7".into());
+    build_git::emit_rerun_if_changed(manifest);
+    let version = build_git::version(manifest).unwrap_or_else(|| "9.8.7".into());
     println!("cargo:rustc-env=PROBE_VERSION={version}");
     let mut runs = std::fs::OpenOptions::new().create(true).append(true).open(manifest.join("probe-runs")).unwrap();
     writeln!(runs, "run").unwrap();
@@ -235,6 +234,12 @@ fn normal_repository_reuses_build_and_refreshes_revision() {
     let sha = git(&fixture.checkout, &["rev-parse", "--short=9", "HEAD"]);
     assert_eq!(next.version, format!("0.1.1-dev.1+g{sha}"));
     assert_eq!(next.runs, first.runs + 1);
+    fixture.assert_fresh(&next);
+    // Remote-tracking refs do not feed the version; a fetch must not rebuild.
+    git(
+        &fixture.repo,
+        &["update-ref", "refs/remotes/origin/main", "HEAD"],
+    );
     fixture.assert_fresh(&next);
 }
 
