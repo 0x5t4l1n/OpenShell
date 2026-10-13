@@ -302,6 +302,18 @@ pub struct ServiceRoutingConfig {
     pub supervisor_app_address_template: Option<String>,
     /// Service SNI domain for direct supervisor ingress.
     pub supervisor_app_service_domain: Option<String>,
+    /// Explicitly choose returned service URLs; defaults to the gateway path.
+    pub service_ingress_mode: ServiceIngressMode,
+    /// Public HTTPS origin for supervisor ingress, independent of API and backend addresses.
+    pub service_ingress_url: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ServiceIngressMode {
+    #[default]
+    Gateway,
+    Supervisor,
 }
 
 /// TLS configuration.
@@ -1080,6 +1092,8 @@ impl Default for ServiceRoutingConfig {
             enable_loopback_service_http: default_enable_loopback_service_http(),
             supervisor_app_address_template: None,
             supervisor_app_service_domain: None,
+            service_ingress_mode: ServiceIngressMode::Gateway,
+            service_ingress_url: None,
         }
     }
 }

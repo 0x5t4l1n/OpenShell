@@ -150,6 +150,21 @@ deploy:
           sandboxRuntime.image.tag: '{{.IMAGE_TAG_openshell_sandbox}}'
           gatewayConfig.openshell\.drivers\.kubernetes.supervisor_image: '{{.IMAGE_REPO_openshell_supervisor}}:{{.IMAGE_TAG_openshell_supervisor}}'
 profiles:
+  # Combine with sandbox-proxy. Apply the Gateway/TLSRoute fixture after CRDs install.
+  - name: sandbox-proxy-ingress
+    patches:
+      - op: add
+        path: /deploy/helm/releases/-
+        value:
+          name: envoy-gateway
+          remoteChart: oci://docker.io/envoyproxy/gateway-helm
+          version: v1.7.0
+          namespace: envoy-gateway-system
+          createNamespace: true
+          wait: true
+      - op: add
+        path: /deploy/helm/releases/0/valuesFiles/-
+        value: ci/values-sandbox-proxy-ingress.yaml
   - name: sandbox-proxy
     patches:
       - op: add

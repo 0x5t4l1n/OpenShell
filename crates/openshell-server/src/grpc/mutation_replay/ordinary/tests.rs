@@ -470,10 +470,13 @@ async fn service_deletion_replays_without_parent_and_does_not_delete_replacement
         request_id: id(),
         ..Default::default()
     };
-    let endpoint = run(&state, authed_request(expose.clone()))
+    let mut endpoint = run(&state, authed_request(expose.clone()))
         .await
         .unwrap()
         .into_inner();
+    // Receipts restore declaration and URL identity; the public RPC refreshes
+    // installation status separately rather than persisting a stale status.
+    endpoint.status = openshell_core::proto::ServiceExposureStatus::Unspecified as i32;
     assert_eq!(replay(&state, expose.clone()).await, endpoint);
     let delete = DeleteServiceRequest {
         sandbox: "service-parent".into(),

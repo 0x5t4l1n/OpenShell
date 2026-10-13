@@ -98,6 +98,15 @@ async fn create_sandbox_replay_preserves_service_urls() {
     let key = directory.path().join("private-key");
     std::fs::write(&key, b"test-only stable private fingerprint material").unwrap();
     let mut state = test_server_state().await;
+    {
+        let routing = &mut Arc::get_mut(&mut state).unwrap().config.service_routing;
+        routing.service_ingress_mode = openshell_core::config::ServiceIngressMode::Supervisor;
+        routing.service_ingress_url =
+            Some("https://api.openshell-sandbox-proxy-ingress.my-domain:28443".into());
+        routing.supervisor_app_service_domain =
+            Some("api.openshell-sandbox-proxy-ingress.my-domain".into());
+        routing.supervisor_app_address_template = Some("supervisor.example:8443".into());
+    }
     Arc::get_mut(&mut state).unwrap().config.gateway_jwt =
         Some(openshell_core::config::GatewayJwtConfig {
             signing_key_path: key,
@@ -125,6 +134,14 @@ async fn create_sandbox_replay_preserves_service_urls() {
         .await
         .unwrap()
         .into_inner();
+    assert_eq!(
+        original.service_urls["web"],
+        "https://default--replay-services--web.api.openshell-sandbox-proxy-ingress.my-domain:28443/"
+    );
+    assert_eq!(
+        original.service_routing_mode,
+        openshell_core::proto::ServiceRoutingMode::Supervisor as i32
+    );
     let replay = service
         .create_sandbox(authed_request(request.clone()))
         .await

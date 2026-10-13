@@ -133,6 +133,42 @@ KUBECONFIG=../../../kubeconfig mise exec -- skaffold run -p sandbox-proxy
 
 This builds the proxy image, enables headless supervisor endpoints and discovery, and deploys `openshell-sandbox-proxy`. It permits that proxy to reach the supervisor app port in the shared namespace. Discovery uses development authentication only in this profile. Production deployment requires an HTTPS gateway, workspace-scoped bearer credentials in `sandboxProxy.discoveryTokenSecret` (key `token`), and any private gateway CA in `sandboxProxy.gatewayCaSecret` (key `ca.crt`). Operator-managed workspace namespaces need corresponding app ingress policies and address templates.
 
+The expected external path is `client → Kubernetes Gateway API ingress → sandbox proxy → supervisor → sandbox service`. For the public base domain `api.openshell-sandbox-proxy-ingress.my-domain`, a service URL is `https://default--sandbox-a--web.api.openshell-sandbox-proxy-ingress.my-domain/`. Wildcard DNS points at ingress; TLS passthrough preserves the service SNI to the supervisor. The API address and internal headless endpoints are configured separately. The [gateway configuration reference](../../../docs/how-it-works/gateways/configuration.mdx#application-ingress-architecture) describes this deployment example. The port-forward below tests the proxy directly; use the Gateway API fixture below to exercise ingress and public CLI/SDK URLs.
+
+## Validate public URLs through Gateway API ingress
+
+Create an operator-owned `openshell-public-app-tls` Secret in `openshell`, with a certificate for `*.api.openshell-sandbox-proxy-ingress.my-domain`. Use the certificate procedure above with that hostname and Secret name. Keep its private key outside the checkout and supply only the public certificate to clients.
+
+Deploy the combined profiles from `deploy/helm/openshell`:
+
+```shell
+KUBECONFIG=../../../kubeconfig mise exec -- skaffold run \
+  -p sandbox-proxy,sandbox-proxy-ingress
+```
+
+This installs the pinned Envoy Gateway controller and configures the gateway to return supervisor-mode URLs at `https://api.openshell-sandbox-proxy-ingress.my-domain:28443`. Application TLS remains on supervisors; the controller and sandbox proxy receive no app private keys. Recreate existing supervisors to apply the new domain and TLS Secret, or create fresh fixtures.
+
+Apply the ingress objects from the repository root after the controller installs its CRDs:
+
+```shell
+KUBECONFIG=kubeconfig kubectl apply \
+  -f e2e/kubernetes/app-listener/gateway-api.yaml
+KUBECONFIG=kubeconfig kubectl -n openshell get gateway openshell-app-ingress
+KUBECONFIG=kubeconfig kubectl -n openshell get tlsroute openshell-app-ingress
+KUBECONFIG=kubeconfig kubectl get svc -A \
+  -l gateway.envoyproxy.io/owning-gateway-name=openshell-app-ingress
+```
+
+Require the Gateway to be programmed and the TLSRoute to be accepted with resolved references. Forward the discovered **Envoy** Service's port 443 to local port 28443. Keep the OpenShell API on a different port, such as 8090, and expose the four fixture services. Each printed URL must use the public domain and port 28443. Also check create-time unnamed exposure and SDK creation URLs.
+
+```shell
+uv run python e2e/kubernetes/app-listener/proxy-smoke.py \
+  --ca /path/to/public-app-certificate.crt \
+  --domain api.openshell-sandbox-proxy-ingress.my-domain --proxy-port 28443
+```
+
+These requests traverse Envoy, the sandbox proxy, headless supervisor DNS, and the sandbox boundary. The smoke client substitutes local resolution for production wildcard DNS while preserving SNI and verifying the supervisor certificate. Check service list/get status before installation, after advertisement, after a target revision changes, and after stop/start. Configured URLs may exist before advertisements and are not health results. Verify gateway-mode URL behavior with supervisor ingress disabled.
+
 Create three detached Python sandboxes from the repository root:
 
 ```shell

@@ -17,7 +17,9 @@ func ServiceEndpointFromProto(resp *pb.ServiceEndpointResponse) *types.ServiceEn
 	}
 
 	result := &types.ServiceEndpoint{
-		URL: resp.GetUrl(),
+		URL:         resp.GetUrl(),
+		RoutingMode: types.ServiceRoutingMode(resp.GetRoutingMode()),
+		Status:      types.ServiceExposureStatus(resp.GetStatus()),
 	}
 
 	if ep := resp.GetEndpoint(); ep != nil {
@@ -56,7 +58,9 @@ func ServiceEndpointToProto(se *types.ServiceEndpoint) *pb.ServiceEndpointRespon
 			Domain:            se.Domain,
 			AuthorizationMode: serviceAuthorizationModeToProto(se.AuthorizationMode),
 		},
-		Url: se.URL,
+		Url:         se.URL,
+		RoutingMode: pb.ServiceRoutingMode(se.RoutingMode),
+		Status:      pb.ServiceExposureStatus(se.Status),
 	}
 }
 

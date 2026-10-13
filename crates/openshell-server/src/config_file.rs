@@ -139,6 +139,9 @@ pub struct GatewayFileSection {
     pub supervisor_app_address_template: Option<String>,
     #[serde(default)]
     pub supervisor_app_service_domain: Option<String>,
+    #[serde(default)]
+    pub service_ingress_mode: openshell_core::config::ServiceIngressMode,
+    pub service_ingress_url: Option<String>,
     /// Enable the WebSocket tunnel for an authenticated edge proxy.
     #[serde(default)]
     pub enable_websocket_tunnel: Option<bool>,

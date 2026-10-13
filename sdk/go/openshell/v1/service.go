@@ -15,6 +15,29 @@ type ServiceEndpoint = types.ServiceEndpoint
 // ServiceExposure describes a loopback HTTP service to expose during sandbox creation.
 type ServiceExposure = types.ServiceExposure
 
+// ServiceRoutingMode identifies the configured application data path.
+type ServiceRoutingMode = types.ServiceRoutingMode
+
+// ServiceExposureStatus describes supervisor installation evidence, not application health.
+type ServiceExposureStatus = types.ServiceExposureStatus
+
+const (
+	// ServiceRoutingModeUnspecified is returned by older gateways.
+	ServiceRoutingModeUnspecified = types.ServiceRoutingModeUnspecified
+	// ServiceRoutingModeGateway uses the gateway listener and relay.
+	ServiceRoutingModeGateway = types.ServiceRoutingModeGateway
+	// ServiceRoutingModeSupervisor uses the configured public ingress origin.
+	ServiceRoutingModeSupervisor = types.ServiceRoutingModeSupervisor
+	// ServiceExposureStatusUnspecified is returned by older gateways.
+	ServiceExposureStatusUnspecified = types.ServiceExposureStatusUnspecified
+	// ServiceExposureStatusConfigured indicates a declaration, possibly pending installation.
+	ServiceExposureStatusConfigured = types.ServiceExposureStatusConfigured
+	// ServiceExposureStatusAdvertised indicates a current leased supervisor installation.
+	ServiceExposureStatusAdvertised = types.ServiceExposureStatusAdvertised
+	// ServiceExposureStatusUnavailable indicates missing runtime, admission, or installation evidence.
+	ServiceExposureStatusUnavailable = types.ServiceExposureStatusUnavailable
+)
+
 // ServiceAuthorizationMode controls handling of an incoming application Authorization header.
 type ServiceAuthorizationMode = types.ServiceAuthorizationMode
 

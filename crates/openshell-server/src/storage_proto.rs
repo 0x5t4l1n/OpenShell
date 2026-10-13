@@ -151,7 +151,7 @@ mod tests {
     // Sandbox service route snapshots and advertisements add public-only messages. They reuse
     // existing durable ServiceEndpoint declarations without a storage change.
     const PUBLIC_RPC_SCHEMA_SHA256: &str =
-        "73de5f9ad75f6280357f1bad52524bb4a9b46d15a5a8266e4059c75ab6b8d4c5";
+        "2b5829ff925d786ae316d00a503dc214792c015c395d0de73b381e9cf9c4fe9c";
     const DURABLE_SCHEMA_SHA256: &str =
         "5281143e2825539af6148785c91f9df67f654eb74d215f57940af9314867a55f";
     const PUBLIC_DURABLE_OVERLAP_SHA256: &str =
@@ -623,7 +623,7 @@ mod tests {
                 overlap_hash.as_str(),
             ),
             (
-                (319, 27),
+                (319, 29),
                 (93, 21),
                 (81, 21),
                 PUBLIC_RPC_SCHEMA_SHA256,

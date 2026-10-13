@@ -44,6 +44,7 @@ pub(super) struct Advertisement {
 }
 
 pub fn validate_config(config: &ServiceRoutingConfig) -> Result<(), String> {
+    crate::service_routing::validate_ingress_config(config)?;
     match (
         &config.supervisor_app_address_template,
         &config.supervisor_app_service_domain,

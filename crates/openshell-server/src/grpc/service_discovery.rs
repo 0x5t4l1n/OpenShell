@@ -560,7 +560,7 @@ mod tests {
         state.supervisor_sessions.disconnect("sandbox-a-id");
         assert_eq!(snapshot(&state, "default").await.unwrap().routes.len(), 1);
     }
-    #[tokio::test(start_paused = true)]
+    #[tokio::test]
     async fn discovery_watch_has_bounded_lifetime() {
         let (state, _, _) = fixture().await;
         let mut stream = watch_routes(
@@ -573,6 +573,9 @@ mod tests {
         .unwrap()
         .into_inner();
         stream.next().await.unwrap().unwrap();
+        // Initialize SQLite and deliver the initial snapshot with real time;
+        // auto-advancing a paused clock can exhaust the database pool deadline.
+        tokio::time::pause();
         tokio::task::yield_now().await;
         tokio::time::advance(WATCH_LIFETIME + Duration::from_millis(1)).await;
         assert!(stream.next().await.is_none());

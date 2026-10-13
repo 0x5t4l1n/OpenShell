@@ -179,10 +179,9 @@ pub(super) async fn expose_service_endpoint(
         .unwrap_or_default();
     service_routing::emit_service_endpoint_config_event(&endpoint, &url, created);
 
-    Ok(Response::new(ServiceEndpointResponse {
-        endpoint: Some(endpoint),
-        url,
-    }))
+    Ok(Response::new(
+        service_endpoint_response(state, endpoint).await,
+    ))
 }
 
 pub(super) async fn handle_get_service(
@@ -207,7 +206,9 @@ pub(super) async fn handle_get_service(
         .await?
         .ok_or_else(|| Status::not_found("service endpoint not found"))?;
 
-    Ok(Response::new(service_endpoint_response(state, endpoint)))
+    Ok(Response::new(
+        service_endpoint_response(state, endpoint).await,
+    ))
 }
 
 pub(super) async fn handle_list_services(
@@ -280,11 +281,17 @@ pub(super) async fn handle_list_services(
         .list_message_page::<ServiceEndpoint>(query, after.as_ref(), pagination.page_size())
         .await
         .map_err(|e| Status::internal(format!("list endpoints failed: {e}")))?;
-    let services = page
-        .messages
-        .into_iter()
-        .map(|ep| service_endpoint_response(state, ep))
-        .collect();
+    let mut services = Vec::new();
+    let mut snapshots = HashMap::new();
+    for endpoint in page.messages {
+        let workspace = endpoint.object_workspace().to_string();
+        if !snapshots.contains_key(&workspace) {
+            snapshots.insert(workspace.clone(), service_snapshot(state, &workspace).await);
+        }
+        services.push(
+            service_endpoint_response_observed(state, endpoint, &snapshots[&workspace]).await,
+        );
+    }
     let next_page_token = pagination.next_object_token(page.next_cursor.as_ref());
     Ok(Response::new(ListServicesResponse {
         services,
@@ -363,9 +370,43 @@ async fn get_service_endpoint(
         .map_err(|e| Status::internal(format!("fetch endpoint failed: {e}")))
 }
 
-fn service_endpoint_response(
+async fn service_endpoint_response(
+    state: &Arc<ServerState>,
+    endpoint: ServiceEndpoint,
+) -> ServiceEndpointResponse {
+    let snapshot = service_snapshot(state, endpoint.object_workspace()).await;
+    service_endpoint_response_observed(state, endpoint, &snapshot).await
+}
+
+async fn service_snapshot(
+    state: &Arc<ServerState>,
+    workspace: &str,
+) -> Result<openshell_core::proto::ServiceRouteSnapshot, Status> {
+    if state.config.service_routing.service_ingress_mode
+        == openshell_core::config::ServiceIngressMode::Supervisor
+    {
+        super::service_discovery::snapshot(state, workspace).await
+    } else {
+        Ok(openshell_core::proto::ServiceRouteSnapshot::default())
+    }
+}
+
+pub(super) async fn refresh_service_status(
+    state: &Arc<ServerState>,
+    response: &mut ServiceEndpointResponse,
+) {
+    if let Some(endpoint) = &response.endpoint {
+        let snapshot = service_snapshot(state, endpoint.object_workspace()).await;
+        let mode = openshell_core::proto::ServiceRoutingMode::try_from(response.routing_mode)
+            .unwrap_or(openshell_core::proto::ServiceRoutingMode::Gateway);
+        response.status = service_exposure_status(state, endpoint, mode, &snapshot).await as i32;
+    }
+}
+
+async fn service_endpoint_response_observed(
     state: &Arc<ServerState>,
     mut endpoint: ServiceEndpoint,
+    snapshot: &Result<openshell_core::proto::ServiceRouteSnapshot, Status>,
 ) -> ServiceEndpointResponse {
     endpoint.authorization_mode =
         match ServiceAuthorizationMode::try_from(endpoint.authorization_mode) {
@@ -379,9 +420,77 @@ fn service_endpoint_response(
     let url =
         service_routing::endpoint_url(&state.config, workspace, &endpoint.sandbox, &endpoint.name)
             .unwrap_or_default();
+    let mode = service_routing::routing_mode(&state.config.service_routing);
+    let status = service_exposure_status(state, &endpoint, mode, snapshot).await;
     ServiceEndpointResponse {
         endpoint: Some(endpoint),
         url,
+        routing_mode: mode as i32,
+        status: status as i32,
+    }
+}
+
+async fn service_exposure_status(
+    state: &Arc<ServerState>,
+    endpoint: &ServiceEndpoint,
+    mode: openshell_core::proto::ServiceRoutingMode,
+    snapshot: &Result<openshell_core::proto::ServiceRouteSnapshot, Status>,
+) -> openshell_core::proto::ServiceExposureStatus {
+    use openshell_core::proto::{
+        SandboxPhase, ServiceExposureStatus as Exposure, ServiceRoutingMode as Mode,
+    };
+    let Ok(Some(sandbox)) = state
+        .store
+        .get_message::<Sandbox>(&endpoint.sandbox_id)
+        .await
+    else {
+        return Exposure::Unavailable;
+    };
+    if SandboxPhase::try_from(sandbox.phase()).ok() != Some(SandboxPhase::Ready) {
+        return Exposure::Unavailable;
+    }
+    if mode != Mode::Supervisor {
+        return Exposure::Configured;
+    }
+    let Ok(snapshot) = snapshot else {
+        return Exposure::Unavailable;
+    };
+    if snapshot.routes.iter().any(|route| {
+        route.service_id == endpoint.object_id()
+            && route.service_revision == endpoint.get_resource_version()
+    }) {
+        return Exposure::Advertised;
+    }
+    let Ok(config) = super::policy::load_sandbox_config(state, &sandbox).await else {
+        return Exposure::Unavailable;
+    };
+    if !config.configuration_admitted {
+        return Exposure::Unavailable;
+    }
+    let id = format!("service-advertisement:{}", endpoint.sandbox_id);
+    match state
+        .store
+        .get(super::service_advertisement::OBJECT_TYPE, &id)
+        .await
+    {
+        Ok(Some(record)) => match serde_json::from_slice::<
+            super::service_advertisement::Advertisement,
+        >(&record.payload)
+        {
+            Ok(advertisement)
+                if advertisement.routes.is_empty()
+                    || advertisement.routes.iter().any(|route| {
+                        route.endpoint_id == endpoint.object_id()
+                            && route.resource_version == endpoint.get_resource_version()
+                    }) =>
+            {
+                Exposure::Unavailable
+            }
+            Ok(_) => Exposure::Configured,
+            Err(_) => Exposure::Unavailable,
+        },
+        Ok(None) => Exposure::Configured,
+        Err(_) => Exposure::Unavailable,
     }
 }
 
@@ -1340,5 +1449,48 @@ mod tests {
             after.service_routes[0].resource_version
         );
         assert_eq!(before.config_revision, after.config_revision);
+    }
+}
+
+#[cfg(test)]
+mod ingress_status_tests {
+    use super::super::service_advertisement::{accept, tests::fixture};
+    use super::*;
+    use openshell_core::config::ServiceIngressMode;
+    use openshell_core::proto::ServiceExposureStatus;
+    #[tokio::test]
+    async fn service_status_tracks_current_installation_and_ownership() {
+        let (mut state, owner, report) = fixture().await;
+        let routing = &mut Arc::get_mut(&mut state).unwrap().config.service_routing;
+        routing.service_ingress_mode = ServiceIngressMode::Supervisor;
+        routing.service_ingress_url = Some("https://svc.openshell.internal:28443".into());
+        let endpoint = get_service_endpoint(&state, "default", "sandbox-a", "web")
+            .await
+            .unwrap()
+            .unwrap();
+        let configured = service_endpoint_response(&state, endpoint.clone()).await;
+        assert_eq!(configured.status, ServiceExposureStatus::Configured as i32);
+        assert_eq!(
+            configured.url,
+            "https://default--sandbox-a--web.svc.openshell.internal:28443/"
+        );
+        accept(&state, &owner, report).await.unwrap();
+        assert_eq!(
+            service_endpoint_response(&state, endpoint.clone())
+                .await
+                .status,
+            ServiceExposureStatus::Advertised as i32
+        );
+        crate::supervisor_owner::SupervisorOwnerIndex::new(
+            state.store.clone(),
+            crate::supervisor_owner::OWNER_TTL,
+        )
+        .release_if_current(&owner)
+        .await
+        .unwrap();
+        assert_eq!(
+            service_endpoint_response(&state, endpoint).await.status,
+            ServiceExposureStatus::Unavailable as i32
+        );
     }
 }

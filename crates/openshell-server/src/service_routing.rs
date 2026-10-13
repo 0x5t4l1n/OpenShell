@@ -161,6 +161,20 @@ pub fn endpoint_url(
     sandbox: &str,
     service: &str,
 ) -> Option<String> {
+    if config.service_routing.service_ingress_mode
+        == openshell_core::config::ServiceIngressMode::Supervisor
+    {
+        let mut origin =
+            url::Url::parse(config.service_routing.service_ingress_url.as_ref()?).ok()?;
+        let domain = origin.host_str()?.to_string();
+        let label = if service.is_empty() {
+            format!("{workspace}--{sandbox}")
+        } else {
+            format!("{workspace}--{sandbox}--{service}")
+        };
+        origin.set_host(Some(&format!("{label}.{domain}"))).ok()?;
+        return Some(origin.to_string());
+    }
     let host = endpoint_host(&config.service_routing, workspace, sandbox, service)?;
     let scheme = endpoint_scheme(config);
     let port = config.bind_address.port();
@@ -170,6 +184,46 @@ pub fn endpoint_url(
     } else {
         format!("{scheme}://{host}/")
     })
+}
+
+pub fn routing_mode(config: &ServiceRoutingConfig) -> openshell_core::proto::ServiceRoutingMode {
+    match config.service_ingress_mode {
+        openshell_core::config::ServiceIngressMode::Gateway => {
+            openshell_core::proto::ServiceRoutingMode::Gateway
+        }
+        openshell_core::config::ServiceIngressMode::Supervisor => {
+            openshell_core::proto::ServiceRoutingMode::Supervisor
+        }
+    }
+}
+
+pub fn validate_ingress_config(config: &ServiceRoutingConfig) -> Result<(), String> {
+    use openshell_core::config::ServiceIngressMode;
+    match (config.service_ingress_mode, &config.service_ingress_url) {
+        (ServiceIngressMode::Gateway, None) => Ok(()),
+        (ServiceIngressMode::Gateway, Some(_)) => {
+            Err("service_ingress_url requires service_ingress_mode = supervisor".into())
+        }
+        (ServiceIngressMode::Supervisor, None) => {
+            Err("supervisor ingress requires service_ingress_url".into())
+        }
+        (ServiceIngressMode::Supervisor, Some(origin)) => {
+            let parsed = url::Url::parse(origin).map_err(|_| "invalid service_ingress_url")?;
+            if parsed.scheme() != "https"
+                || !parsed.username().is_empty()
+                || parsed.password().is_some()
+                || parsed.path() != "/"
+                || parsed.query().is_some()
+                || parsed.fragment().is_some()
+                || parsed.port() == Some(0)
+                || parsed.host_str() != config.supervisor_app_service_domain.as_deref()
+                || !matches!(parsed.host(), Some(url::Host::Domain(_)))
+            {
+                return Err("service_ingress_url must be an HTTPS origin matching supervisor_app_service_domain, without credentials, path, query, or fragment".into());
+            }
+            Ok(())
+        }
+    }
 }
 
 fn endpoint_scheme(config: &openshell_core::Config) -> &'static str {
@@ -1872,5 +1926,62 @@ mod tests {
             .as_ref()
             .expect("structured OCSF event should be reachable from the layer");
         assert_eq!(event.format_shorthand(), expected_shorthand);
+    }
+}
+
+#[cfg(test)]
+mod ingress_url_tests {
+    use super::*;
+    use openshell_core::config::ServiceIngressMode;
+    #[test]
+    fn public_ingress_urls_preserve_origin_port_and_unnamed_routes() {
+        let mut config = openshell_core::Config::new(None);
+        config.service_routing.service_ingress_mode = ServiceIngressMode::Supervisor;
+        config.service_routing.service_ingress_url =
+            Some("https://api.openshell-sandbox-proxy-ingress.my-domain:28443".into());
+        config.service_routing.supervisor_app_service_domain =
+            Some("api.openshell-sandbox-proxy-ingress.my-domain".into());
+        assert!(validate_ingress_config(&config.service_routing).is_ok());
+        assert_eq!(
+            endpoint_url(&config, "default", "sandbox-b", "portal").unwrap(),
+            "https://default--sandbox-b--portal.api.openshell-sandbox-proxy-ingress.my-domain:28443/"
+        );
+        assert_eq!(
+            endpoint_url(&config, "default", "sandbox-a", "").unwrap(),
+            "https://default--sandbox-a.api.openshell-sandbox-proxy-ingress.my-domain:28443/"
+        );
+        config.service_routing.service_ingress_url =
+            Some("https://api.openshell-sandbox-proxy-ingress.my-domain:443/".into());
+        assert_eq!(
+            endpoint_url(&config, "default", "sandbox-a", "web").unwrap(),
+            "https://default--sandbox-a--web.api.openshell-sandbox-proxy-ingress.my-domain/"
+        );
+    }
+    #[test]
+    fn supervisor_ingress_rejects_incomplete_or_mismatched_origins() {
+        let mut config = ServiceRoutingConfig {
+            service_ingress_mode: ServiceIngressMode::Supervisor,
+            supervisor_app_service_domain: Some(
+                "api.openshell-sandbox-proxy-ingress.my-domain".into(),
+            ),
+            ..ServiceRoutingConfig::default()
+        };
+        assert!(validate_ingress_config(&config).is_err());
+        for url in [
+            "http://api.openshell-sandbox-proxy-ingress.my-domain",
+            "https://other.example.com",
+            "https://user@api.openshell-sandbox-proxy-ingress.my-domain",
+            "https://api.openshell-sandbox-proxy-ingress.my-domain/path",
+            "https://api.openshell-sandbox-proxy-ingress.my-domain/?token=secret",
+            "https://api.openshell-sandbox-proxy-ingress.my-domain/#fragment",
+            "https://api.openshell-sandbox-proxy-ingress.my-domain:0",
+        ] {
+            config.service_ingress_url = Some(url.into());
+            assert!(validate_ingress_config(&config).is_err(), "{url}");
+        }
+        config.service_ingress_mode = ServiceIngressMode::Gateway;
+        assert!(validate_ingress_config(&config).is_err());
+        config.service_ingress_url = None;
+        assert!(validate_ingress_config(&config).is_ok());
     }
 }

@@ -156,6 +156,8 @@ pub(in crate::grpc) enum Outcome {
         changed: bool,
         #[serde(default)]
         service_urls: HashMap<String, String>,
+        #[serde(default)]
+        service_routing_mode: i32,
     },
     SandboxDeletion {
         id: String,
@@ -175,6 +177,8 @@ pub(in crate::grpc) enum Outcome {
         reference: Reference,
         sandbox_id: String,
         url: String,
+        #[serde(default)]
+        routing_mode: i32,
     },
     Profiles {
         references: Vec<Reference>,
@@ -415,11 +419,13 @@ fn sandbox_receipt(
     sandbox: Option<&Sandbox>,
     changed: bool,
     service_urls: HashMap<String, String>,
+    service_routing_mode: i32,
 ) -> Result<Outcome, Status> {
     Ok(Outcome::Sandbox {
         id: sandbox.ok_or_else(uncertain)?.object_id().into(),
         changed,
         service_urls,
+        service_routing_mode,
     })
 }
 
@@ -435,14 +441,21 @@ macro_rules! sandbox_mutation {
                 response.get_ref().sandbox.as_ref(),
                 false,
                 HashMap::new(),
+                response.get_ref().service_routing_mode,
             ),
             async |store: &Store, outcome: Outcome| {
-                let Outcome::Sandbox { id, .. } = outcome else {
+                let Outcome::Sandbox {
+                    id,
+                    service_routing_mode,
+                    ..
+                } = outcome
+                else {
                     return Err(replay_unavailable());
                 };
                 Ok(SandboxResponse {
                     sandbox: Some(live(store, &id).await?),
                     service_urls: HashMap::new(),
+                    service_routing_mode,
                 })
             }
         );
@@ -458,10 +471,14 @@ scoped_mutation!(
         response.get_ref().sandbox.as_ref(),
         false,
         response.get_ref().service_urls.clone(),
+        response.get_ref().service_routing_mode,
     ),
     async |store: &Store, outcome: Outcome| {
         let Outcome::Sandbox {
-            id, service_urls, ..
+            id,
+            service_urls,
+            service_routing_mode,
+            ..
         } = outcome
         else {
             return Err(replay_unavailable());
@@ -469,6 +486,7 @@ scoped_mutation!(
         Ok(SandboxResponse {
             sandbox: Some(live(store, &id).await?),
             service_urls,
+            service_routing_mode,
         })
     }
 );
@@ -573,6 +591,7 @@ sandbox_scoped_mutation!(
             reference: Reference::new(endpoint),
             sandbox_id: endpoint.sandbox_id.clone(),
             url: value.url.clone(),
+            routing_mode: value.routing_mode,
         })
     },
     async |store: &Store, outcome: Outcome| {
@@ -580,6 +599,7 @@ sandbox_scoped_mutation!(
             reference,
             sandbox_id,
             url,
+            routing_mode,
         } = outcome
         else {
             return Err(replay_unavailable());
@@ -588,6 +608,8 @@ sandbox_scoped_mutation!(
         Ok(ServiceEndpointResponse {
             endpoint: Some(reference.restore(store).await?),
             url,
+            routing_mode,
+            status: 0,
         })
     }
 );

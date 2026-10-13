@@ -737,6 +737,8 @@ async fn handle_create_sandbox_inner(
     Ok(Response::new(SandboxResponse {
         sandbox: Some(sandbox),
         service_urls,
+        service_routing_mode: crate::service_routing::routing_mode(&state.config.service_routing)
+            as i32,
     }))
 }
 
@@ -918,6 +920,8 @@ pub(super) async fn handle_get_sandbox(
     let mut response = Response::new(SandboxResponse {
         sandbox: Some(sandbox),
         service_urls: HashMap::new(),
+        service_routing_mode: crate::service_routing::routing_mode(&state.config.service_routing)
+            as i32,
     });
     if let Some(value) = owner.and_then(|owner| owner.parse().ok()) {
         response
@@ -1717,6 +1721,8 @@ async fn handle_stop_sandbox_inner(
     Ok(Response::new(SandboxResponse {
         sandbox: Some(sandbox),
         service_urls: HashMap::new(),
+        service_routing_mode: crate::service_routing::routing_mode(&state.config.service_routing)
+            as i32,
     }))
 }
 
@@ -1772,6 +1778,8 @@ async fn handle_start_sandbox_inner(
     Ok(Response::new(SandboxResponse {
         sandbox: Some(sandbox),
         service_urls: HashMap::new(),
+        service_routing_mode: crate::service_routing::routing_mode(&state.config.service_routing)
+            as i32,
     }))
 }
 
