@@ -9,6 +9,7 @@ use crate::auth::principal::Principal;
 use crate::auth::workspace_authz::{
     MinWorkspaceRole, authorize_workspace, selected_workspace_name,
 };
+use crate::persistence::ObjectCursor;
 use crate::supervisor_owner::{OWNER_TTL, SupervisorOwnerIndex};
 use openshell_core::proto::{
     DiscoveredServiceRoute, GetServiceRouteSnapshotRequest, GetServiceRouteSnapshotResponse,
@@ -23,7 +24,9 @@ use std::time::Duration;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status};
 
-const MAX_ADVERTISEMENTS: u32 = 1000;
+const MAX_ADVERTISEMENTS: usize = 1000;
+const PAGE_SIZE: u32 = 128;
+const SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_DISCOVERED_ROUTES: usize = 4096;
 const SANDBOX_KEY: &str = "{sandbox}";
 const WORKSPACE_KEY: &str = "{workspace}";
@@ -133,122 +136,151 @@ pub(super) async fn snapshot(
     state: &Arc<ServerState>,
     workspace: &str,
 ) -> Result<ServiceRouteSnapshot, Status> {
+    tokio::time::timeout(
+        SNAPSHOT_TIMEOUT,
+        collect_snapshot(state, workspace, MAX_ADVERTISEMENTS, MAX_DISCOVERED_ROUTES),
+    )
+    .await
+    .map_err(|_| Status::unavailable("service discovery snapshot timed out"))?
+}
+
+async fn collect_snapshot(
+    state: &Arc<ServerState>,
+    workspace: &str,
+    max_advertisements: usize,
+    max_routes: usize,
+) -> Result<ServiceRouteSnapshot, Status> {
     let config = &state.config.service_routing;
     let mut routes = Vec::new();
     if let (Some(template), Some(domain)) = (
         &config.supervisor_app_address_template,
         &config.supervisor_app_service_domain,
     ) {
-        let records = state
-            .store
-            .list(OBJECT_TYPE, workspace, MAX_ADVERTISEMENTS + 1, 0)
-            .await
-            .map_err(|_| Status::unavailable("service advertisements unavailable"))?;
-        if records.len() > usize::try_from(MAX_ADVERTISEMENTS).expect("bounded advertisement count")
-        {
-            return Err(Status::resource_exhausted(
-                "too many service advertisements for one snapshot",
-            ));
-        }
         let owners = SupervisorOwnerIndex::new(state.store.clone(), OWNER_TTL);
-        for record in records {
-            let advertisement: Advertisement = serde_json::from_slice(&record.payload)
-                .map_err(|_| Status::internal("invalid stored service advertisement"))?;
-            let now = openshell_core::time::now_ms();
-            if advertisement.routes.is_empty()
-                || advertisement.expires_at_ms <= now
-                || advertisement.service_domain != *domain
-            {
-                continue;
-            }
-            let Some(owner) = owners
-                .read(&advertisement.sandbox_id)
-                .await
-                .map_err(|_| Status::unavailable("supervisor ownership unavailable"))?
-            else {
-                continue;
-            };
-            if !owner.is_fresh(OWNER_TTL)
-                || owner.session_id != advertisement.session_id
-                || owner.supervisor_instance_id != advertisement.supervisor_instance_id
-                || owner.connection_epoch != advertisement.connection_epoch
-            {
-                continue;
-            }
-            let Some(sandbox) = state
+        let mut after = None;
+        let mut eligible_advertisements = 0;
+        loop {
+            let records = state
                 .store
-                .get_message::<Sandbox>(&advertisement.sandbox_id)
+                .list_after(OBJECT_TYPE, workspace, after.as_ref(), PAGE_SIZE)
                 .await
-                .map_err(|_| Status::unavailable("sandbox unavailable"))?
-            else {
-                continue;
-            };
-            if sandbox.object_workspace() != workspace
-                || SandboxPhase::try_from(sandbox.phase()).ok() != Some(SandboxPhase::Ready)
-                || sandbox.status.as_ref().is_none_or(|status| {
-                    status.main_process_instance_id != advertisement.supervisor_instance_id
-                })
-            {
-                continue;
-            }
-            let address = template
-                .replace("{sandbox_id}", sandbox.object_id())
-                .replace(SANDBOX_KEY, sandbox.object_name())
-                .replace(WORKSPACE_KEY, workspace);
-            if address != advertisement.address {
-                continue;
-            }
-            let accepted = super::policy::load_sandbox_config(state, &sandbox).await?;
-            if !accepted.configuration_admitted {
-                continue;
-            }
-            let expires = advertisement
-                .expires_at_ms
-                .min(owner.updated_at_ms.saturating_add(45_000));
-            for stamp in &advertisement.routes {
-                let Some(endpoint) = state
-                    .store
-                    .get_message::<ServiceEndpoint>(&stamp.endpoint_id)
-                    .await
-                    .map_err(|_| Status::unavailable("service declaration unavailable"))?
-                else {
-                    continue;
-                };
-                if endpoint.object_workspace() != workspace
-                    || endpoint.sandbox_id != advertisement.sandbox_id
-                    || endpoint.get_resource_version() != stamp.resource_version
-                    || !endpoint.domain
+                .map_err(|_| Status::unavailable("service advertisements unavailable"))?;
+            let final_page = records.len() < PAGE_SIZE as usize;
+            after = records.last().map(ObjectCursor::from);
+            for record in records {
+                let advertisement: Advertisement = serde_json::from_slice(&record.payload)
+                    .map_err(|_| Status::internal("invalid stored service advertisement"))?;
+                let now = openshell_core::time::now_ms();
+                if advertisement.routes.is_empty()
+                    || advertisement.expires_at_ms <= now
+                    || advertisement.service_domain != *domain
                 {
                     continue;
                 }
-                let service_label = if endpoint.name.is_empty() {
-                    String::new()
-                } else {
-                    format!("--{}", endpoint.name)
+                let Some(owner) = owners
+                    .read(&advertisement.sandbox_id)
+                    .await
+                    .map_err(|_| Status::unavailable("supervisor ownership unavailable"))?
+                else {
+                    continue;
                 };
-                routes.push(DiscoveredServiceRoute {
-                    workspace: workspace.into(),
-                    sandbox: sandbox.object_name().into(),
-                    name: endpoint.name.clone(),
-                    sandbox_id: advertisement.sandbox_id.clone(),
-                    service_id: endpoint.object_id().into(),
-                    hostname: format!(
-                        "{workspace}--{}{service_label}.{domain}",
-                        sandbox.object_name()
-                    ),
-                    supervisor_instance_id: advertisement.supervisor_instance_id.clone(),
-                    supervisor_app_address: address.clone(),
-                    service_revision: stamp.resource_version,
-                    runtime_generation: advertisement.supervisor_instance_id.clone(),
-                    expires_at: openshell_core::time::timestamp_from_millis(expires).ok(),
-                    advertisement_revision: record.resource_version,
-                });
-                if routes.len() > MAX_DISCOVERED_ROUTES {
-                    return Err(Status::resource_exhausted(
-                        "too many routes for one snapshot",
-                    ));
+                if !owner.is_fresh(OWNER_TTL)
+                    || owner.session_id != advertisement.session_id
+                    || owner.supervisor_instance_id != advertisement.supervisor_instance_id
+                    || owner.connection_epoch != advertisement.connection_epoch
+                {
+                    continue;
+                }
+                let Some(sandbox) = state
+                    .store
+                    .get_message::<Sandbox>(&advertisement.sandbox_id)
+                    .await
+                    .map_err(|_| Status::unavailable("sandbox unavailable"))?
+                else {
+                    continue;
+                };
+                if sandbox.object_workspace() != workspace
+                    || SandboxPhase::try_from(sandbox.phase()).ok() != Some(SandboxPhase::Ready)
+                    || sandbox.status.as_ref().is_none_or(|status| {
+                        status.main_process_instance_id != advertisement.supervisor_instance_id
+                    })
+                {
+                    continue;
+                }
+                let address = template
+                    .replace("{sandbox_id}", sandbox.object_id())
+                    .replace(SANDBOX_KEY, sandbox.object_name())
+                    .replace(WORKSPACE_KEY, workspace);
+                if address != advertisement.address {
+                    continue;
+                }
+                let accepted = super::policy::load_sandbox_config(state, &sandbox).await?;
+                if !accepted.configuration_admitted {
+                    continue;
+                }
+                let expires = advertisement
+                    .expires_at_ms
+                    .min(owner.updated_at_ms.saturating_add(45_000));
+                let first_route = routes.len();
+                for stamp in &advertisement.routes {
+                    let Some(endpoint) = state
+                        .store
+                        .get_message::<ServiceEndpoint>(&stamp.endpoint_id)
+                        .await
+                        .map_err(|_| Status::unavailable("service declaration unavailable"))?
+                    else {
+                        continue;
+                    };
+                    if endpoint.object_workspace() != workspace
+                        || endpoint.sandbox_id != advertisement.sandbox_id
+                        || endpoint.get_resource_version() != stamp.resource_version
+                        || !endpoint.domain
+                        || expires <= openshell_core::time::now_ms()
+                    {
+                        continue;
+                    }
+                    let service_label = if endpoint.name.is_empty() {
+                        String::new()
+                    } else {
+                        format!("--{}", endpoint.name)
+                    };
+                    if routes.len() == first_route {
+                        eligible_advertisements += 1;
+                        if eligible_advertisements > max_advertisements {
+                            return Err(Status::resource_exhausted(
+                                "too many eligible service advertisements for one snapshot",
+                            ));
+                        }
+                    }
+                    routes.push(DiscoveredServiceRoute {
+                        workspace: workspace.into(),
+                        sandbox: sandbox.object_name().into(),
+                        name: endpoint.name.clone(),
+                        sandbox_id: advertisement.sandbox_id.clone(),
+                        service_id: endpoint.object_id().into(),
+                        hostname: format!(
+                            "{workspace}--{}{service_label}.{domain}",
+                            sandbox.object_name()
+                        ),
+                        supervisor_instance_id: advertisement.supervisor_instance_id.clone(),
+                        supervisor_app_address: address.clone(),
+                        service_revision: stamp.resource_version,
+                        runtime_generation: advertisement.supervisor_instance_id.clone(),
+                        expires_at: openshell_core::time::timestamp_from_millis(expires).ok(),
+                        advertisement_revision: record.resource_version,
+                    });
+                    if routes.len() > max_routes {
+                        return Err(Status::resource_exhausted(
+                            "too many routes for one snapshot",
+                        ));
+                    }
                 }
             }
+            if final_page {
+                break;
+            }
+            // Keep large historical scans cooperative; the outer timeout bounds total work.
+            tokio::task::yield_now().await;
         }
     }
     let now = openshell_core::time::now_ms();
@@ -311,6 +343,173 @@ mod tests {
             )
             .await
             .unwrap();
+    }
+
+    async fn stored_advertisement(state: &ServerState) -> Advertisement {
+        serde_json::from_slice(
+            &state
+                .store
+                .get(OBJECT_TYPE, "service-advertisement:sandbox-a-id")
+                .await
+                .unwrap()
+                .unwrap()
+                .payload,
+        )
+        .unwrap()
+    }
+
+    async fn seed_eligible_route(state: &Arc<ServerState>, suffix: &str) {
+        let mut advertisement = stored_advertisement(state).await;
+        let mut sandbox = state
+            .store
+            .get_message::<Sandbox>("sandbox-a-id")
+            .await
+            .unwrap()
+            .unwrap();
+        let id = format!("sandbox-{suffix}-id");
+        let name = format!("sandbox-{suffix}");
+        let metadata = sandbox.metadata.as_mut().unwrap();
+        metadata.id.clone_from(&id);
+        metadata.name.clone_from(&name);
+        metadata.resource_version = 0;
+        sandbox.status.as_mut().unwrap().main_process_instance_id = format!("runtime-{suffix}");
+        state.store.put_message(&sandbox).await.unwrap();
+
+        let mut endpoint = state
+            .store
+            .get_message::<ServiceEndpoint>(&advertisement.routes[0].endpoint_id)
+            .await
+            .unwrap()
+            .unwrap();
+        endpoint.sandbox_id.clone_from(&id);
+        endpoint.sandbox.clone_from(&name);
+        let metadata = endpoint.metadata.as_mut().unwrap();
+        metadata.id = format!("endpoint-{suffix}");
+        metadata.name = format!("{name}--web");
+        metadata.resource_version = 0;
+        state.store.put_message(&endpoint).await.unwrap();
+
+        let owner = SupervisorOwnerIndex::new(state.store.clone(), OWNER_TTL)
+            .publish(
+                &id,
+                &format!("session-{suffix}"),
+                &format!("runtime-{suffix}"),
+                1,
+                &state.replica_id,
+                "local://test",
+            )
+            .await
+            .unwrap();
+        advertisement.sandbox_id.clone_from(&id);
+        advertisement.session_id = owner.session_id;
+        advertisement.supervisor_instance_id = owner.supervisor_instance_id;
+        advertisement.connection_epoch = owner.connection_epoch;
+        advertisement.address = format!("app-{id}.default.svc:443");
+        advertisement.expires_at_ms = openshell_core::time::now_ms() + 20_000;
+        advertisement.routes[0].endpoint_id = format!("endpoint-{suffix}");
+        advertisement.routes[0].resource_version = 1;
+        state
+            .store
+            .put_if(
+                OBJECT_TYPE,
+                &format!("service-advertisement:{id}"),
+                &id,
+                "default",
+                &serde_json::to_vec(&advertisement).unwrap(),
+                None,
+                crate::persistence::WriteCondition::MustCreate,
+            )
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn discovery_pages_past_historical_records_to_find_live_services() {
+        let (state, owner, report) = fixture().await;
+        accept(&state, &owner, report).await.unwrap();
+        let template = stored_advertisement(&state).await;
+        for index in 0..MAX_ADVERTISEMENTS + 5 {
+            let id = format!("historical-{index:04}");
+            let mut advertisement = Advertisement {
+                sandbox_id: id.clone(),
+                ..template.clone()
+            };
+            match index % 3 {
+                0 => advertisement.expires_at_ms = 0,
+                1 => advertisement.routes.clear(),
+                // Unexpired evidence without an eligible owner also does not count.
+                _ => {}
+            }
+            state
+                .store
+                .put_if(
+                    OBJECT_TYPE,
+                    &format!("service-advertisement:{id}"),
+                    &id,
+                    "default",
+                    &serde_json::to_vec(&advertisement).unwrap(),
+                    None,
+                    crate::persistence::WriteCondition::MustCreate,
+                )
+                .await
+                .unwrap();
+        }
+        // This live record sorts after the historical pages.
+        seed_eligible_route(&state, "later").await;
+        let discovered = snapshot(&state, "default").await.unwrap();
+        assert_eq!(discovered.routes.len(), 2);
+        assert!(
+            discovered
+                .routes
+                .iter()
+                .any(|route| route.sandbox == "sandbox-later")
+        );
+        assert!(
+            discovered
+                .routes
+                .iter()
+                .any(|route| route.sandbox == "sandbox-a")
+        );
+        // Discovery remains read-only; historical cleanup runs separately.
+        assert_eq!(
+            state
+                .store
+                .list(OBJECT_TYPE, "default", 2000, 0)
+                .await
+                .unwrap()
+                .len(),
+            MAX_ADVERTISEMENTS + 7
+        );
+    }
+
+    #[tokio::test]
+    async fn discovery_still_enforces_eligible_advertisement_and_route_limits() {
+        let (state, owner, report) = fixture().await;
+        accept(&state, &owner, report).await.unwrap();
+        seed_eligible_route(&state, "b").await;
+        // Exercise the same collector with small limits to keep the fixture compact.
+        assert_eq!(
+            collect_snapshot(&state, "default", 1, 2)
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::ResourceExhausted
+        );
+        assert_eq!(
+            collect_snapshot(&state, "default", 2, 1)
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::ResourceExhausted
+        );
+        assert_eq!(
+            collect_snapshot(&state, "default", 2, 2)
+                .await
+                .unwrap()
+                .routes
+                .len(),
+            2
+        );
     }
     #[tokio::test]
     async fn discovery_snapshot_contains_only_current_advertised_declarations() {

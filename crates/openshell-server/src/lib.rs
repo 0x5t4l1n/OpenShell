@@ -979,12 +979,18 @@ pub(crate) async fn run_server(
     ssh_sessions::spawn_session_reaper(store.clone(), Duration::from_hours(1));
     supervisor_session::spawn_relay_reaper(state.clone(), Duration::from_secs(30));
     provider_refresh::spawn_refresh_worker(state.clone(), Duration::from_mins(1));
+    let advertisement_cleanup =
+        grpc::service_advertisement::spawn_cleanup_worker(state.clone(), shutdown_rx.clone());
 
     shutdown_signal().await;
     info!("Shutdown signal received; stopping gateway");
     state.gateway_shutting_down.store(true, Ordering::Release);
     state.supervisor_sessions.close_admission();
     let _ = shutdown_tx.send(true);
+
+    if let Err(err) = advertisement_cleanup.await {
+        warn!(error = %err, "Service advertisement cleanup task failed during shutdown");
+    }
 
     if let Err(err) = listener_task.await {
         warn!(error = %err, "Gateway listener task failed during shutdown");

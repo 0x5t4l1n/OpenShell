@@ -6,7 +6,7 @@
 //! fail closed after restart, ownership replacement, declaration changes, or expiry.
 
 use crate::ServerState;
-use crate::persistence::WriteCondition;
+use crate::persistence::{ObjectCursor, ObjectRecord, PersistenceError, WriteCondition};
 use crate::supervisor_owner::{OWNER_TTL, OwnerGuard, SupervisorOwnerIndex};
 use openshell_core::config::ServiceRoutingConfig;
 use openshell_core::proto::{Sandbox, SandboxPhase, SupervisorServiceAdvertisement};
@@ -16,12 +16,16 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 use std::sync::Arc;
+use std::time::Duration;
 use tonic::Status;
 
 pub(super) const OBJECT_TYPE: &str = "supervisor_service_advertisement";
 const MAX_ROUTES: usize = 1024;
 const LEASE_MS: i64 = 30_000;
 const SANDBOX_PLACEHOLDER: &str = "{sandbox}";
+const CLEANUP_PAGE_SIZE: u32 = 128;
+const CLEANUP_INTERVAL: Duration = Duration::from_secs(30);
+const CLEANUP_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub(super) struct RouteStamp {
@@ -41,6 +45,120 @@ pub(super) struct Advertisement {
     pub report_sequence: u64,
     pub digest: String,
     pub routes: Vec<RouteStamp>,
+}
+
+/// Retain sequence fences until the publishing session is permanently fenced.
+/// Expiry, withdrawal, or a missing/expired owner alone is not sufficient.
+async fn cleanup_record(state: &Arc<ServerState>, record: &ObjectRecord) -> Result<bool, Status> {
+    let advertisement: Advertisement = serde_json::from_slice(&record.payload)
+        .map_err(|_| Status::internal("invalid stored service advertisement"))?;
+    let _guard = state
+        .compute
+        .sandbox_sync_guard()
+        .await
+        .map_err(|_| Status::internal("service advertisement cleanup lock failed"))?;
+    let current = state
+        .store
+        .get(OBJECT_TYPE, &record.id)
+        .await
+        .map_err(|_| Status::unavailable("service advertisement unavailable during cleanup"))?;
+    // Versions restart when a deleted object is recreated. Check the payload
+    // under the publisher's lock too, not only the version captured by paging.
+    if current.is_none_or(|current| {
+        current.resource_version != record.resource_version || current.payload != record.payload
+    }) {
+        return Ok(false);
+    }
+    let sandbox = state
+        .store
+        .get_message::<Sandbox>(&advertisement.sandbox_id)
+        .await
+        .map_err(|_| Status::unavailable("sandbox unavailable during advertisement cleanup"))?;
+    let permanently_fenced = if sandbox.is_none() {
+        true
+    } else {
+        let owner = SupervisorOwnerIndex::new(state.store.clone(), OWNER_TTL)
+            .read(&advertisement.sandbox_id)
+            .await
+            .map_err(|_| Status::unavailable("supervisor ownership unavailable during cleanup"))?;
+        owner.is_some_and(|owner| {
+            owner.session_id != advertisement.session_id
+                || owner.supervisor_instance_id != advertisement.supervisor_instance_id
+                || owner.connection_epoch != advertisement.connection_epoch
+        })
+    };
+    if !permanently_fenced {
+        return Ok(false);
+    }
+    match state
+        .store
+        .delete_if(OBJECT_TYPE, &record.id, record.resource_version)
+        .await
+    {
+        Ok(deleted) => Ok(deleted),
+        // A replacement or renewal won the race; a later page may inspect it.
+        Err(PersistenceError::Conflict { .. }) => Ok(false),
+        Err(_) => Err(Status::unavailable("service advertisement cleanup failed")),
+    }
+}
+
+async fn cleanup_page(
+    state: &Arc<ServerState>,
+    after: Option<&ObjectCursor>,
+) -> Result<Option<ObjectCursor>, Status> {
+    let records = state
+        .store
+        .list_by_type_after(OBJECT_TYPE, after, CLEANUP_PAGE_SIZE)
+        .await
+        .map_err(|_| Status::unavailable("service advertisements unavailable during cleanup"))?;
+    // Capture the cursor before deletion so removals cannot shift the next page.
+    let next = (records.len() == CLEANUP_PAGE_SIZE as usize)
+        .then(|| records.last().map(ObjectCursor::from))
+        .flatten();
+    for record in records {
+        if cleanup_record(state, &record).await.is_err() {
+            tracing::warn!("Service advertisement cleanup skipped an unavailable record");
+        }
+    }
+    Ok(next)
+}
+
+/// Bound each sweep's work, release the mutation guard between records, and
+/// stop promptly with the gateway. Multiple replicas may safely sweep together.
+pub fn spawn_cleanup_worker(
+    state: Arc<ServerState>,
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut after = None;
+        let mut timer = tokio::time::interval(CLEANUP_INTERVAL);
+        timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            if *shutdown.borrow() {
+                return;
+            }
+            tokio::select! {
+                changed = shutdown.changed() => {
+                    if changed.is_err() || *shutdown.borrow() { return; }
+                    continue;
+                },
+                _ = timer.tick() => {},
+            }
+            let sweep = tokio::time::timeout(CLEANUP_TIMEOUT, cleanup_page(&state, after.as_ref()));
+            tokio::select! {
+                changed = shutdown.changed() => {
+                    if changed.is_err() || *shutdown.borrow() { return; }
+                },
+                result = sweep => {
+                    if let Ok(Ok(next)) = result {
+                        after = next;
+                    } else {
+                        tracing::warn!("Service advertisement cleanup deferred an incomplete page");
+                    }
+                },
+            }
+        }
+    })
 }
 
 pub fn validate_config(config: &ServiceRoutingConfig) -> Result<(), String> {
@@ -448,6 +566,182 @@ pub(super) mod tests {
         );
         accept(&state, &replacement, report).await.unwrap();
         assert_eq!(stored(&state).await.session_id, "session-b");
+    }
+
+    async fn record(state: &ServerState) -> ObjectRecord {
+        state
+            .store
+            .get(OBJECT_TYPE, "service-advertisement:sandbox-a-id")
+            .await
+            .unwrap()
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn cleanup_preserves_expired_and_withdrawn_sequence_fences() {
+        let (state, owner, report) = fixture().await;
+        accept(&state, &owner, report.clone()).await.unwrap();
+        let previous = record(&state).await;
+        let mut expired = stored(&state).await;
+        expired.expires_at_ms = 0;
+        state
+            .store
+            .put_if(
+                OBJECT_TYPE,
+                &previous.id,
+                &previous.name,
+                &previous.workspace,
+                &serde_json::to_vec(&expired).unwrap(),
+                None,
+                WriteCondition::MatchResourceVersion(previous.resource_version),
+            )
+            .await
+            .unwrap();
+        assert!(!cleanup_record(&state, &record(&state).await).await.unwrap());
+
+        // A higher sequence can renew the same session after advertisement expiry.
+        let mut renewed = report.clone();
+        renewed.report_sequence = 2;
+        accept(&state, &owner, renewed.clone()).await.unwrap();
+        let withdrawal = SupervisorServiceAdvertisement {
+            report_sequence: 3,
+            routes: Vec::new(),
+            ..renewed.clone()
+        };
+        accept(&state, &owner, withdrawal).await.unwrap();
+        assert!(!cleanup_record(&state, &record(&state).await).await.unwrap());
+        assert_eq!(
+            accept(&state, &owner, renewed.clone())
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::FailedPrecondition
+        );
+
+        // Missing owner evidence alone is also insufficient to discard a fence.
+        SupervisorOwnerIndex::new(state.store.clone(), OWNER_TTL)
+            .release_if_current(&owner)
+            .await
+            .unwrap();
+        assert!(!cleanup_record(&state, &record(&state).await).await.unwrap());
+        assert_eq!(stored(&state).await.report_sequence, 3);
+    }
+
+    #[tokio::test]
+    async fn cleanup_cannot_delete_a_concurrent_renewal_or_recreated_record() {
+        let (state, owner, mut report) = fixture().await;
+        accept(&state, &owner, report.clone()).await.unwrap();
+        let scanned = record(&state).await;
+        report.report_sequence = 2;
+        accept(&state, &owner, report.clone()).await.unwrap();
+        assert!(!cleanup_record(&state, &scanned).await.unwrap());
+        assert_eq!(stored(&state).await.report_sequence, 2);
+
+        let owners = SupervisorOwnerIndex::new(state.store.clone(), OWNER_TTL);
+        let replacement = owners
+            .publish(
+                "sandbox-a-id",
+                "session-b",
+                "runtime-a",
+                2,
+                &state.replica_id,
+                "local://test",
+            )
+            .await
+            .unwrap();
+        register(&state, "session-b");
+        assert!(cleanup_record(&state, &record(&state).await).await.unwrap());
+        assert!(
+            state
+                .store
+                .get(OBJECT_TYPE, &scanned.id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            accept(&state, &owner, report.clone())
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::PermissionDenied
+        );
+
+        // Deletion resets the resource version, so an old page can see version 1
+        // again. Its old payload must never authorize deletion of session B.
+        report.report_sequence = 1;
+        accept(&state, &replacement, report).await.unwrap();
+        assert_eq!(
+            record(&state).await.resource_version,
+            scanned.resource_version
+        );
+        assert!(!cleanup_record(&state, &scanned).await.unwrap());
+        assert_eq!(stored(&state).await.session_id, "session-b");
+    }
+
+    #[tokio::test]
+    async fn cleanup_pages_remove_deleted_sandboxes_without_offset_skips() {
+        let (state, owner, report) = fixture().await;
+        accept(&state, &owner, report).await.unwrap();
+        let template = stored(&state).await;
+        let historical_count = CLEANUP_PAGE_SIZE * 2 + 3;
+        for index in 0..historical_count {
+            let sandbox_id = format!("deleted-{index:04}");
+            let historical = Advertisement {
+                sandbox_id: sandbox_id.clone(),
+                ..template.clone()
+            };
+            state
+                .store
+                .put_if(
+                    OBJECT_TYPE,
+                    &format!("service-advertisement:{sandbox_id}"),
+                    &sandbox_id,
+                    "default",
+                    &serde_json::to_vec(&historical).unwrap(),
+                    None,
+                    WriteCondition::MustCreate,
+                )
+                .await
+                .unwrap();
+        }
+        let mut after = cleanup_page(&state, None).await.unwrap();
+        assert!(after.is_some());
+        assert_eq!(
+            state
+                .store
+                .list(OBJECT_TYPE, "default", 1000, 0)
+                .await
+                .unwrap()
+                .len(),
+            historical_count as usize + 1 - CLEANUP_PAGE_SIZE as usize + 1
+        );
+        while let Some(cursor) = after {
+            after = cleanup_page(&state, Some(&cursor)).await.unwrap();
+        }
+        assert_eq!(
+            state
+                .store
+                .list(OBJECT_TYPE, "default", 1000, 0)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(stored(&state).await.session_id, owner.session_id);
+    }
+
+    #[tokio::test]
+    async fn cleanup_worker_stops_with_gateway_shutdown() {
+        let (state, _, _) = fixture().await;
+        let (shutdown, receiver) = tokio::sync::watch::channel(false);
+        let worker = spawn_cleanup_worker(state, receiver);
+        tokio::task::yield_now().await;
+        shutdown.send(true).unwrap();
+        tokio::time::timeout(Duration::from_secs(1), worker)
+            .await
+            .expect("cleanup must not wait for its next interval on shutdown")
+            .unwrap();
     }
     #[test]
     fn advertisement_config_requires_trusted_complete_address() {
