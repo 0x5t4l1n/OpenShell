@@ -74,7 +74,7 @@ Install the public OpenShell skills for your coding agent:
 npx skills add NVIDIA/OpenShell
 ```
 
-The skills teach your agent to drive the OpenShell CLI, write sandbox policies, and debug gateways and inference routing. They live in [`skills/`](skills/) and work without an OpenShell source checkout. The skills start by running `openshell agent context`, which prints a compact reference for every command in the installed CLI.
+The skills teach your agent to drive the OpenShell CLI, write sandbox policies, and debug gateways and inference routing. They live in [`skills/`](skills/) and work without an OpenShell source checkout. The skills start by running `openshell agent context`, which prints a map of every command and flag in the installed CLI.
 
 ## SDKs
 

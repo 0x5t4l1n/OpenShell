@@ -180,13 +180,15 @@ fn gateway_add_rejects_removed_ssh_key_flag() {
     );
 }
 
-/// Upper bound for the agent bootstrap. If this fails, keep long detail in
-/// `--help` rather than raising the bound casually.
-const AGENT_CONTEXT_BUDGET_BYTES: usize = 56_000;
+/// Upper bound for the agent map. Agent harnesses cap a single tool result
+/// (Claude Code moves output over 30,000 characters to a file and shows a
+/// preview), so the map must stay well under that to be read in one call.
+/// If this fails, leave detail to `--help` rather than raising the bound.
+const AGENT_CONTEXT_BUDGET_BYTES: usize = 25_000;
 
 #[test]
-fn agent_context_prints_compact_reference_for_every_command() {
-    // Force color to prove the reference stays plain even when styling is on.
+fn agent_context_prints_compact_map_for_every_command() {
+    // Force color to prove the map stays plain even when styling is on.
     let output = run_isolated(&["--color", "always", "agent", "context"]);
     assert_eq!(output.code, 0, "agent context:\n{}", output.combined);
     let reference = &output.stdout;
@@ -194,8 +196,10 @@ fn agent_context_prints_compact_reference_for_every_command() {
     for expected in [
         "## Global flags",
         "## sandbox: Manage sandboxes (alias: sb)",
-        "\nopenshell sandbox create [OPTIONS] [-- <COMMAND>...]\n",
-        "  --from <FROM>",
+        "\nopenshell sandbox create [OPTIONS] [-- <COMMAND>...]  # Create a sandbox\n",
+        "\n  --from <FROM>  [conflicts: --template]\n",
+        "\n  --upload <UPLOAD>  [repeatable] [conflicts: <COMMAND>...]\n",
+        "\n  -o, --output <table|yaml|json>  [default: table]\n",
         "\nopenshell sandbox provider attach ",
         "\nopenshell provider refresh configure ",
         "\nopenshell workspace member add ",

@@ -1,15 +1,13 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Agent-oriented CLI reference rendered from the clap command tree.
+//! Agent-oriented CLI map rendered from the clap command tree.
 //!
-//! `openshell agent context` prints one compact reference that lists every
-//! visible command with its usage line and description, and every flag with
-//! its description, allowed values, default, and environment variable. Each
-//! description is complete but folded onto one line, so a coding agent can
-//! bootstrap from that single call and fall back to `--help` only for flag
-//! constraints. The text is projected from the clap definitions that parse
-//! arguments, so it cannot drift from the binary.
+//! `openshell agent context` prints every visible command with its usage line
+//! and summary, and every flag with its allowed values, default, environment
+//! variable, and conflicting flags. Flag descriptions are left to `--help` so
+//! the map fits in a single agent tool call. The text is projected from the
+//! clap definitions that parse arguments, so it cannot drift from the binary.
 //!
 //! The output is deterministic. Commands and arguments appear in definition
 //! order, hidden commands and flags are omitted, and no ANSI styling survives.
@@ -20,19 +18,15 @@ use clap::{Arg, ArgAction, Command};
 
 /// Usage notes printed under the title. Each one must hold for every command.
 const CONVENTIONS: &[&str] = &[
-    "This reference is generated from the installed binary, so it matches this version exactly.",
-    "Global flags work with every command and are listed once.",
+    "This map is generated from the installed binary, so it matches this version exactly.",
+    "Each command shows its usage line and summary, then its flags. Global flags work with every command.",
+    "Flag tags list allowed values, defaults, environment variables, and flags that cannot be combined.",
+    "Run `openshell <command> --help` for flag descriptions.",
     "Prefer `--output json` where a command offers it. Table output is for people and may change.",
     "Most commands with an optional sandbox name default to the last-used sandbox. Pass the name explicitly in automation.",
-    "Descriptions are complete but folded onto one line. Run `openshell <command> --help` for flag constraints, such as which flags conflict.",
 ];
 
-/// Widest argument form that sets the description column. Longer forms are
-/// followed by two spaces so one long flag cannot pad a whole block.
-const MAX_FORM_WIDTH: usize = 32;
-
-/// Render the agent reference for the root command `cmd`, normally
-/// `Cli::command()`.
+/// Render the agent map for the root command `cmd`, normally `Cli::command()`.
 pub fn render_context(cmd: &Command) -> String {
     let mut root = cmd.clone();
     // Propagate global arguments and binary names so usage lines match what
@@ -70,11 +64,15 @@ fn write_header(out: &mut String, root: &Command) {
 
     let globals = root
         .get_arguments()
-        .filter(|arg| arg.is_global_set() && is_documented(arg))
-        .collect::<Vec<_>>();
-    if !globals.is_empty() {
-        out.push_str("\n## Global flags\n\n");
-        write_args(out, &globals);
+        .filter(|arg| arg.is_global_set() && is_documented(arg));
+    let mut lines = String::new();
+    for arg in globals {
+        // Global flags are few and change how every command connects, so they
+        // keep their descriptions.
+        write_flag(&mut lines, root, arg, true);
+    }
+    if !lines.is_empty() {
+        let _ = write!(out, "\n## Global flags\n\n{lines}");
     }
 }
 
@@ -95,7 +93,7 @@ fn write_top_level(out: &mut String, cmd: &mut Command) {
             let _ = write!(out, " (aliases: {})", aliases.join(", "));
         }
     }
-    out.push('\n');
+    out.push_str("\n\n");
 
     let is_leaf = visible_subcommands(cmd).next().is_none();
     // A top-level leaf already shows its summary in the heading.
@@ -122,36 +120,31 @@ fn write_leaves(out: &mut String, cmd: &mut Command, show_about: bool) {
     let usage = cmd.render_usage().to_string();
     let usage = usage.trim();
     let usage = usage.strip_prefix("Usage:").unwrap_or(usage).trim();
-    let _ = writeln!(out, "\n{usage}");
-    if show_about && let Some(about) = cmd.get_long_about().or_else(|| cmd.get_about()) {
-        let _ = writeln!(out, "  {}", one_line(&about.to_string()));
+    let _ = write!(out, "{usage}");
+    if show_about && let Some(about) = cmd.get_about().or_else(|| cmd.get_long_about()) {
+        let _ = write!(out, "  # {}", one_line(&about.to_string()));
     }
-    let args = cmd
+    out.push('\n');
+    // Positional arguments already appear in the usage line.
+    let flags = cmd
         .get_arguments()
-        .filter(|arg| !arg.is_global_set() && is_documented(arg))
-        .collect::<Vec<_>>();
-    write_args(out, &args);
+        .filter(|arg| !arg.is_global_set() && !arg.is_positional() && is_documented(arg));
+    for arg in flags {
+        write_flag(out, cmd, arg, false);
+    }
 }
 
-/// Write one aligned line per argument: form, description, and attribute tags.
-fn write_args(out: &mut String, args: &[&Arg]) {
-    let forms = args.iter().map(|arg| arg_form(arg)).collect::<Vec<_>>();
-    let width = forms
-        .iter()
-        .map(String::len)
-        .filter(|len| *len <= MAX_FORM_WIDTH)
-        .max()
-        .unwrap_or_default();
-    for (arg, form) in args.iter().zip(forms) {
-        let mut line = format!("  {form:width$}");
-        if let Some(help) = arg.get_long_help().or_else(|| arg.get_help()) {
-            let _ = write!(line, "  {}", one_line(&help.to_string()));
-        }
-        for tag in arg_tags(arg) {
-            let _ = write!(line, " [{tag}]");
-        }
-        let _ = writeln!(out, "{}", line.trim_end());
+/// Write one flag line: its form, optionally its description, and its tags.
+fn write_flag(out: &mut String, cmd: &Command, arg: &Arg, describe: bool) {
+    let mut line = format!("  {}", flag_form(arg));
+    if describe && let Some(help) = arg.get_help().or_else(|| arg.get_long_help()) {
+        let _ = write!(line, "  {}", one_line(&help.to_string()));
     }
+    let tags = flag_tags(cmd, arg);
+    if !tags.is_empty() {
+        let _ = write!(line, "  [{}]", tags.join("] ["));
+    }
+    let _ = writeln!(out, "{}", line.trim_end());
 }
 
 /// Arguments worth listing: visible and not the built-in help or version flags.
@@ -167,17 +160,9 @@ fn visible_subcommands(cmd: &Command) -> impl Iterator<Item = &Command> {
     cmd.get_subcommands().filter(|c| !c.is_hide_set())
 }
 
-/// How the argument is written on the command line, such as
-/// `-o, --output <OUTPUT>` or `-- <COMMAND>...`.
-fn arg_form(arg: &Arg) -> String {
-    let value = value_form(arg);
-    if arg.is_positional() {
-        return if arg.is_last_set() {
-            format!("-- {value}")
-        } else {
-            value
-        };
-    }
+/// How the flag is written on the command line, such as `--name <NAME>`.
+/// Allowed values replace the placeholder, as in `-o, --output <table|json>`.
+fn flag_form(arg: &Arg) -> String {
     let mut form = String::new();
     if let Some(short) = arg.get_short() {
         let _ = write!(form, "-{short}");
@@ -188,23 +173,42 @@ fn arg_form(arg: &Arg) -> String {
     if let Some(long) = arg.get_long() {
         let _ = write!(form, "--{long}");
     }
+    let value = value_form(arg);
     if !value.is_empty() {
         let _ = write!(form, " {value}");
     }
     form
 }
 
-/// Value placeholder for an argument, such as `<NAME>`, `[<COUNT>]`, or
-/// `<COMMAND>...`. Empty for flags that take no value.
+/// The shortest unambiguous name for an argument, such as `--output` or
+/// `<COMMAND>`.
+fn arg_name(arg: &Arg) -> String {
+    arg.get_long().map_or_else(
+        || {
+            arg.get_short()
+                .map_or_else(|| value_form(arg), |short| format!("-{short}"))
+        },
+        |long| format!("--{long}"),
+    )
+}
+
+/// Value placeholder for an argument, such as `<NAME>`, `[<COUNT>]`,
+/// `<COMMAND>...`, or `<table|json>` when the values are fixed. Empty for
+/// flags that take no value.
 fn value_form(arg: &Arg) -> String {
     if !arg.get_action().takes_values() {
         return String::new();
     }
-    // clap's own help falls back to the argument id when no value name is set.
-    let names = arg.get_value_names().map_or_else(
-        || vec![arg.get_id().to_string()],
-        |names| names.iter().map(ToString::to_string).collect(),
-    );
+    let values = possible_values(arg);
+    let names = if values.is_empty() {
+        // clap's own help falls back to the argument id when no value name is set.
+        arg.get_value_names().map_or_else(
+            || vec![arg.get_id().to_string()],
+            |names| names.iter().map(ToString::to_string).collect(),
+        )
+    } else {
+        vec![values.join("|")]
+    };
     let mut value = names
         .iter()
         .map(|name| format!("<{name}>"))
@@ -220,24 +224,21 @@ fn value_form(arg: &Arg) -> String {
     value
 }
 
-fn arg_tags(arg: &Arg) -> Vec<String> {
+fn possible_values(arg: &Arg) -> Vec<String> {
+    if arg.is_hide_possible_values_set() {
+        return Vec::new();
+    }
+    arg.get_possible_values()
+        .into_iter()
+        .filter(|value| !value.is_hide_set())
+        .map(|value| value.get_name().to_string())
+        .collect()
+}
+
+fn flag_tags(cmd: &Command, arg: &Arg) -> Vec<String> {
     let mut tags = Vec::new();
-    if arg.is_required_set() {
-        tags.push("required".to_string());
-    }
-    if !arg.is_positional() && matches!(arg.get_action(), ArgAction::Append | ArgAction::Count) {
+    if matches!(arg.get_action(), ArgAction::Append | ArgAction::Count) {
         tags.push("repeatable".to_string());
-    }
-    if !arg.is_hide_possible_values_set() {
-        let values = arg
-            .get_possible_values()
-            .into_iter()
-            .filter(|value| !value.is_hide_set())
-            .map(|value| value.get_name().to_string())
-            .collect::<Vec<_>>();
-        if !values.is_empty() {
-            tags.push(format!("values: {}", values.join(", ")));
-        }
     }
     if arg.get_action().takes_values() && !arg.is_hide_default_value_set() {
         let defaults = arg
@@ -255,7 +256,34 @@ fn arg_tags(arg: &Arg) -> Vec<String> {
     {
         tags.push(format!("env: {}", env.to_string_lossy()));
     }
+    let conflicts = conflicts(cmd, arg);
+    if !conflicts.is_empty() {
+        tags.push(format!("conflicts: {}", conflicts.join(", ")));
+    }
     tags
+}
+
+/// Visible arguments of `cmd` that cannot be combined with `arg`, in
+/// definition order. clap records a conflict on one side only, so both
+/// directions are checked.
+fn conflicts(cmd: &Command, arg: &Arg) -> Vec<String> {
+    if arg.is_global_set() {
+        return Vec::new();
+    }
+    let declared = cmd.get_arg_conflicts_with(arg);
+    cmd.get_arguments()
+        .filter(|other| {
+            other.get_id() != arg.get_id() && !other.is_global_set() && is_documented(other)
+        })
+        .filter(|other| {
+            declared.iter().any(|d| d.get_id() == other.get_id())
+                || cmd
+                    .get_arg_conflicts_with(other)
+                    .iter()
+                    .any(|d| d.get_id() == arg.get_id())
+        })
+        .map(arg_name)
+        .collect()
 }
 
 /// Example invocations from the command's after-help text. Every example
@@ -343,6 +371,13 @@ mod tests {
                                     .long_help("Box size.\n\nLarger boxes take longer."),
                             )
                             .arg(
+                                Arg::new("empty")
+                                    .long("empty")
+                                    .action(ArgAction::SetTrue)
+                                    .conflicts_with("size")
+                                    .help("Create without contents."),
+                            )
+                            .arg(
                                 Arg::new("legacy")
                                     .long("legacy")
                                     .action(ArgAction::SetTrue)
@@ -382,7 +417,9 @@ mod tests {
             "{text}"
         );
         assert!(
-            text.contains("## Global flags\n\n  -p, --profile <profile>  Profile to use. [env: TOOL_PROFILE]\n"),
+            text.contains(
+                "## Global flags\n\n  -p, --profile <profile>  Profile to use.  [env: TOOL_PROFILE]\n"
+            ),
             "{text}"
         );
         assert_eq!(text.matches("--profile").count(), 1, "{text}");
@@ -393,21 +430,21 @@ mod tests {
         let text = render_context(&fixture());
 
         assert!(
-            text.contains("## box: Manage boxes. (alias: bx)\n"),
+            text.contains("## box: Manage boxes. (alias: bx)\n\n"),
             "{text}"
         );
         assert!(
             text.contains(
-                "\ntool box create [OPTIONS] <name> [-- <command>...]\n  Create a box. The box starts empty.\n"
+                "\ntool box create [OPTIONS] <name> [-- <command>...]  # Create a box.\n"
             ),
             "{text}"
         );
         assert!(
-            text.contains("\ntool box list [OPTIONS]\n  List boxes.\n"),
+            text.contains("\ntool box list [OPTIONS]  # List boxes.\n"),
             "{text}"
         );
         assert!(
-            text.contains("\ntool box shelf add [OPTIONS]\n  Add a shelf.\n"),
+            text.contains("\ntool box shelf add [OPTIONS]  # Add a shelf.\n"),
             "{text}"
         );
         // A top-level leaf shows its summary once, in the heading.
@@ -419,21 +456,24 @@ mod tests {
     }
 
     #[test]
-    fn describes_each_argument_on_one_line() {
+    fn lists_each_flag_with_values_and_tags_but_no_description() {
         let text = render_context(&fixture());
 
         for line in [
-            "  Create a box. The box starts empty.",
-            "  <name>                 Box name. [required]",
-            "  -o, --output <output>  Output format. [values: table, json] [default: table]",
-            "  --label <label>        Label to add. [repeatable]",
-            "  --size <size>          Box size. Larger boxes take longer.",
-            "  -- <command>...        Command to run.",
+            "  -o, --output <table|json>  [default: table]",
+            "  --label <label>  [repeatable]",
+            "  --size <size>  [conflicts: --empty]",
+            "  --empty  [conflicts: --size]",
         ] {
             assert!(
-                text.contains(&format!("{line}\n")),
+                text.contains(&format!("\n{line}\n")),
                 "missing {line:?}:\n{text}"
             );
+        }
+        // Positional arguments appear only in the usage line, and flag
+        // descriptions are left to `--help`.
+        for absent in ["  <name>", "  -- <command>", "Box size.", "Label to add."] {
+            assert!(!text.contains(absent), "unexpected {absent:?}:\n{text}");
         }
     }
 

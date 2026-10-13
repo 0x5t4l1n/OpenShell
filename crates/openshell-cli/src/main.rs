@@ -1448,13 +1448,14 @@ enum GatewayCommands {
 
 #[derive(Subcommand, Debug)]
 enum AgentCommands {
-    /// Print a compact reference of every command and flag for coding agents.
+    /// Print a map of every command and flag for coding agents.
     ///
-    /// Lists each command with its usage line and description, and each flag
-    /// with its description, allowed values, default, and environment
-    /// variable. The reference is generated from this binary's command
-    /// definitions, so it always matches the installed version. Use `--help`
-    /// on a command for flag constraints, such as which flags conflict.
+    /// Lists each command with its usage line and summary, and each flag with
+    /// its allowed values, default, environment variable, and the flags it
+    /// cannot be combined with. The map is generated from this binary's
+    /// command definitions, so it always matches the installed version, and
+    /// it is sized to fit in a single agent tool call. Use `--help` on a
+    /// command for flag descriptions.
     #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
     Context,
 }
