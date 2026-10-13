@@ -80,7 +80,7 @@ OpenShell keeps skills for using the product separate from skills for developing
 
 ### Skills for Using OpenShell
 
-Public skills live in `skills/` and work without an OpenShell source checkout. Install them with `npx skills add NVIDIA/OpenShell`.
+Public skills live in `skills/` and work without an OpenShell source checkout. Install them with `npx skills add NVIDIA/OpenShell`, or add a release tag to match an installed CLI: `npx skills add NVIDIA/OpenShell#<release-tag>`.
 
 | Skill | Purpose |
 | --- | --- |
