@@ -8769,6 +8769,7 @@ mod tests {
         let mut policy = openshell_policy::restrictive_default_policy();
         policy.ui = Some(openshell_core::proto::UiPolicy::default());
         global_policy.ui = policy.ui;
+        openshell_core::policy_identity::stamp_global_token_grant_owners(&mut global_policy);
         let sandbox = test_sandbox("create-global", "create-global", policy, Vec::new());
         let inputs = resolve_sandbox_create_runtime_inputs(state.as_ref(), &sandbox)
             .await
