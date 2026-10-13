@@ -367,6 +367,9 @@ credentials:
     description: API access token
     env_vars: [CUSTOM_API_TOKEN]
     required: true
+    # Optional mode for external credential updaters that need one opaque
+    # placeholder to survive value-only provider revisions.
+    stable_placeholder: false
 
     # Accepted values: basic, bearer, header, query, path.
     # These fields describe static credential placement.
@@ -750,6 +753,22 @@ OpenShell skips expired provider credentials when it builds a sandbox provider e
 
 The gateway sends a complete host, port, and path binding for every emitted static credential key. It derives bindings from profile endpoints or explicit sandbox policy endpoints for endpointless profiles. It withholds static credential keys from endpointless selected profiles that have no explicit policy binding. Supervisors reject other incomplete binding metadata and clear previously active provider material when a refresh fails validation. Refer to [Static Credential Endpoint Binding](#understand-static-credential-endpoint-binding) for matching, denial, lifecycle, and migration behavior.
 
+### Keep an Externally Updated Placeholder Stable
+
+An MCP client may configure its caller-assertion header once at startup using the reference supplied by OpenShell. A host service rotates the assertion and updates the provider before the old assertion expires. The client needs its next request to use the new assertion without restarting or reloading its environment reference. Gateway-managed token refresh already provides this continuity; `stable_placeholder` extends it to externally supplied static credentials.
+
+Set `stable_placeholder: true` on a credential only when an external updater requires the workload to keep one opaque placeholder across value-only `provider update` revisions. Declare at least one `env_vars` alias for that credential. OpenShell still classifies the value as secret and resolves it only for hosts, ports, and paths in the credential's effective endpoint binding. An endpointless profile therefore needs an explicit sandbox-policy `credential_binding` before the gateway emits this metadata.
+
+The setting defaults to `false`, preserving existing revision-scoped behavior. Ordinary credentials continue to work with older gateways. To enable stable placeholders, use a supporting gateway, supervisor, and profile client. The CLI and Go SDK check gateway support before importing or updating an opted-in profile; a failed support check leaves the profile unchanged. Raw API clients must check `LintProviderProfilesResponse.supports_stable_placeholder` before enabling the setting.
+
+The gateway withholds opted-in credentials from supervisors that do not advertise support. Once a supervisor activates an external stable credential, a gateway response without support acknowledgment revokes static credentials instead of switching to revision-scoped delivery. This requirement survives failed refreshes and clears when an acknowledged snapshot removes the last external stable credential. Keep a supporting gateway for startup and supervisor reconstruction: older binaries can discard unknown profile fields, so an empty stable-key list on first contact does not prove support. Remove the opt-in and activate that change before downgrading the gateway.
+
+Use the environment value issued by the supervisor. Do not construct a resolver string or a canonical environment-name alias. Once the supervisor installs a value update, the next request from a process holding its original placeholder resolves the current value. Saving the provider update alone does not establish supervisor activation. Expiry or an activated detach prevents the placeholder from resolving a credential.
+
+The supervisor resolves the placeholder outside the workload. The sandbox receives the prepared environment through its authenticated boundary; the credential value remains with the supervisor.
+
+The opaque placeholder is tied to the sandbox, provider instance, credential key, and effective endpoint binding. Updating only the credential value preserves the placeholder. Replacing the provider or changing its endpoint binding produces a new placeholder, so a running process cannot use its old placeholder for the replacement credential. Use the default `false` when value-only continuity is unnecessary. Profiles cannot combine `stable_placeholder: true` with gateway-managed refresh, credentials produced as another credential's refresh outputs, or `token_grant` because those credentials have a different lifecycle owner.
+
 ## Configure Credential Refresh
 
 Refresh configuration is stored separately from the current injectable credential value. Non-secret refresh configuration remains in the refresh-state record. Secret material is resolved from the active credential driver only while the gateway mints a new short-lived token. The gateway writes the token back through credential storage and updates credential expiry metadata. If an OAuth issuer rotates its refresh token, the gateway stages the replacement through credential storage before committing the refresh generation and removes the previous handle afterward.
@@ -762,12 +781,21 @@ bodies. The recovery actions are:
 - `retry`: a network, rate-limit, or temporary issuer failure; the worker retries automatically.
 - `reauthorize`: a user refresh grant is no longer usable, such as `invalid_grant`; obtain a new grant and run `provider refresh configure`.
 - `fix_configuration`: the OAuth client, scopes, grant type, or administrator policy must be corrected.
-- `investigate`: the issuer returned an unrecognized response; the worker retries, but the operator should investigate persistent failures.
+- `investigate`: an unrecognized issuer response or an interrupted mint requires investigation. The worker retries unrecognized issuer responses, but it does not retry an interrupted mint with an uncertain outcome.
 
 The gateway parks `reauthorize` and `fix_configuration` failures instead of
 retrying them every worker tick. A manual `provider refresh rotate` still
 attempts the exchange. The current access token remains available only until
 its recorded expiry, after which credential resolution fails closed.
+
+The `refresh_in_progress` and `refresh_committing` statuses can indicate active
+work. Check gateway health and status again; concurrent refresh requests wait
+for the active mint. If a gateway interruption leaves either marker behind and
+rotation reports an uncertain previous mint, investigate the issuer state and
+run `provider refresh configure` with a valid grant. Obtain a new OAuth grant
+first if the previous refresh token may have been consumed. Repeated rotation
+or direct marker edits cannot recover it. Reconfiguration revokes previous
+workload handles, so restart processes holding them.
 
 Before OpenShell 0.1.0, refresh-state and credential-driver migrations are not
 supported. Upgrading from a build that stored refresh material inline requires

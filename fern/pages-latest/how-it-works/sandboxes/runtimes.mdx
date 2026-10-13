@@ -28,9 +28,14 @@ the sandbox record and driver-supported persistent storage.
 Set `compute_driver` in the gateway TOML file. A gateway uses one driver at a time.
 
 ```toml
+[openshell]
+version = 2
+
 [openshell.gateway]
 compute_driver = "docker"
 ```
+
+Every gateway TOML file must start with the `[openshell]` table and `version = 2`, or `openshell-gateway config preflight` rejects it with `missing_version`. The remaining examples on this page show only the tables they change.
 
 When `compute_driver` is unset, the gateway auto-detects Kubernetes, then Podman, then Docker. The VM driver is never auto-detected.
 
@@ -218,6 +223,8 @@ You can also set `OPENSHELL_COMPUTE_DRIVER=vm` in the gateway environment.
 Common options in `[openshell.drivers.vm]` are `default_image`, `bootstrap_image`, `vcpus`, `mem_mib`, `overlay_disk_mib`, `state_dir`, and `grpc_endpoint`. The default image is `nvcr.io/nvidia/base/ubuntu:24.04`. Use an image that includes the agents and tools your workloads need.
 
 The driver looks up sandbox images in local Docker or Podman before pulling from a registry. On Linux with Podman, start `podman.socket` so the driver can find local images.
+
+Registry downloads must match the resolved image digest, including the selected platform for multi-platform images. A mismatch fails image preparation. After upgrading, the driver rebuilds older bootstrap and prepared-image cache entries on first use, so the first sandbox start can take longer.
 
 VM sandboxes have no network interface. All traffic flows through the OpenShell supervisor on the host. For networks that require a corporate proxy, the VM driver accepts the same `https_proxy` and `proxy_*` options as Podman. To reach a proxy on the gateway host, use `http://host.openshell.internal:<port>`.
 
