@@ -177,7 +177,7 @@ fn tcp_table(address_family: u32) -> Result<(Vec<u32>, usize)> {
     for _ in 0..3 {
         let mut buffer = vec![0u32; (byte_len as usize).div_ceil(size_of::<u32>()).max(1)];
         let mut actual_len = u32::try_from(buffer.len() * size_of::<u32>())
-            .map_err(|_| format!("TCP table buffer is too large"))?;
+            .map_err(|_| "TCP table buffer is too large".to_string())?;
         // SAFETY: The u32-backed buffer has sufficient alignment and capacity
         // for the requested byte count. The API writes at most `actual_len`
         // bytes and updates it when the table grows concurrently.
@@ -203,9 +203,7 @@ fn tcp_table(address_family: u32) -> Result<(Vec<u32>, usize)> {
         byte_len = actual_len;
     }
 
-    Err(format!(
-        "GetExtendedTcpTable changed size during three consecutive reads"
-    ))
+    Err("GetExtendedTcpTable changed size during three consecutive reads".to_string())
 }
 
 fn table_rows<T: Copy>(
@@ -215,7 +213,7 @@ fn table_rows<T: Copy>(
     row_stride: usize,
 ) -> Result<Vec<T>> {
     if byte_len < size_of::<u32>() {
-        return Err(format!("Windows TCP table is missing its header"));
+        return Err("Windows TCP table is missing its header".to_string());
     }
     if row_stride < size_of::<T>() {
         return Err(format!(
@@ -231,10 +229,10 @@ fn table_rows<T: Copy>(
             .checked_add(
                 (count - 1)
                     .checked_mul(row_stride)
-                    .ok_or_else(|| format!("Windows TCP row count overflow"))?,
+                    .ok_or_else(|| "Windows TCP row count overflow".to_string())?,
             )
             .and_then(|last_row| last_row.checked_add(size_of::<T>()))
-            .ok_or_else(|| format!("Windows TCP table size overflow"))?
+            .ok_or_else(|| "Windows TCP table size overflow".to_string())?
     };
     if required > byte_len || required > size_of_val(buffer) {
         return Err(format!(
