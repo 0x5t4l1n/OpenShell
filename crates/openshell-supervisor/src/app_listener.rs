@@ -110,8 +110,17 @@ fn valid_label(label: &str) -> bool {
 #[derive(Clone, Default)]
 struct Snapshot {
     routes: BTreeMap<String, SandboxServiceRoute>,
+    generations: BTreeMap<String, u64>,
+    next_generation: u64,
     expires: Option<Instant>,
+    // Whole-sandbox suspension fence, independent of individual service edits.
     epoch: u64,
+}
+
+#[derive(Clone, Copy)]
+struct RouteToken {
+    epoch: u64,
+    generation: u64,
 }
 
 /// Shared by policy reconciliation and ingress. Only accepted configuration
@@ -164,10 +173,31 @@ impl Routes {
         }
         let changed = self.sender.borrow().routes != routes;
         self.sender.send_modify(|snapshot| {
-            if changed {
+            // Renewal after a lapse cannot revive a connection whose lease expired.
+            if snapshot
+                .expires
+                .is_some_and(|expiry| expiry <= Instant::now())
+            {
                 snapshot.epoch = snapshot.epoch.wrapping_add(1);
             }
+            let generations = routes
+                .iter()
+                .map(|(name, route)| {
+                    let previous = (snapshot.routes.get(name) == Some(route))
+                        .then(|| snapshot.generations.get(name).copied())
+                        .flatten();
+                    let generation = previous.unwrap_or_else(|| {
+                        snapshot.next_generation = snapshot
+                            .next_generation
+                            .checked_add(1)
+                            .expect("app route generation exhausted");
+                        snapshot.next_generation
+                    });
+                    (name.clone(), generation)
+                })
+                .collect();
             snapshot.routes = routes;
+            snapshot.generations = generations;
             snapshot.expires = Some(Instant::now() + FRESHNESS);
         });
         if changed {
@@ -184,12 +214,18 @@ impl Routes {
     pub(crate) fn suspend(&self) {
         self.sender.send_modify(|snapshot| {
             snapshot.routes.clear();
+            snapshot.generations.clear();
             snapshot.expires = None;
             snapshot.epoch = snapshot.epoch.wrapping_add(1);
         });
     }
 
-    fn resolve(&self, sni: &str, prefix: &str, domain: &str) -> Option<(SandboxServiceRoute, u64)> {
+    fn resolve(
+        &self,
+        sni: &str,
+        prefix: &str,
+        domain: &str,
+    ) -> Option<(SandboxServiceRoute, RouteToken)> {
         let encoded = sni.strip_suffix(&format!(".{domain}"))?;
         let service = if encoded == prefix {
             ""
@@ -200,19 +236,24 @@ impl Routes {
         if snapshot.expires? <= Instant::now() {
             return None;
         }
-        snapshot
-            .routes
-            .get(service)
-            .cloned()
-            .map(|route| (route, snapshot.epoch))
+        Some((
+            snapshot.routes.get(service)?.clone(),
+            RouteToken {
+                epoch: snapshot.epoch,
+                generation: *snapshot.generations.get(service)?,
+            },
+        ))
     }
 
-    async fn revoked(&self, route: &SandboxServiceRoute, epoch: u64) {
+    async fn revoked(&self, route: &SandboxServiceRoute, token: RouteToken) {
         let mut receiver = self.sender.subscribe();
         loop {
             let expiry = {
                 let snapshot = receiver.borrow_and_update();
-                if snapshot.epoch != epoch || snapshot.routes.get(&route.name) != Some(route) {
+                if snapshot.epoch != token.epoch
+                    || snapshot.generations.get(&route.name) != Some(&token.generation)
+                    || snapshot.routes.get(&route.name) != Some(route)
+                {
                     return;
                 }
                 let Some(expiry) = snapshot.expires else {
@@ -297,14 +338,14 @@ impl BoundListener {
                             let Some(sni) = tls.get_ref().1.server_name().map(str::to_ascii_lowercase) else {
                                 emit_denial("App listener missing SNI"); return;
                             };
-                            let Some((route, epoch)) = routes.resolve(&sni, &prefix, &domain) else {
+                            let Some((route, token)) = routes.resolve(&sni, &prefix, &domain) else {
                                 emit_denial("App listener unknown or expired SNI route"); return;
                             };
                             let connection_routes = routes.clone();
                             let connection_route = route.clone();
                             let permit = Arc::new(permit);
                             let service = hyper::service::service_fn(move |req| {
-                                proxy(req, sni.clone(), route.clone(), routes.clone(), connector.clone(), permit.clone(), epoch)
+                                proxy(req, sni.clone(), route.clone(), routes.clone(), connector.clone(), permit.clone(), token)
                             });
                             let connection = hyper::server::conn::http1::Builder::new()
                                 .timer(TokioTimer::new()).header_read_timeout(HANDSHAKE_TIMEOUT)
@@ -312,7 +353,7 @@ impl BoundListener {
                                 .serve_connection(TokioIo::new(tls), service).with_upgrades();
                             tokio::select! {
                                 _ = connection => {},
-                                () = connection_routes.revoked(&connection_route, epoch) => {},
+                                () = connection_routes.revoked(&connection_route, token) => {},
                             }
                         });
                     }
@@ -531,7 +572,7 @@ async fn proxy(
     routes: Routes,
     connector: Arc<dyn BoundaryLoopbackConnector>,
     permit: Arc<tokio::sync::OwnedSemaphorePermit>,
-    epoch: u64,
+    token: RouteToken,
 ) -> std::result::Result<Response<Body>, std::convert::Infallible> {
     if !authority_matches(&req, &sni) {
         return Ok(error(StatusCode::MISDIRECTED_REQUEST));
@@ -590,7 +631,7 @@ async fn proxy(
                         let _ = tokio::io::copy_bidirectional(&mut TokioIo::new(upstream), &mut TokioIo::new(downstream)).await;
                     }
                 } => {},
-                () = routes.revoked(&route, epoch) => {},
+                () = routes.revoked(&route, token) => {},
             }
             upstream_task.abort();
         });
@@ -610,6 +651,28 @@ mod tests {
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
     const HOST: &str = "default--sandbox-a--web.svc.openshell.internal";
+
+    fn installed(routes: Vec<SandboxServiceRoute>) -> SettingsPollResult {
+        SettingsPollResult {
+            service_routes: routes,
+            configuration_instance_id: "runtime-a".into(),
+            configuration_admitted: true,
+            configuration_error: String::new(),
+            policy: None,
+            version: 1,
+            policy_hash: String::new(),
+            config_revision: 1,
+            policy_source: openshell_core::proto::PolicySource::Unspecified,
+            settings: std::collections::HashMap::default(),
+            global_policy_version: 0,
+            provider_env_revision: 0,
+            provider_attachment_epoch: String::new(),
+            supervisor_middleware_services: Vec::new(),
+            workspace: "default".into(),
+            policy_validation_failure_mode: openshell_core::PolicyValidationFailureMode::default(),
+            extension_authentication_enabled: false,
+        }
+    }
 
     struct Connector {
         calls: AtomicUsize,
@@ -719,11 +782,7 @@ mod tests {
             authorization_mode: 1,
             resource_version: 1,
         };
-        routes.sender.send_replace(Snapshot {
-            routes: BTreeMap::from([("web".into(), route.clone())]),
-            expires: Some(Instant::now() + FRESHNESS),
-            epoch: 1,
-        });
+        routes.install(&installed(vec![route.clone()]));
         let connector = Arc::new(Connector {
             calls: AtomicUsize::new(0),
         });
@@ -824,16 +883,16 @@ mod tests {
     #[tokio::test]
     async fn withdrawn_and_expired_routes_never_dial_boundary() {
         let f = fixture().await;
-        let old_epoch = f.routes.sender.borrow().epoch;
+        let (_, old_token) = f
+            .routes
+            .resolve(HOST, "default--sandbox-a", "svc.openshell.internal")
+            .unwrap();
         f.routes.suspend();
-        f.routes.sender.send_modify(|snapshot| {
-            snapshot.routes.insert("web".into(), f.route.clone());
-            snapshot.expires = Some(Instant::now() + FRESHNESS);
-        });
+        f.routes.install(&installed(vec![f.route.clone()]));
         // Even a quickly restored identical route cannot revive an old stream.
         tokio::time::timeout(
             Duration::from_secs(1),
-            f.routes.revoked(&f.route, old_epoch),
+            f.routes.revoked(&f.route, old_token),
         )
         .await
         .unwrap();
@@ -896,6 +955,111 @@ mod tests {
             .unwrap();
         assert!(closed.is_none() || closed.unwrap().is_err());
         assert_eq!(f.connector.calls.load(Ordering::SeqCst), 1);
+    }
+
+    type TestWebSocket =
+        tokio_tungstenite::WebSocketStream<tokio_rustls::client::TlsStream<tokio::net::TcpStream>>;
+
+    async fn websocket(f: &Fixture, service: &str) -> TestWebSocket {
+        let host = format!("default--sandbox-a--{service}.svc.openshell.internal");
+        let stream = openshell_core::net::connect_tcp_nodelay_best_effort(&[f.address])
+            .await
+            .unwrap();
+        let name = rustls::pki_types::ServerName::try_from(host.clone()).unwrap();
+        let tls = tokio_rustls::TlsConnector::from(f.tls.clone())
+            .connect(name, stream)
+            .await
+            .unwrap();
+        tokio_tungstenite::client_async(format!("wss://{host}/echo"), tls)
+            .await
+            .unwrap()
+            .0
+    }
+
+    async fn echo(ws: &mut TestWebSocket, value: &str) {
+        ws.send(tokio_tungstenite::tungstenite::Message::Text(value.into()))
+            .await
+            .unwrap();
+        let echoed = tokio::time::timeout(Duration::from_secs(2), ws.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(echoed.to_text().unwrap(), value);
+    }
+
+    async fn closed(ws: &mut TestWebSocket) {
+        let next = tokio::time::timeout(Duration::from_secs(2), ws.next())
+            .await
+            .expect("revoked WebSocket must close");
+        assert!(next.is_none() || next.unwrap().is_err());
+    }
+
+    #[tokio::test]
+    async fn service_edits_close_only_affected_websockets() {
+        let f = fixture().await;
+        let mut web = websocket(&f, "web").await;
+        let mut portal = SandboxServiceRoute {
+            endpoint_id: "portal-id".into(),
+            name: "portal".into(),
+            ..f.route.clone()
+        };
+        f.routes
+            .install(&installed(vec![f.route.clone(), portal.clone()]));
+        echo(&mut web, "web survives portal addition").await;
+        let mut portal_ws = websocket(&f, "portal").await;
+        echo(&mut portal_ws, "portal active").await;
+
+        // Renewing identical declarations does not revoke either stream.
+        f.routes
+            .install(&installed(vec![f.route.clone(), portal.clone()]));
+        echo(&mut web, "web renewed").await;
+        echo(&mut portal_ws, "portal renewed").await;
+
+        portal.authorization_mode = 2;
+        portal.resource_version += 1;
+        f.routes
+            .install(&installed(vec![f.route.clone(), portal.clone()]));
+        closed(&mut portal_ws).await;
+        echo(&mut web, "web survives portal edit").await;
+
+        let mut portal_ws = websocket(&f, "portal").await;
+        f.routes.install(&installed(vec![f.route.clone()]));
+        closed(&mut portal_ws).await;
+        echo(&mut web, "web survives portal deletion").await;
+
+        f.routes.install(&installed(vec![f.route.clone(), portal]));
+        let mut portal_ws = websocket(&f, "portal").await;
+        f.routes.suspend();
+        closed(&mut web).await;
+        closed(&mut portal_ws).await;
+    }
+
+    #[tokio::test]
+    async fn coalesced_recreation_and_lease_lapse_cannot_revive_old_streams() {
+        let f = fixture().await;
+        let (_, original) = f
+            .routes
+            .resolve(HOST, "default--sandbox-a", "svc.openshell.internal")
+            .unwrap();
+        // Both updates can occur before a watch receiver observes either one.
+        f.routes.install(&installed(Vec::new()));
+        f.routes.install(&installed(vec![f.route.clone()]));
+        tokio::time::timeout(Duration::from_secs(1), f.routes.revoked(&f.route, original))
+            .await
+            .unwrap();
+
+        let (_, renewed) = f
+            .routes
+            .resolve(HOST, "default--sandbox-a", "svc.openshell.internal")
+            .unwrap();
+        f.routes.sender.send_modify(|snapshot| {
+            snapshot.expires = Some(Instant::now() - Duration::from_secs(1));
+        });
+        f.routes.install(&installed(vec![f.route.clone()]));
+        tokio::time::timeout(Duration::from_secs(1), f.routes.revoked(&f.route, renewed))
+            .await
+            .unwrap();
     }
     #[tokio::test]
     async fn advertisements_follow_installed_routes_and_withdrawal() {
