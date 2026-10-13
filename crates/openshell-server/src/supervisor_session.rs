@@ -607,6 +607,15 @@ impl SupervisorSessionRegistry {
             .is_some_and(|session| session.runtime_ready)
     }
 
+    /// Whether this session already persisted its runtime readiness.
+    pub(crate) fn is_session_runtime_ready(&self, sandbox_id: &str, session_id: &str) -> bool {
+        self.sessions
+            .lock()
+            .unwrap()
+            .get(sandbox_id)
+            .is_some_and(|session| session.session_id == session_id && session.runtime_ready)
+    }
+
     fn mark_runtime_ready(&self, sandbox_id: &str, session_id: &str) -> bool {
         let mut sessions = self.sessions.lock().unwrap();
         let Some(session) = sessions.get_mut(sandbox_id) else {
@@ -3087,6 +3096,15 @@ async fn handle_supervisor_message(
             config_session::handle_config_update_result(session, &result).await;
         }
         Some(supervisor_message::Payload::RuntimeReady(_)) => {
+            // A supervisor reports readiness again after every accepted
+            // admission. This session's readiness is already durable, so
+            // persisting it again would only take the sandbox lock.
+            if state
+                .supervisor_sessions
+                .is_session_runtime_ready(sandbox_id, session_id)
+            {
+                return;
+            }
             // A polling session has no streamed admission to require.
             if !mark_supervisor_initialized(
                 state,

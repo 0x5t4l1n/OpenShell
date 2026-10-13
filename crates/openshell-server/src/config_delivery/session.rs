@@ -3761,6 +3761,49 @@ BEGIN SELECT RAISE(ABORT, 'database unavailable'); END;
     }
 
     #[tokio::test]
+    async fn repeated_runtime_readiness_is_not_persisted_again() {
+        let sandbox_id = "sb-ready-repeat";
+        let state = state_with_sandbox(sandbox_id).await;
+        let mut harness = crate::grpc::test_support::connect_supervisor_stream(
+            &state,
+            sandbox_id,
+            StreamFeatures::Apply,
+        )
+        .await
+        .expect("supervisor connects");
+        first_gateway_message(&mut harness).await;
+        let runtime_ready = || SupervisorMessage {
+            payload: Some(supervisor_message::Payload::RuntimeReady(
+                openshell_core::proto::SupervisorRuntimeReady {},
+            )),
+        };
+        harness.outbound.send(runtime_ready()).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !state.supervisor_sessions.is_runtime_ready(sandbox_id) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("first readiness report is persisted");
+        let resource_version = || async {
+            state
+                .store
+                .get_message::<Sandbox>(sandbox_id)
+                .await
+                .unwrap()
+                .and_then(|sandbox| sandbox.metadata.map(|metadata| metadata.resource_version))
+        };
+        let before = resource_version().await;
+
+        // Supervisors report readiness again after every accepted admission.
+        for _ in 0..3 {
+            harness.outbound.send(runtime_ready()).await.unwrap();
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(resource_version().await, before);
+    }
+
+    #[tokio::test]
     async fn polling_reconnect_after_workload_start_is_ready_on_accept() {
         let state = state_with_sandbox("sb-poll-running").await;
         let mut harness = crate::grpc::test_support::connect_supervisor_stream(
