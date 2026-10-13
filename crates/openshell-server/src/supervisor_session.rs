@@ -43,6 +43,17 @@ use crate::supervisor_owner::{
 };
 
 const HEARTBEAT_INTERVAL_SECS: u32 = 15;
+// Header-only probes intentionally close the bridge before application bodies
+// finish. Preserve diagnostics without warning on routine probe cancellation.
+macro_rules! relay_bridge_warn {
+    ($health_check:expr, $($fields:tt)*) => {
+        if $health_check {
+            debug!($($fields)*);
+        } else {
+            warn!($($fields)*);
+        }
+    };
+}
 const OWNER_RENEW_TIMEOUT: Duration = Duration::from_secs(5);
 const RELAY_PENDING_TIMEOUT: Duration = Duration::from_secs(10);
 /// How long a stopping replica waits for a redirected supervisor to publish its
@@ -1258,6 +1269,7 @@ async fn handle_relay_stream_inner(
     let claimed = registry.claim_relay(&channel_id, principal.as_ref())?;
     let sandbox_id = claimed.sandbox_id;
     let supervisor_side = claimed.stream;
+    let health_check = claimed.health_check;
     if claimed.health_check {
         debug!(channel_id = %channel_id, sandbox_id = %sandbox_id, "HTTP health check: bridging relay");
     } else {
@@ -1286,13 +1298,15 @@ async fn handle_relay_stream_inner(
                     if let Err(e) =
                         tokio::io::AsyncWriteExt::write_all(&mut write_half, &data).await
                     {
-                        warn!(channel_id = %channel_id_in, error = %e, "relay stream: write to duplex failed");
+                        relay_bridge_warn!(health_check, sandbox_id = %sandbox_id_in, channel_id = %channel_id_in, error = %e, "relay stream: write to duplex failed");
                         break;
                     }
                 }
                 Ok(None) => break,
                 Err(e) => {
-                    if let Some(state) = state_in.as_ref()
+                    if health_check {
+                        debug!(sandbox_id = %sandbox_id_in, channel_id = %channel_id_in, error = %e, "relay stream: health check inbound closed");
+                    } else if let Some(state) = state_in.as_ref()
                         && expected_transport_close_during_sandbox_teardown(
                             state,
                             &sandbox_id_in,
@@ -1336,7 +1350,7 @@ async fn handle_relay_stream_inner(
                     }
                 }
                 Err(e) => {
-                    warn!(channel_id = %channel_id_out, error = %e, "relay stream: read from duplex failed");
+                    relay_bridge_warn!(health_check, channel_id = %channel_id_out, error = %e, "relay stream: read from duplex failed");
                     break;
                 }
             }
@@ -1941,6 +1955,7 @@ async fn connect_peer_relay(
     sandbox_id: &str,
     relay_open: RelayOpen,
 ) -> Result<tokio::io::DuplexStream, Status> {
+    let health_check = relay_open.health_check;
     let mut timer = RoutedRequestTimer::relay(relay_kind(&relay_open), RelayRoute::Peer);
     let token = state
         .peer_routes
@@ -1983,7 +1998,13 @@ async fn connect_peer_relay(
     })?;
     let inbound = response.into_inner();
     let (gateway_stream, bridge_stream) = tokio::io::duplex(64 * 1024);
-    spawn_peer_bridge(bridge_stream, inbound, out_tx, sandbox_id.to_string());
+    spawn_peer_bridge(
+        bridge_stream,
+        inbound,
+        out_tx,
+        sandbox_id.to_string(),
+        health_check,
+    );
     Ok(gateway_stream)
 }
 
@@ -2042,6 +2063,7 @@ pub async fn handle_peer_relay(
         );
     }
 
+    let health_check = relay_open.health_check;
     let (channel_id, relay_rx) = state
         .supervisor_sessions
         .open_relay_with_message(&init.sandbox_id, relay_open, Duration::from_secs(5))
@@ -2060,6 +2082,7 @@ pub async fn handle_peer_relay(
         out_tx,
         init.sandbox_id,
         channel_id,
+        health_check,
     );
     let stream: Pin<
         Box<dyn tokio_stream::Stream<Item = Result<PeerRelayFrame, Status>> + Send + 'static>,
@@ -2072,6 +2095,7 @@ fn spawn_peer_bridge(
     mut inbound: tonic::Streaming<PeerRelayFrame>,
     out_tx: mpsc::Sender<PeerRelayFrame>,
     sandbox_id: String,
+    health_check: bool,
 ) {
     let (mut read_half, mut write_half) = tokio::io::split(bridge_stream);
     let sandbox_id_in = sandbox_id.clone();
@@ -2089,13 +2113,13 @@ fn spawn_peer_bridge(
                     if let Err(err) =
                         tokio::io::AsyncWriteExt::write_all(&mut write_half, &data).await
                     {
-                        warn!(sandbox_id = %sandbox_id_in, error = %err, "gateway peer relay: write to duplex failed");
+                        relay_bridge_warn!(health_check, sandbox_id = %sandbox_id_in, error = %err, "gateway peer relay: write to duplex failed");
                         break;
                     }
                 }
                 Ok(None) => break,
                 Err(err) => {
-                    warn!(sandbox_id = %sandbox_id_in, error = %err, "gateway peer relay: inbound errored");
+                    relay_bridge_warn!(health_check, sandbox_id = %sandbox_id_in, error = %err, "gateway peer relay: inbound errored");
                     break;
                 }
             }
@@ -2120,7 +2144,7 @@ fn spawn_peer_bridge(
                     }
                 }
                 Err(err) => {
-                    warn!(sandbox_id = %sandbox_id, error = %err, "gateway peer relay: read from duplex failed");
+                    relay_bridge_warn!(health_check, sandbox_id = %sandbox_id, error = %err, "gateway peer relay: read from duplex failed");
                     break;
                 }
             }
@@ -2134,6 +2158,7 @@ fn spawn_peer_owner_bridge(
     out_tx: mpsc::Sender<Result<PeerRelayFrame, Status>>,
     sandbox_id: String,
     channel_id: String,
+    health_check: bool,
 ) {
     let (mut read_half, mut write_half) = tokio::io::split(supervisor_stream);
     let sandbox_id_in = sandbox_id.clone();
@@ -2152,13 +2177,13 @@ fn spawn_peer_owner_bridge(
                     if let Err(err) =
                         tokio::io::AsyncWriteExt::write_all(&mut write_half, &data).await
                     {
-                        warn!(sandbox_id = %sandbox_id_in, channel_id = %channel_id_in, error = %err, "gateway peer relay owner: write to supervisor relay failed");
+                        relay_bridge_warn!(health_check, sandbox_id = %sandbox_id_in, channel_id = %channel_id_in, error = %err, "gateway peer relay owner: write to supervisor relay failed");
                         break;
                     }
                 }
                 Ok(None) => break,
                 Err(err) => {
-                    warn!(sandbox_id = %sandbox_id_in, channel_id = %channel_id_in, error = %err, "gateway peer relay owner: inbound errored");
+                    relay_bridge_warn!(health_check, sandbox_id = %sandbox_id_in, channel_id = %channel_id_in, error = %err, "gateway peer relay owner: inbound errored");
                     break;
                 }
             }
@@ -2183,7 +2208,7 @@ fn spawn_peer_owner_bridge(
                     }
                 }
                 Err(err) => {
-                    warn!(sandbox_id = %sandbox_id, channel_id = %channel_id, error = %err, "gateway peer relay owner: read from supervisor relay failed");
+                    relay_bridge_warn!(health_check, sandbox_id = %sandbox_id, channel_id = %channel_id, error = %err, "gateway peer relay owner: read from supervisor relay failed");
                     break;
                 }
             }
