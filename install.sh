@@ -4,7 +4,7 @@
 #
 # Install OpenShell from a GitHub release.
 #
-# Linux automatically installs the snap when the snap command is available and
+# Linux automatically installs the snap when snapd is available and
 # the version is unset or dev; exact releases and prereleases use native packages.
 # Apple Silicon macOS installs the generated Homebrew formula, so Homebrew owns
 # the binary layout and launchd service lifecycle.
@@ -64,13 +64,13 @@ ENVIRONMENT VARIABLES:
                         pre-v0.0.37 or non-snap installation.
     OPENSHELL_INSTALL_METHOD
                         Linux package to install: snap, deb, or rpm. Unset
-                        selects snap when available, otherwise deb or rpm.
+                        selects snap when snapd is available, otherwise deb or rpm.
 
 NOTES:
     When OPENSHELL_VERSION is unset, this resolves the latest tagged release
     from ${GITHUB_URL}/releases/latest.
 
-    Linux installs the OpenShell snap when the snap command is available and
+    Linux installs the OpenShell snap when snapd is available and
     OPENSHELL_VERSION is unset or dev. Snap installs use latest/stable by
     default and latest/edge for dev. Explicit release tags and prereleases use
     the Debian package on amd64/arm64 or the RPM packages on x86_64/aarch64,
@@ -85,6 +85,11 @@ EOF
 
 has_cmd() {
   command -v "$1" >/dev/null 2>&1
+}
+
+snapd_available() {
+  has_cmd snap || return 1
+  snap version 2>/dev/null | grep -Eq '^snapd[[:space:]]+[0-9]'
 }
 
 require_cmd() {
@@ -671,7 +676,7 @@ linux_package_method() {
 
   case "${OPENSHELL_VERSION:-}" in
     '' | dev)
-      if has_cmd snap; then
+      if snapd_available; then
         echo "snap"
         return 0
       fi
@@ -1450,6 +1455,9 @@ wait_for_user_snap_gateway_listener() {
 
 install_linux_snap() {
   require_cmd snap
+  snapd_available || error "snapd is not available; ensure snapd is running, then rerun this installer"
+  info "waiting for snapd initialization to complete..."
+  as_root snap wait system seed.loaded || error "snapd initialization did not complete"
   set_linux_target_runtime_dir
 
   if snap list openshell >/dev/null 2>&1; then
