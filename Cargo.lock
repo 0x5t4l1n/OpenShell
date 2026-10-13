@@ -4412,6 +4412,8 @@ dependencies = [
  "futures",
  "http 1.4.0",
  "http-body-util",
+ "hyper",
+ "hyper-util",
  "k8s-openapi",
  "kube",
  "kube-runtime",
