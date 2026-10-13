@@ -156,6 +156,10 @@ pub struct ConfigSessionState {
     slots: Arc<ConfigSlots>,
     sandbox_config: ComponentDeliveryState,
     provider_environment: ComponentDeliveryState,
+    /// Both components were rebuilt together because each half was staged
+    /// waiting for the other. Until a component is acknowledged, a repeat of
+    /// that deadlock waits for reconciliation instead of rebuilding again.
+    paired_rebuild_requested: bool,
 }
 
 #[derive(Debug, Default)]
@@ -203,14 +207,14 @@ enum Finalized {
     /// The session or update was replaced before the result was finished.
     Obsolete,
     Done {
-        rebuild: Option<ConfigComponentKind>,
+        rebuild: ConfigComponents,
     },
 }
 
 impl Finalized {
-    fn rebuild(&self) -> Option<ConfigComponentKind> {
+    fn rebuild(&self) -> ConfigComponents {
         match self {
-            Self::Obsolete => None,
+            Self::Obsolete => ConfigComponents::default(),
             Self::Done { rebuild } => *rebuild,
         }
     }
@@ -237,6 +241,7 @@ impl ConfigSessionState {
             slots,
             sandbox_config: ComponentDeliveryState::default(),
             provider_environment: ComponentDeliveryState::default(),
+            paired_rebuild_requested: false,
         }
     }
 
@@ -349,13 +354,25 @@ impl ConfigSessionState {
         delivery_state.in_flight = None;
         let pending = delivery_state.pending.take();
 
-        let other = self.component_mut(counterpart);
-        let rebuild = if staged {
-            (!other.staged).then_some(counterpart)
-        } else if acknowledged {
-            std::mem::take(&mut other.staged).then_some(counterpart)
+        if acknowledged {
+            self.paired_rebuild_requested = false;
+        }
+        let other_staged = self.component_mut(counterpart).staged;
+        let rebuild = if staged && !other_staged {
+            ConfigComponents::only(counterpart)
+        } else if staged {
+            // Each half waits for the other, so they were built from
+            // different inputs. Rebuilding both together pairs them; a
+            // repeat before any acknowledgement waits for reconciliation.
+            if std::mem::replace(&mut self.paired_rebuild_requested, true) {
+                ConfigComponents::default()
+            } else {
+                ConfigComponents::ALL
+            }
+        } else if acknowledged && std::mem::take(&mut self.component_mut(counterpart).staged) {
+            ConfigComponents::only(counterpart)
         } else {
-            None
+            ConfigComponents::default()
         };
         let finalized = Finalized::Done { rebuild };
         (finalized, self.release_pending(component, pending))
@@ -407,7 +424,13 @@ impl ConfigSessionState {
         self.release_pending(component, pending)
     }
 
-    fn rejected_components(&self) -> ConfigComponents {
+    /// Components reconciliation must rebuild beyond the sandbox
+    /// configuration: any the supervisor failed to apply, and both halves
+    /// when each is staged waiting for the other.
+    fn repair_components(&self) -> ConfigComponents {
+        if self.sandbox_config.staged && self.provider_environment.staged {
+            return ConfigComponents::ALL;
+        }
         ConfigComponents {
             sandbox_config: self.sandbox_config.rejected,
             provider_environment: self.provider_environment.rejected,
@@ -496,10 +519,10 @@ impl SupervisorSessionRegistry {
     /// for its counterpart, so the counterpart is rebuilt rather than the
     /// staged one, which the supervisor would only stage again. Once the
     /// counterpart is acknowledged, the staged component is rebuilt so the
-    /// supervisor reports the result it still owes. A counterpart that is
-    /// itself staged is not rebuilt, so mismatched halves cannot keep
-    /// requesting each other; the next publication or reconciliation pass
-    /// repairs them.
+    /// supervisor reports the result it still owes. Halves that are each
+    /// staged waiting for the other are rebuilt together once, from one load
+    /// of their inputs; if that pair deadlocks again before any
+    /// acknowledgement, reconciliation rebuilds both.
     fn finalize_config_update(
         &self,
         sandbox_id: &str,
@@ -574,13 +597,13 @@ impl SupervisorSessionRegistry {
 
     /// Components whose last update the session's supervisor failed to
     /// apply.
-    pub(crate) fn rejected_config_components(
+    pub(crate) fn repair_config_components(
         &self,
         sandbox_id: &str,
         session_id: &str,
     ) -> ConfigComponents {
         self.with_config_session(sandbox_id, session_id, |config| {
-            config.map(|config| config.rejected_components())
+            config.map(|config| config.repair_components())
         })
         .flatten()
         .unwrap_or_default()
@@ -985,8 +1008,9 @@ pub async fn handle_config_update_result(session: &AcceptedSession, result: &Con
     } else {
         registry.finalize_config_update(sandbox_id, session_id, &completed, true)
     };
-    if let Some(component) = finalized.rebuild() {
-        super::publish_sandbox_components(state, sandbox_id, ConfigComponents::only(component));
+    let rebuild = finalized.rebuild();
+    if !rebuild.is_empty() {
+        super::publish_sandbox_components(state, sandbox_id, rebuild);
     }
 }
 
@@ -1856,7 +1880,9 @@ mod tests {
             .unwrap();
         assert_eq!(
             registry.finalize_config_update("sb-1", "session-1", &completed, true),
-            Finalized::Done { rebuild: None }
+            Finalized::Done {
+                rebuild: ConfigComponents::default()
+            }
         );
 
         // The acknowledgement releases only the newest held snapshot.
@@ -2889,7 +2915,7 @@ BEGIN SELECT RAISE(ABORT, 'database unavailable'); END;
             provider_env_revision: 5,
             ..Default::default()
         });
-        let rejected = || registry.rejected_config_components("sb-1", "session-1");
+        let rejected = || registry.repair_config_components("sb-1", "session-1");
         let send = || {
             assert_eq!(
                 registry.deliver_config("sb-1", "session-1", provider.clone()),
@@ -2915,7 +2941,7 @@ BEGIN SELECT RAISE(ABORT, 'database unavailable'); END;
         finalize_result(&registry, &update, &provider, ConfigApplyOutcome::Applied);
         assert_eq!(rejected(), ConfigComponents::default());
         assert_eq!(
-            registry.rejected_config_components("sb-1", "other-session"),
+            registry.repair_config_components("sb-1", "other-session"),
             ConfigComponents::default()
         );
     }
@@ -2946,7 +2972,7 @@ BEGIN SELECT RAISE(ABORT, 'database unavailable'); END;
                 ConfigApplyOutcome::AwaitingComponent
             ),
             Finalized::Done {
-                rebuild: Some(ConfigComponentKind::ProviderEnvironment)
+                rebuild: ConfigComponents::only(ConfigComponentKind::ProviderEnvironment)
             },
             "a staged half requests only its counterpart"
         );
@@ -2959,7 +2985,7 @@ BEGIN SELECT RAISE(ABORT, 'database unavailable'); END;
                 ConfigApplyOutcome::Applied
             ),
             Finalized::Done {
-                rebuild: Some(ConfigComponentKind::SandboxConfig)
+                rebuild: ConfigComponents::only(ConfigComponentKind::SandboxConfig)
             },
             "the acknowledged counterpart releases the staged half once"
         );
@@ -2971,13 +2997,52 @@ BEGIN SELECT RAISE(ABORT, 'database unavailable'); END;
                 &sandbox,
                 ConfigApplyOutcome::IgnoredDuplicate
             ),
-            Finalized::Done { rebuild: None }
+            Finalized::Done {
+                rebuild: ConfigComponents::default()
+            }
         );
 
-        // Halves that each wait for the other do not keep requesting rebuilds.
+        // Halves that each wait for the other were built from different
+        // inputs. They are rebuilt together once, and reconciliation keeps
+        // rebuilding both while the deadlock lasts.
         let sandbox = sandbox_config(8);
         let provider = SupervisorConfigMessage::ProviderEnvironment(ProviderEnvironmentSnapshot {
             provider_env_revision: 6,
+            ..Default::default()
+        });
+        let repair = || registry.repair_config_components("sb-1", "session-1");
+        let sandbox_update = send(&sandbox);
+        let provider_update = send(&provider);
+        assert_eq!(
+            finalize_result(
+                &registry,
+                &sandbox_update,
+                &sandbox,
+                ConfigApplyOutcome::AwaitingComponent
+            ),
+            Finalized::Done {
+                rebuild: ConfigComponents::only(ConfigComponentKind::ProviderEnvironment)
+            }
+        );
+        assert_eq!(
+            finalize_result(
+                &registry,
+                &provider_update,
+                &provider,
+                ConfigApplyOutcome::AwaitingComponent
+            ),
+            Finalized::Done {
+                rebuild: ConfigComponents::ALL
+            },
+            "mutually staged halves are rebuilt together"
+        );
+        assert_eq!(repair(), ConfigComponents::ALL);
+
+        // The rebuilt pair deadlocks again: no immediate rebuild, so the
+        // halves cannot loop; reconciliation still rebuilds both.
+        let sandbox = sandbox_config(9);
+        let provider = SupervisorConfigMessage::ProviderEnvironment(ProviderEnvironmentSnapshot {
+            provider_env_revision: 7,
             ..Default::default()
         });
         let sandbox_update = send(&sandbox);
@@ -2990,8 +3055,9 @@ BEGIN SELECT RAISE(ABORT, 'database unavailable'); END;
                 ConfigApplyOutcome::AwaitingComponent
             ),
             Finalized::Done {
-                rebuild: Some(ConfigComponentKind::ProviderEnvironment)
-            }
+                rebuild: ConfigComponents::only(ConfigComponentKind::ProviderEnvironment)
+            },
+            "a half staged against an in-flight counterpart still requests it"
         );
         assert_eq!(
             finalize_result(
@@ -3000,8 +3066,44 @@ BEGIN SELECT RAISE(ABORT, 'database unavailable'); END;
                 &provider,
                 ConfigApplyOutcome::AwaitingComponent
             ),
-            Finalized::Done { rebuild: None }
+            Finalized::Done {
+                rebuild: ConfigComponents::default()
+            },
+            "a repeated deadlock before any acknowledgement waits for reconciliation"
         );
+        assert_eq!(repair(), ConfigComponents::ALL);
+
+        // A matching pair is applied: the deadlock and its guard clear.
+        let sandbox = sandbox_config(10);
+        let provider = SupervisorConfigMessage::ProviderEnvironment(ProviderEnvironmentSnapshot {
+            provider_env_revision: 8,
+            ..Default::default()
+        });
+        let provider_update = send(&provider);
+        assert_eq!(
+            finalize_result(
+                &registry,
+                &provider_update,
+                &provider,
+                ConfigApplyOutcome::Applied
+            ),
+            Finalized::Done {
+                rebuild: ConfigComponents::only(ConfigComponentKind::SandboxConfig)
+            }
+        );
+        let sandbox_update = send(&sandbox);
+        assert_eq!(
+            finalize_result(
+                &registry,
+                &sandbox_update,
+                &sandbox,
+                ConfigApplyOutcome::Applied
+            ),
+            Finalized::Done {
+                rebuild: ConfigComponents::default()
+            }
+        );
+        assert_eq!(repair(), ConfigComponents::default());
     }
 
     #[tokio::test]

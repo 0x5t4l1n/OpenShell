@@ -264,8 +264,9 @@ The labels take these values:
   `ConfigApplyOutcome` name, such as `CONFIG_APPLY_OUTCOME_APPLIED`.
 - `lane` is `sandbox` for a change to one sandbox, or `fanout` for a change
   that reaches many sandboxes, including the 30-second reconcile of each
-  session. The reconcile rebuilds the sandbox configuration, and also any
-  component the supervisor last failed to apply. A quarter of the build slots
+  session. The reconcile rebuilds the sandbox configuration, any component
+  the supervisor last failed to apply, and both components when each is
+  waiting for the other to arrive. A quarter of the build slots
   are reserved for the `sandbox` lane.
 - On builds, `outcome` is `ok`, `failed`, or `timeout`. A failed build retries
   with a per-session backoff from 1 to 30 seconds.

@@ -476,10 +476,10 @@ impl Deliver for Builder<'_> {
         (failed, Some(providers))
     }
 
-    fn rejected(&self, record: &SessionRecord) -> ConfigComponents {
+    fn repair(&self, record: &SessionRecord) -> ConfigComponents {
         self.0
             .supervisor_sessions
-            .rejected_config_components(&record.sandbox_id, &record.session_id)
+            .repair_config_components(&record.sandbox_id, &record.session_id)
     }
 }
 

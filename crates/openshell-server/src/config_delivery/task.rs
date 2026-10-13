@@ -23,9 +23,9 @@ use tokio::time::Instant;
 
 use super::ConfigComponents;
 
-/// How often a session rebuilds its sandbox configuration, and any component
-/// its supervisor failed to apply, to repair a missed publication or retry a
-/// failure that may have cleared. A session first reconciles one to two intervals after it
+/// How often a session rebuilds its sandbox configuration, any component
+/// its supervisor failed to apply, and both halves of a staged deadlock, to
+/// repair a missed publication or retry a failure that may have cleared. A session first reconciles one to two intervals after it
 /// registers, at a random offset, so reconciliation is a steady trickle
 /// rather than a burst and never repeats the bootstrap it just applied.
 pub(super) const RECONCILE_INTERVAL: Duration = Duration::from_secs(30);
@@ -271,12 +271,14 @@ pub(super) trait Deliver: Sync {
         work: Work,
     ) -> impl Future<Output = (ConfigComponents, Option<HashSet<String>>)> + Send;
 
-    /// Components whose last update the session's supervisor failed to apply.
-    fn rejected(&self, record: &SessionRecord) -> ConfigComponents;
+    /// Components reconciliation rebuilds beyond the sandbox configuration:
+    /// ones the supervisor failed to apply, and halves staged waiting for
+    /// each other.
+    fn repair(&self, record: &SessionRecord) -> ConfigComponents;
 }
 
 /// Run a session's deliveries until it closes, rebuilding its sandbox
-/// configuration and any rejected component every `reconcile_interval`.
+/// configuration and any component needing repair every `reconcile_interval`.
 pub(super) async fn run(
     record: Arc<SessionRecord>,
     permits: &Permits,
@@ -296,7 +298,7 @@ pub(super) async fn run(
                 () = record.wake.notified() => {}
                 () = tokio::time::sleep_until(next_reconcile) => {
                     next_reconcile = Instant::now() + reconcile_interval;
-                    let components = ConfigComponents::SANDBOX_CONFIG.union(deliver.rejected(&record));
+                    let components = ConfigComponents::SANDBOX_CONFIG.union(deliver.repair(&record));
                     record.mark(components, Lane::Fanout);
                 }
             }
@@ -411,7 +413,7 @@ mod tests {
             (*self.fail.lock().unwrap(), None)
         }
 
-        fn rejected(&self, _record: &SessionRecord) -> ConfigComponents {
+        fn repair(&self, _record: &SessionRecord) -> ConfigComponents {
             *self.rejected.lock().unwrap()
         }
     }
