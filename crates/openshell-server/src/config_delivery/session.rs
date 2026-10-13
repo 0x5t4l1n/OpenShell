@@ -3620,24 +3620,17 @@ BEGIN SELECT RAISE(ABORT, 'database unavailable'); END;
         .expect("runtime readiness before timeout");
     }
 
-    #[tokio::test]
-    async fn apply_reconnect_skips_startup_preparation_and_restores_readiness() {
-        let sandbox_id = "sb-reconnect-no-preparation";
-        let policy = openshell_policy::restrictive_default_policy();
-        let state = state_with_startup_policy(sandbox_id, Some(policy)).await;
-        let mut initial = crate::grpc::test_support::connect_supervisor_stream(
-            &state,
-            sandbox_id,
-            StreamFeatures::Apply,
-        )
-        .await
-        .expect("initial supervisor connection");
+    /// Prepare a first session's startup policy unchanged and return the
+    /// bootstrap it is accepted with.
+    async fn accept_unchanged_startup_policy(
+        harness: &mut crate::grpc::test_support::SupervisorStreamHarness,
+    ) -> ConfigBootstrap {
         let Some(gateway_message::Payload::StartupConfigCandidate(candidate)) =
-            first_gateway_message(&mut initial).await.payload
+            first_gateway_message(harness).await.payload
         else {
             panic!("initial session must prepare the startup policy");
         };
-        initial
+        harness
             .outbound
             .send(SupervisorMessage {
                 payload: Some(supervisor_message::Payload::StartupConfigPrepared(
@@ -3650,11 +3643,129 @@ BEGIN SELECT RAISE(ABORT, 'database unavailable'); END;
             .await
             .unwrap();
         let Some(gateway_message::Payload::SessionAccepted(accepted)) =
-            first_gateway_message(&mut initial).await.payload
+            first_gateway_message(harness).await.payload
         else {
             panic!("expected initial SessionAccepted");
         };
-        let bootstrap = accepted.bootstrap.expect("initial authoritative bootstrap");
+        accepted.bootstrap.expect("initial authoritative bootstrap")
+    }
+
+    #[tokio::test]
+    async fn failed_runtime_readiness_save_closes_the_session_for_a_reconnect() {
+        use openshell_core::proto::SandboxPhase;
+
+        let sandbox_id = "sb-readiness-save-failure";
+        let policy = openshell_policy::restrictive_default_policy();
+        let state = state_with_startup_policy(sandbox_id, Some(policy)).await;
+        // A new sandbox provisions under an armed deadline.
+        let mut sandbox = state
+            .store
+            .get_message::<Sandbox>(sandbox_id)
+            .await
+            .unwrap()
+            .expect("sandbox");
+        sandbox.set_phase(SandboxPhase::Provisioning as i32);
+        sandbox
+            .status
+            .get_or_insert_with(Default::default)
+            .provisioning = Some(crate::compute::provisioning_deadline::new_record(
+            openshell_core::time::now_ms(),
+        ));
+        state.store.put_message(&sandbox).await.unwrap();
+
+        let mut initial = crate::grpc::test_support::connect_supervisor_stream(
+            &state,
+            sandbox_id,
+            StreamFeatures::Apply,
+        )
+        .await
+        .expect("initial supervisor connection");
+        let bootstrap = accept_unchanged_startup_policy(&mut initial).await;
+        initial
+            .outbound
+            .send(SupervisorMessage {
+                payload: Some(supervisor_message::Payload::ConfigBootstrapResult(
+                    applied_bootstrap_result(&bootstrap),
+                )),
+            })
+            .await
+            .unwrap();
+        assert!(matches!(
+            first_gateway_message(&mut initial).await.payload,
+            Some(gateway_message::Payload::ConfigurationAdmission(_))
+        ));
+
+        // The supervisor reports readiness again only after another admission,
+        // so a lost save must close the session instead of leaving the running
+        // workload to the provisioning deadline.
+        state
+            .store
+            .execute_for_test(FAIL_SANDBOX_RECORD_WRITES)
+            .await;
+        initial
+            .outbound
+            .send(SupervisorMessage {
+                payload: Some(supervisor_message::Payload::RuntimeReady(
+                    openshell_core::proto::SupervisorRuntimeReady {},
+                )),
+            })
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while let Ok(Some(_)) = initial.inbound.message().await {}
+        })
+        .await
+        .expect("gateway closes the session after a failed readiness save");
+        state.store.execute_for_test(RESTORE_RESULT_WRITES).await;
+
+        let mut reconnect = crate::grpc::test_support::reconnect_supervisor_stream(
+            &state,
+            sandbox_id,
+            StreamFeatures::Apply,
+        )
+        .await
+        .expect("supervisor reconnects");
+        let Some(gateway_message::Payload::SessionAccepted(accepted)) =
+            first_gateway_message(&mut reconnect).await.payload
+        else {
+            panic!("expected SessionAccepted on reconnect");
+        };
+        let bootstrap = accepted
+            .bootstrap
+            .expect("reconnect authoritative bootstrap");
+        report_bootstrap_and_runtime_ready(&state, sandbox_id, &mut reconnect, &bootstrap).await;
+
+        let sandbox = state
+            .store
+            .get_message::<Sandbox>(sandbox_id)
+            .await
+            .unwrap()
+            .expect("sandbox");
+        assert_eq!(sandbox.phase(), SandboxPhase::Ready as i32);
+        let provisioning = sandbox
+            .status
+            .as_ref()
+            .and_then(|status| status.provisioning.as_ref())
+            .expect("provisioning record");
+        assert!(
+            provisioning.deadline.is_none() && provisioning.timeout_time.is_none(),
+            "readiness ends provisioning before the deadline can reclaim the workload"
+        );
+    }
+
+    #[tokio::test]
+    async fn apply_reconnect_skips_startup_preparation_and_restores_readiness() {
+        let sandbox_id = "sb-reconnect-no-preparation";
+        let policy = openshell_policy::restrictive_default_policy();
+        let state = state_with_startup_policy(sandbox_id, Some(policy)).await;
+        let mut initial = crate::grpc::test_support::connect_supervisor_stream(
+            &state,
+            sandbox_id,
+            StreamFeatures::Apply,
+        )
+        .await
+        .expect("initial supervisor connection");
+        let bootstrap = accept_unchanged_startup_policy(&mut initial).await;
         report_bootstrap_and_runtime_ready(&state, sandbox_id, &mut initial, &bootstrap).await;
         drop(initial);
 

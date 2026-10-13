@@ -2957,7 +2957,11 @@ async fn run_session_loop(
                                     debug!(sandbox_id, session_id, "ignored bootstrap result from a polling supervisor");
                                 }
                             }
-                            payload => handle_supervisor_message(session, payload).await,
+                            payload => {
+                                if !handle_supervisor_message(session, payload).await {
+                                    break;
+                                }
+                            }
                         }
                     }
                     Ok(None) => {
@@ -3048,10 +3052,11 @@ async fn renew_supervisor_owner(
     }
 }
 
+/// Handle one supervisor message. Returns false when the session must close.
 async fn handle_supervisor_message(
     session: &AcceptedSession,
     payload: Option<supervisor_message::Payload>,
-) {
+) -> bool {
     let AcceptedSession {
         state,
         sandbox_id,
@@ -3103,7 +3108,7 @@ async fn handle_supervisor_message(
                 .supervisor_sessions
                 .is_session_runtime_ready(sandbox_id, session_id)
             {
-                return;
+                return true;
             }
             // A polling session has no streamed admission to require.
             if !mark_supervisor_initialized(
@@ -3115,10 +3120,16 @@ async fn handle_supervisor_message(
             )
             .await
             {
+                // The supervisor reports readiness again only after its next
+                // admission, which an unchanged configuration never sends, and
+                // the provisioning deadline would reclaim the running workload.
+                // Close the session so the reconnect reports readiness again,
+                // as a failed ready-on-accept registration does.
                 warn!(
                     sandbox_id,
-                    session_id, "failed to persist supervisor runtime readiness"
+                    session_id, "failed to persist supervisor runtime readiness; closing session"
                 );
+                return false;
             }
         }
         _ => {
@@ -3129,6 +3140,7 @@ async fn handle_supervisor_message(
             );
         }
     }
+    true
 }
 
 async fn mark_supervisor_initialized(
