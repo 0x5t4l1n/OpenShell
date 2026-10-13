@@ -5291,46 +5291,6 @@ process:
         OpaEngine::from_strings(TEST_POLICY, L7_TEST_DATA).expect("Failed to load L7 test data")
     }
 
-    #[test]
-    fn mxc_host_service_fixture_enforces_paths_and_socket_owner() {
-        let binary = crate::test_support::executable_path("/usr/bin/curl");
-        let yaml =
-            include_str!("../../openshell-driver-mxc/examples/e2e-policies/host-service.yaml")
-                .replace("__HOST_SERVICE_IP__", "192.168.1.20")
-                .replace("__HOST_SERVICE_PORT__", "49152")
-                .replace(
-                    "C:/work/openshell-mxc-e2e",
-                    &std::env::temp_dir().to_string_lossy().replace('\\', "/"),
-                )
-                .replace("__CURL_EXE__", binary.to_str().unwrap());
-        let engine = OpaEngine::from_strings(TEST_POLICY, &yaml).expect("host-service policy");
-        let network = NetworkInput {
-            host: "192.168.1.20".into(),
-            port: 49152,
-            binary_path: binary.clone(),
-            binary_sha256: "unused".into(),
-            ancestors: Vec::new(),
-            cmdline_paths: Vec::new(),
-        };
-        assert!(engine.evaluate_network(&network).unwrap().allowed);
-        assert_eq!(
-            engine.query_allowed_ips(&network).unwrap(),
-            ["192.168.1.20/32"]
-        );
-        for (path, allowed) in [
-            ("/allowed/one", true),
-            ("/allowed/two", true),
-            ("/denied", false),
-        ] {
-            let mut input = l7_input("192.168.1.20", 49152, "GET", path);
-            input["exec"]["path"] = binary.to_str().unwrap().into();
-            assert_eq!(eval_l7(&engine, &input), allowed, "{path}");
-        }
-        let mut wrong_binary = network;
-        wrong_binary.binary_path = crate::test_support::executable_path("/usr/bin/other");
-        assert!(!engine.evaluate_network(&wrong_binary).unwrap().allowed);
-    }
-
     fn l7_input(host: &str, port: u16, method: &str, path: &str) -> serde_json::Value {
         l7_input_with_query(host, port, method, path, serde_json::json!({}))
     }

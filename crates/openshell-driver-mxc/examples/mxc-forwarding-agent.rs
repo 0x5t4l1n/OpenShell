@@ -9,25 +9,18 @@ use std::time::Duration;
 
 fn main() -> std::io::Result<()> {
     let arguments: Vec<String> = std::env::args().collect();
-    if !(arguments.len() == 3 || (matches!(arguments.len(), 4 | 6) && arguments[3] == "http")) {
+    if !(arguments.len() == 3 || (matches!(arguments.len(), 4 | 5) && arguments[3] == "http")) {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
-            "usage: mxc-forwarding-agent READY_FILE NONCE [http [BIND_IPV4 REQUEST_LOG]]",
+            "usage: mxc-forwarding-agent READY_FILE NONCE [http [REQUEST_LOG]]",
         ));
     }
     let http_mode = arguments.len() >= 4;
-    let bind_ip = if arguments.len() == 6 {
-        arguments[4]
-            .parse::<std::net::Ipv4Addr>()
-            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?
-    } else {
-        std::net::Ipv4Addr::LOCALHOST
-    };
-    let request_log = arguments.get(5);
+    let request_log = arguments.get(4);
     if let Some(path) = request_log {
         std::fs::write(path, "")?;
     }
-    let listener = TcpListener::bind((bind_ip, 0))?;
+    let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))?;
     let ready_file = std::path::Path::new(&arguments[1]);
     let staged_ready = ready_file.with_extension("tmp");
     std::fs::write(&staged_ready, listener.local_addr()?.port().to_string())?;

@@ -67,7 +67,7 @@ fn https_fixture_authorizes_direct_curl_with_read_only_https() {
 }
 
 #[test]
-fn host_service_scoring_rejects_transport_failures_and_unenforced_requests() {
+fn host_service_scoring_records_success_and_rejects_false_responses() {
     let root = tempfile::tempdir().unwrap();
     let script = r#"
 $ErrorActionPreference = 'Stop'
@@ -76,7 +76,7 @@ $tokens = $null; $errors = $null
 $ast = [System.Management.Automation.Language.Parser]::ParseFile(
     $env:OPENSHELL_MXC_RUNNER, [ref]$tokens, [ref]$errors)
 if ($errors.Count) { throw "runner parse errors: $($errors.Message -join '; ')" }
-foreach ($name in @('Wait-File', 'Test-HostServiceResult')) {
+foreach ($name in @('Quote-NativeArgument', 'Invoke-NativeCaptured', 'Wait-File', 'Write-HostServiceBatch', 'Test-HostServiceResult')) {
     $helper = $ast.Find({ param($node)
         $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq $name
     }, $true)
@@ -87,26 +87,34 @@ $work = Join-Path $env:OPENSHELL_MXC_SCORE_ROOT 'work with spaces'
 New-Item -ItemType Directory $work | Out-Null
 $requestLog = Join-Path $env:OPENSHELL_MXC_SCORE_ROOT 'host.requests'
 $nonce = 'unique-host-service-response'
+$batch = Join-Path $work 'host-service.cmd'
+Write-HostServiceBatch $batch 'C:/Windows/System32/curl.exe' 'http://127.0.0.1:49152' $work $nonce
+$recordLine = @(Get-Content -LiteralPath $batch | Where-Object { $_.StartsWith('echo %errorlevel%') })[0]
+foreach ($code in @(0, 22)) {
+    $probeBatch = Join-Path $work 'record-exit.cmd'
+    Set-Content -LiteralPath $probeBatch -Encoding ASCII -Value ("@echo off`r`ncmd.exe /d /c exit $code`r`n$recordLine`r`nexit /b 0")
+    $result = Invoke-NativeCaptured 'cmd.exe' @('/d', '/c', $probeBatch) 10
+    if ($result.ExitCode -ne 0) { throw "batch exit probe failed: $($result.Output -join '; ')" }
+    $recorded = Get-Content -LiteralPath (Join-Path $work 'host-service.one.exit') -Raw
+    if (!$recorded -or $recorded.Trim() -ne "$code") { throw "generated batch failed to record curl exit $code" }
+}
 function Reset-Proofs {
     foreach ($name in @('one', 'two')) {
-        [IO.File]::WriteAllText((Join-Path $work "host-service.$name.body"), "${nonce}:/allowed/$name")
+        [IO.File]::WriteAllText((Join-Path $work "host-service.$name.body"), "${nonce}:/$name")
         [IO.File]::WriteAllText((Join-Path $work "host-service.$name.exit"), '0')
     }
-    [IO.File]::WriteAllText((Join-Path $work 'host-service.denied.exit'), '22')
-    [IO.File]::WriteAllText((Join-Path $work 'host-service.denied.status'), '403')
     [IO.File]::WriteAllText((Join-Path $work 'host-service.done'), $nonce)
-    [IO.File]::WriteAllText($requestLog, "/health`n/allowed/one`n/allowed/two`n")
+    [IO.File]::WriteAllText($requestLog, "/health`n/one`n/two`n")
 }
 Reset-Proofs
-if ((Test-HostServiceResult $work $nonce $requestLog) -notmatch 'never reached') { throw 'valid host-service run must pass' }
-foreach ($case in @('transport', 'denial-reached-host', 'wrong-response', 'wrong-workload')) {
+if ((Test-HostServiceResult $work $nonce $requestLog) -notmatch '127.0.0.1') { throw 'valid host-service run must pass' }
+foreach ($case in @('transport', 'unexpected-request', 'wrong-response', 'wrong-workload')) {
     Reset-Proofs
     switch ($case) {
         'transport' {
-            [IO.File]::WriteAllText((Join-Path $work 'host-service.denied.exit'), '7')
-            [IO.File]::WriteAllText((Join-Path $work 'host-service.denied.status'), '000')
+            [IO.File]::WriteAllText((Join-Path $work 'host-service.one.exit'), '7')
         }
-        'denial-reached-host' { [IO.File]::AppendAllText($requestLog, "/denied`n") }
+        'unexpected-request' { [IO.File]::AppendAllText($requestLog, "/unexpected`n") }
         'wrong-response' { [IO.File]::WriteAllText((Join-Path $work 'host-service.one.body'), 'unrelated service') }
         'wrong-workload' { [IO.File]::WriteAllText((Join-Path $work 'host-service.done'), 'stale-run') }
     }

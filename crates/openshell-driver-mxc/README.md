@@ -287,15 +287,12 @@ unique GET responses through gateway host-based routing. It deletes the endpoint
 and requires HTTP 404 afterward. Requests connect only to the gateway with the
 exposed URL's Host header, so no wildcard DNS setup is required.
 
-The default `host-service` scenario runs an HTTP fixture on the Windows host's
-active LAN IPv4 address and a dynamic port. A real MXC workload uses curl through
-the authenticated supervisor proxy, with that exact address allowed by a `/32`
-policy. Two GETs must return the fixture's nonce; a disallowed path must return
-HTTP 403 with curl exit 22 and never appear in the host-side request log. The
-host service is checked before launch and stopped after testing. Missing host
-IPv4 connectivity fails the scenario. This uses the host's LAN address because
-the shared proxy always rejects loopback destinations. Select it with
-`-Scenario host-service`; no Internet access or firewall changes are required.
+The default `host-service` scenario runs an HTTP fixture on host `127.0.0.1`
+and a dynamic port. A real MXC workload makes two direct curl requests; both
+must return the fixture's nonce and appear in its host-side request log. The
+host service is checked before launch and stopped after testing. Select it with
+`-Scenario host-service`; no Internet access, LAN address, or firewall changes
+are required. This verifies direct localhost connectivity.
 
 The `ws-agent.yaml` and `openclaw-gateway.yaml` policies preserve the Windows
 branch's workload grants. `inference.yaml` is a template: replace its filesystem,

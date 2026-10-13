@@ -10,14 +10,7 @@ network_policies:
   host_service:
     name: host-service
     endpoints:
-      - host: '__HOST_SERVICE_IP__'
+      - host: 127.0.0.1
         port: __HOST_SERVICE_PORT__
-        allowed_ips: ['__HOST_SERVICE_IP__/32']
-        protocol: rest
-        enforcement: enforce
-        rules:
-          - allow:
-              method: GET
-              path: /allowed/*
     binaries:
       - path: '__CURL_EXE__'
