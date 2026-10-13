@@ -389,6 +389,16 @@ If the user needs access to multiple hosts or the same host with different rules
 
 Before presenting the policy to the user, verify correctness **and** flag breadth concerns.
 
+### Validate the Policy File
+
+Write the policy to a file and check it locally:
+
+```shell
+openshell policy validate --policy policy.yaml
+```
+
+The command runs the gateway's schema and safety checks without contacting a gateway and prints every violation. Fix each one and run it again until the file is valid. A policy file needs `version: 1`, so to check a `network_policies` fragment, put it under `version: 1` in a scratch file. When the policy is applied, the gateway also checks endpoint ambiguity, provider-composed entries, and registered middleware, so also confirm the items below that depend on them. On a CLI without `policy validate`, check every item below by hand.
+
 ### Hard Errors (would block sandbox startup)
 
 - [ ] `rules` and `access` are NOT both present on the same endpoint
