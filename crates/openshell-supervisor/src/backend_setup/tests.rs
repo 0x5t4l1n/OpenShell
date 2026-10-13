@@ -698,10 +698,23 @@ fn mxc_setup_preserves_admitted_identity_and_constructs_only_mxc() {
     let proxy = built.proxy_listener.unwrap();
     assert_eq!(proxy.bind_addr, launch.proxy.bind_addr);
     assert_eq!(proxy.authorization.as_ref(), launch.proxy.authorization);
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let client = std::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+    let (server, peer) = listener.accept().unwrap();
+    let socket_identity = (proxy.identity_resolver)(peer, server.local_addr().unwrap()).unwrap();
     assert_eq!(
-        proxy.binary_identity.executable.path,
+        std::fs::canonicalize(&socket_identity.executable.path).unwrap(),
+        std::fs::canonicalize(std::env::current_exe().unwrap()).unwrap()
+    );
+    assert!(socket_identity.executable.digest.is_some());
+    assert_ne!(
+        socket_identity.executable.path,
         launch.proxy.workload_binary
     );
+    // A missing connection must fail closed instead of using the launch binary.
+    assert!((proxy.identity_resolver)(peer, "127.0.0.1:0".parse().unwrap()).is_err());
+    drop(client);
+    drop(server);
 
     // Selecting a Windows implementation does not waive main's identity checks.
     let mut foreign_auth = setup.auth.clone();
