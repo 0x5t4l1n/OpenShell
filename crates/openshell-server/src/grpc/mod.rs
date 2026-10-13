@@ -495,7 +495,9 @@ impl OpenShell for OpenShellService {
         &self,
         request: Request<ExposeServiceRequest>,
     ) -> Result<Response<ServiceEndpointResponse>, Status> {
-        mutation_replay::run(&self.state, request).await
+        let mut response = mutation_replay::run(&self.state, request).await?;
+        service::refresh_service_status(&self.state, response.get_mut()).await;
+        Ok(response)
     }
 
     async fn get_service(

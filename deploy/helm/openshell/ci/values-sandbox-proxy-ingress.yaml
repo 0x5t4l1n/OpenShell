@@ -1,0 +1,17 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES.
+# SPDX-License-Identifier: Apache-2.0
+
+# Development public origin; port-forward Envoy's TLS listener to 28443.
+gatewayConfig:
+  openshell.gateway:
+    service_ingress_mode: supervisor
+    service_ingress_url: https://api.openshell-sandbox-proxy-ingress.my-domain:28443
+    supervisor_app_service_domain: api.openshell-sandbox-proxy-ingress.my-domain
+    supervisor_app_address_template: "os-app-{sandbox_id}.openshell.svc.cluster.local:8443"
+  openshell.drivers.kubernetes:
+    sandbox_runtime:
+      app_listener:
+        port: 8443
+        service_domain: api.openshell-sandbox-proxy-ingress.my-domain
+        tls_secret_name: openshell-public-app-tls
+        create_service: true

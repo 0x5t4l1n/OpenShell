@@ -1,0 +1,45 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES.
+# SPDX-License-Identifier: Apache-2.0
+
+apiVersion: gateway.networking.k8s.io/v1
+kind: GatewayClass
+metadata:
+  name: openshell-app-ingress
+spec:
+  controllerName: gateway.envoyproxy.io/gatewayclass-controller
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: openshell-app-ingress
+  namespace: openshell
+spec:
+  gatewayClassName: openshell-app-ingress
+  listeners:
+    - name: app-tls
+      protocol: TLS
+      hostname: "*.api.openshell-sandbox-proxy-ingress.my-domain"
+      port: 443
+      tls:
+        mode: Passthrough
+      allowedRoutes:
+        kinds:
+          - kind: TLSRoute
+        namespaces:
+          from: Same
+---
+apiVersion: gateway.networking.k8s.io/v1alpha2
+kind: TLSRoute
+metadata:
+  name: openshell-app-ingress
+  namespace: openshell
+spec:
+  parentRefs:
+    - name: openshell-app-ingress
+      sectionName: app-tls
+  hostnames:
+    - "*.api.openshell-sandbox-proxy-ingress.my-domain"
+  rules:
+    - backendRefs:
+        - name: openshell-sandbox-proxy
+          port: 443

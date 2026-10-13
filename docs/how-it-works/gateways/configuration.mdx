@@ -883,6 +883,43 @@ The POC polls discovery state once per second and bounds each workspace snapshot
 
 The optional OpenShell sandbox proxy consumes these snapshots and routes TLS streams by SNI directly to supervisors. Helm enables it with `sandboxProxy.enabled`. Set `sandboxProxy.gatewayEndpoint` to an HTTPS gateway and `sandboxProxy.workspaces` to its explicit authorized scopes. Supply a bearer credential Secret through `sandboxProxy.discoveryTokenSecret` (key `token`) and, for a private gateway CA, `sandboxProxy.gatewayCaSecret` (key `ca.crt`). It rereads credentials when watches reconnect and needs no application private keys. The proxy defaults to 256 connections and expires cached routes during discovery outages. The development-only `allowPlaintextDevelopment` option requires a plaintext gateway and no bearer credentials. Its app-port NetworkPolicy covers supervisors in the same namespace; other workspace placements require operator-managed policies.
 
+#### Application ingress architecture
+
+For Kubernetes Gateway API ingress, the expected application path is:
+
+```text
+Client → Kubernetes ingress → OpenShell sandbox proxy → supervisor → sandbox service
+```
+
+For example, use `api.openshell-sandbox-proxy-ingress.my-domain` as the application base domain. Individual service URLs become:
+
+```text
+https://default--sandbox-a--web.api.openshell-sandbox-proxy-ingress.my-domain/
+https://default--sandbox-b--portal.api.openshell-sandbox-proxy-ingress.my-domain/
+```
+
+Point wildcard DNS for `*.api.openshell-sandbox-proxy-ingress.my-domain` at the Kubernetes ingress. With a controller that supports TLS passthrough, configure a `TLSRoute` to forward these hostnames to the sandbox proxy Service. Preserve service SNI through ingress and the proxy; supervisors terminate TLS using certificates for these service hostnames. Set the supervisor listener domain and gateway `supervisor_app_service_domain` to the same public base domain. The proxy discovers internal headless supervisor addresses and connects using the app listener port.
+
+The OpenShell API can use a separate address such as `https://api.my-product.com`. The proxy queries that API for discovery; application payloads bypass it. An existing ingress can instead use a discovery adapter to select supervisors directly. See [Gateway API TLS routing](https://gateway-api.sigs.k8s.io/guides/user-guides/tls-routing/) for controller support and passthrough configuration.
+
+Select the public application origin explicitly:
+
+```toml
+[openshell.gateway]
+service_ingress_mode = "supervisor"
+service_ingress_url = "https://api.openshell-sandbox-proxy-ingress.my-domain"
+supervisor_app_service_domain = "api.openshell-sandbox-proxy-ingress.my-domain"
+supervisor_app_address_template = "os-app-{sandbox_id}.openshell.svc.cluster.local:8443"
+```
+
+Set the supervisor listener's `service_domain` to `api.openshell-sandbox-proxy-ingress.my-domain` too. `service_ingress_url` must be an HTTPS origin matching that domain, without credentials, paths, queries, or fragments. Include a non-default public port when needed, such as `https://api.openshell-sandbox-proxy-ingress.my-domain:28443`. The origin controls returned service URLs; the address template controls internal backend connections.
+
+CLI service exposure, create-time exposure, and service list/get use the configured public origin. SDK creation responses preserve those URLs too. Supervisor-mode URLs retain their public port even when the API is reached through a different port-forward. The default `service_ingress_mode = "gateway"` preserves existing gateway-mode URLs; omit `service_ingress_url` in that mode. Enabling advertisements alone does not migrate URLs.
+
+Service responses include a routing mode and installation status. `configured` means a declaration exists and installation may be pending; `advertised` means the current supervisor installed that revision with an unexpired lease; `unavailable` means runtime, configuration admission, discovery, or installation evidence is unavailable. These states do not prove application health or external ingress readiness. Check current status with `openshell service list` or `openshell service get`.
+
+The Helm `sandbox-proxy-ingress` fixture validates the Gateway API passthrough path with the public-origin example; see the repository's application listener smoke procedure.
+
 The gateway runs as a Pod and creates paired workload and supervisor Pods in another namespace. The gateway CA is projected from a Kubernetes Secret into supervisor Pods; user client certificate and key entries in that Secret are not exposed to either Pod.
 
 ```toml

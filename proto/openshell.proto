@@ -1499,6 +1499,8 @@ message SandboxResponse {
   // Service URLs created by CreateSandbox, keyed by service name. The empty
   // key identifies the unnamed service. Other sandbox RPCs return an empty map.
   map<string, string> service_urls = 2;
+  // Controls whether clients may adapt service URLs to their gateway transport port.
+  ServiceRoutingMode service_routing_mode = 3;
 }
 
 // List sandboxes response.
@@ -1881,10 +1883,29 @@ message ServiceEndpoint {
   ServiceAuthorizationMode authorization_mode = 7;
 }
 
-// Response containing a service endpoint and, when available, its local URL.
+// Response containing a declaration, configured public URL, and installation status.
 message ServiceEndpointResponse {
   ServiceEndpoint endpoint = 1;
   string url = 2;
+  ServiceRoutingMode routing_mode = 3;
+  // Installation evidence, not application health or end-to-end ingress readiness.
+  ServiceExposureStatus status = 4;
+}
+
+enum ServiceRoutingMode {
+  SERVICE_ROUTING_MODE_UNSPECIFIED = 0;
+  SERVICE_ROUTING_MODE_GATEWAY = 1;
+  SERVICE_ROUTING_MODE_SUPERVISOR = 2;
+}
+
+enum ServiceExposureStatus {
+  SERVICE_EXPOSURE_STATUS_UNSPECIFIED = 0;
+  // Declaration exists; supervisor installation may still be pending.
+  SERVICE_EXPOSURE_STATUS_CONFIGURED = 1;
+  // Current supervisor advertised the installed declaration with an unexpired lease.
+  SERVICE_EXPOSURE_STATUS_ADVERTISED = 2;
+  // Runtime/admission, discovery, or installation lease is unavailable.
+  SERVICE_EXPOSURE_STATUS_UNAVAILABLE = 3;
 }
 
 // Revoke SSH session request.

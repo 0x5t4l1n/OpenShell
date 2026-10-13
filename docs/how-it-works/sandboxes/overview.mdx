@@ -496,6 +496,10 @@ with SandboxClient.from_active_cluster(client_credentials=auth) as client:
 
 Service forwarding makes a long-running process inside a sandbox reachable through a gateway-managed URL. Use it for development servers, notebooks, dashboards, or other services that keep listening after the sandbox starts. Run the service on loopback inside the sandbox, expose its port, then open the URL printed by OpenShell.
 
+Gateway routing is the default. When an operator enables supervisor ingress, the returned URL uses the configured public application origin, such as `https://default--my-sandbox--web.api.openshell-sandbox-proxy-ingress.my-domain/`, independently of the gateway API address. Kubernetes ingress can forward TLS through the OpenShell sandbox proxy to supervisor app listeners. See [application ingress configuration](../gateways/configuration#application-ingress-architecture).
+
+Service list/get status distinguishes `configured`, `advertised`, and `unavailable`. A configured URL may exist while installation is pending. Advertised means the current supervisor installed the declaration; it does not establish application health or external ingress readiness.
+
 Expose the unnamed service as part of sandbox creation when the sandbox's main
 process starts the server:
 
@@ -508,7 +512,7 @@ openshell sandbox create \
 ```
 
 The CLI includes the unnamed endpoint in the sandbox create request and prints
-its URL after the sandbox reaches `Ready`. `--expose` keeps the sandbox after
+its configured URL after the sandbox reaches `Ready`. `--expose` keeps the sandbox after
 the create command returns and cannot be combined with `--no-keep`. Use
 `openshell service expose` to add or update an endpoint later.
 

@@ -582,6 +582,11 @@ fn prepare_server_config_with_drivers(
             .service_routing
             .supervisor_app_service_domain
             .clone_from(&gateway_file.supervisor_app_service_domain);
+        config.service_routing.service_ingress_mode = gateway_file.service_ingress_mode;
+        config
+            .service_routing
+            .service_ingress_url
+            .clone_from(&gateway_file.service_ingress_url);
         crate::grpc::service_advertisement::validate_config(&config.service_routing)
             .map_err(|error| miette::miette!(error))?;
         if let Some(drivers) = &gateway_file.credential_drivers {

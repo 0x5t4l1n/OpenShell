@@ -665,7 +665,7 @@ mod tests {
                 overlap_hash.as_str(),
             ),
             (
-                (322, 28),
+                (322, 30),
                 (95, 22),
                 (83, 22),
                 PUBLIC_RPC_SCHEMA_SHA256,

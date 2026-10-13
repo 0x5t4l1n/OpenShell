@@ -31,4 +31,32 @@ type ServiceEndpoint struct {
 	URL               string
 	Workspace         string
 	AuthorizationMode ServiceAuthorizationMode
+	RoutingMode       ServiceRoutingMode
+	Status            ServiceExposureStatus
 }
+
+// ServiceRoutingMode identifies the configured application data path.
+type ServiceRoutingMode int32
+
+const (
+	// ServiceRoutingModeUnspecified is returned by older gateways.
+	ServiceRoutingModeUnspecified ServiceRoutingMode = 0
+	// ServiceRoutingModeGateway uses the gateway listener and relay.
+	ServiceRoutingModeGateway ServiceRoutingMode = 1
+	// ServiceRoutingModeSupervisor uses the separately configured public ingress.
+	ServiceRoutingModeSupervisor ServiceRoutingMode = 2
+)
+
+// ServiceExposureStatus describes installation evidence, not application health.
+type ServiceExposureStatus int32
+
+const (
+	// ServiceExposureStatusUnspecified is returned by older gateways.
+	ServiceExposureStatusUnspecified ServiceExposureStatus = 0
+	// ServiceExposureStatusConfigured indicates a declaration with installation potentially pending.
+	ServiceExposureStatusConfigured ServiceExposureStatus = 1
+	// ServiceExposureStatusAdvertised indicates a current, leased supervisor installation.
+	ServiceExposureStatusAdvertised ServiceExposureStatus = 2
+	// ServiceExposureStatusUnavailable indicates missing runtime, admission, or installation evidence.
+	ServiceExposureStatusUnavailable ServiceExposureStatus = 3
+)

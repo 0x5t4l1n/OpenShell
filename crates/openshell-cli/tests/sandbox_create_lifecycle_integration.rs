@@ -242,6 +242,7 @@ impl OpenShell for TestOpenShell {
         Ok(Response::new(SandboxResponse {
             sandbox: Some(sandbox),
             service_urls,
+            service_routing_mode: 0,
         }))
     }
 
@@ -282,6 +283,7 @@ impl OpenShell for TestOpenShell {
         Ok(Response::new(SandboxResponse {
             sandbox: Some(sandbox),
             service_urls: HashMap::new(),
+            service_routing_mode: 0,
         }))
     }
 

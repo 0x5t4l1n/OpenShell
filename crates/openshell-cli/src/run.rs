@@ -725,7 +725,12 @@ pub async fn sandbox_create(
     let service_urls = response
         .service_urls
         .into_iter()
-        .map(|(service, url)| (service, service_url_for_gateway(&url, &effective_server)))
+        .map(|(service, url)| {
+            (
+                service,
+                service_url_for_mode(&url, &effective_server, response.service_routing_mode),
+            )
+        })
         .collect::<HashMap<_, _>>();
     let sandbox = response
         .sandbox
@@ -1114,10 +1119,7 @@ pub async fn sandbox_create(
                     "\u{2713}".green().bold(),
                 );
                 if let Some(url) = service_urls.get("").filter(|url| !url.is_empty()) {
-                    eprintln!(
-                        "  Access at: {}",
-                        service_url_for_gateway(url, &effective_server)
-                    );
+                    eprintln!("  Access at: {url}");
                 }
             }
 
@@ -4260,8 +4262,14 @@ pub async fn service_expose(
         );
     }
     if !response.url.is_empty() {
-        let url = service_url_for_gateway(&response.url, server);
+        let url = service_url_for_mode(&response.url, server, response.routing_mode);
         println!("  URL: {}", url.cyan());
+    }
+    if response.status != 0 {
+        println!(
+            "  Status: {}",
+            service_exposure_status_name(response.status)
+        );
     }
     Ok(())
 }
@@ -4459,96 +4467,101 @@ fn print_service_endpoint_table(
     gateway_endpoint: &str,
     all_workspaces: bool,
 ) {
+    let mut headers = vec![
+        "SANDBOX",
+        "SERVICE",
+        "TARGET",
+        "AUTHORIZATION",
+        "STATUS",
+        "URL",
+    ];
+    if all_workspaces {
+        headers.insert(0, "WORKSPACE");
+    }
     let rows = services
         .iter()
         .filter_map(|response| {
             let endpoint = response.endpoint.as_ref()?;
-            let workspace = endpoint
-                .metadata
-                .as_ref()
-                .map_or("", |m| m.workspace.as_str());
-            let service = service_display_name(&endpoint.name).to_string();
-            let target = format!("127.0.0.1:{}", endpoint.target_port);
-            let authorization = service_authorization_mode_name(endpoint.authorization_mode);
-            let url = if response.url.is_empty() {
-                String::new()
-            } else {
-                service_url_for_gateway(&response.url, gateway_endpoint)
-            };
-            Some((
-                workspace.to_string(),
+            let mut row = vec![
                 endpoint.sandbox.clone(),
-                service,
-                target,
-                authorization,
-                url,
-            ))
+                service_display_name(&endpoint.name).into(),
+                format!("127.0.0.1:{}", endpoint.target_port),
+                service_authorization_mode_name(endpoint.authorization_mode).into(),
+                service_exposure_status_name(response.status).into(),
+                service_url_for_mode(&response.url, gateway_endpoint, response.routing_mode),
+            ];
+            if all_workspaces {
+                row.insert(
+                    0,
+                    endpoint
+                        .metadata
+                        .as_ref()
+                        .map_or("", |m| m.workspace.as_str())
+                        .into(),
+                );
+            }
+            Some(row)
         })
         .collect::<Vec<_>>();
-
     if rows.is_empty() {
         return;
     }
-
-    let ws_width = if all_workspaces {
-        rows.iter()
-            .map(|(ws, _, _, _, _, _)| ws.len())
-            .max()
-            .unwrap_or(9)
-            .max(9)
-    } else {
-        0
-    };
-    let sandbox_width = rows
+    let widths = headers
         .iter()
-        .map(|(_, sandbox, _, _, _, _)| sandbox.len())
-        .max()
-        .unwrap_or(7)
-        .max(7);
-    let service_width = rows
-        .iter()
-        .map(|(_, _, service, _, _, _)| service.len())
-        .max()
-        .unwrap_or(7)
-        .max(7);
-    let target_width = rows
-        .iter()
-        .map(|(_, _, _, target, _, _)| target.len())
-        .max()
-        .unwrap_or(6)
-        .max(6);
-
-    if all_workspaces {
+        .enumerate()
+        .map(|(index, header)| {
+            rows.iter()
+                .map(|row| row[index].len())
+                .max()
+                .unwrap_or(0)
+                .max(header.len())
+        })
+        .collect::<Vec<_>>();
+    println!(
+        "{}",
+        headers
+            .iter()
+            .enumerate()
+            .map(|(index, header)| format!("{:<width$}", header.bold(), width = widths[index]))
+            .collect::<Vec<_>>()
+            .join("  ")
+    );
+    for row in rows {
         println!(
-            "{:<ws_width$}  {:<sandbox_width$}  {:<service_width$}  {:<target_width$}  {:<20}  {}",
-            "WORKSPACE".bold(),
-            "SANDBOX".bold(),
-            "SERVICE".bold(),
-            "TARGET".bold(),
-            "AUTHORIZATION".bold(),
-            "URL".bold(),
-        );
-    } else {
-        println!(
-            "{:<sandbox_width$}  {:<service_width$}  {:<target_width$}  {:<20}  {}",
-            "SANDBOX".bold(),
-            "SERVICE".bold(),
-            "TARGET".bold(),
-            "AUTHORIZATION".bold(),
-            "URL".bold(),
+            "{}",
+            row.iter()
+                .enumerate()
+                .map(|(index, cell)| format!("{cell:<width$}", width = widths[index]))
+                .collect::<Vec<_>>()
+                .join("  ")
+                .trim_end()
         );
     }
+}
 
-    for (workspace, sandbox, service, target, authorization, url) in rows {
-        if all_workspaces {
-            println!(
-                "{workspace:<ws_width$}  {sandbox:<sandbox_width$}  {service:<service_width$}  {target:<target_width$}  {authorization:<20}  {url}"
-            );
-        } else {
-            println!(
-                "{sandbox:<sandbox_width$}  {service:<service_width$}  {target:<target_width$}  {authorization:<20}  {url}"
-            );
-        }
+fn service_exposure_status_name(status: i32) -> &'static str {
+    use openshell_core::proto::ServiceExposureStatus;
+    match ServiceExposureStatus::try_from(status) {
+        Ok(ServiceExposureStatus::Configured) => "configured",
+        Ok(ServiceExposureStatus::Advertised) => "advertised",
+        Ok(ServiceExposureStatus::Unavailable) => "unavailable",
+        _ => "unknown",
+    }
+}
+
+fn service_routing_mode_name(mode: i32) -> &'static str {
+    if mode == openshell_core::proto::ServiceRoutingMode::Supervisor as i32 {
+        "supervisor"
+    } else {
+        "gateway"
+    }
+}
+
+fn service_url_for_mode(url: &str, gateway_endpoint: &str, mode: i32) -> String {
+    if mode == openshell_core::proto::ServiceRoutingMode::Supervisor as i32 {
+        url.into()
+    } else {
+        service_url_for_gateway(url, gateway_endpoint)
     }
 }
 
@@ -4564,7 +4577,7 @@ fn service_endpoint_to_json(
     let url = if response.url.is_empty() {
         String::new()
     } else {
-        service_url_for_gateway(&response.url, gateway_endpoint)
+        service_url_for_mode(&response.url, gateway_endpoint, response.routing_mode)
     };
 
     Some(serde_json::json!({
@@ -4573,6 +4586,8 @@ fn service_endpoint_to_json(
         "service": endpoint.name,
         "target_port": endpoint.target_port,
         "authorization_mode": service_authorization_mode_name(endpoint.authorization_mode),
+        "routing_mode": service_routing_mode_name(response.routing_mode),
+        "status": service_exposure_status_name(response.status),
         "url": url,
     }))
 }
@@ -7200,6 +7215,8 @@ mod tests {
                 ..Default::default()
             }),
             url: "https://api.openshell.localhost:3000/".to_string(),
+            routing_mode: openshell_core::proto::ServiceRoutingMode::Gateway as i32,
+            status: openshell_core::proto::ServiceExposureStatus::Configured as i32,
         };
 
         let value = service_endpoint_to_json(&response, "https://gateway.example:17670")
@@ -7212,6 +7229,8 @@ mod tests {
                 "service": "",
                 "target_port": 8080,
                 "authorization_mode": "bearer_passthrough",
+                "routing_mode": "gateway",
+                "status": "configured",
                 "url": "https://api.openshell.localhost:17670/",
             })
         );
@@ -9353,5 +9372,43 @@ mod tests {
         assert!(!forward_requires_session_token(&Status::permission_denied(
             "authorization_token is required for ForwardTcp"
         )));
+    }
+}
+
+#[cfg(test)]
+mod ingress_url_tests {
+    use super::service_url_for_mode;
+    use openshell_core::proto::ServiceRoutingMode;
+    #[test]
+    fn supervisor_urls_are_independent_of_api_transport() {
+        for url in [
+            "https://default--sandbox--web.api.openshell-sandbox-proxy-ingress.my-domain/",
+            "https://default--sandbox.api.openshell-sandbox-proxy-ingress.my-domain:28443/",
+        ] {
+            assert_eq!(
+                service_url_for_mode(
+                    url,
+                    "http://127.0.0.1:26091",
+                    ServiceRoutingMode::Supervisor as i32
+                ),
+                url
+            );
+        }
+        assert_eq!(
+            service_url_for_mode(
+                "http://default--sandbox.openshell.localhost:8080/",
+                "http://127.0.0.1:26091",
+                ServiceRoutingMode::Gateway as i32
+            ),
+            "http://default--sandbox.openshell.localhost:26091/"
+        );
+        assert_eq!(
+            service_url_for_mode(
+                "http://default--sandbox.openshell.localhost:8080/",
+                "http://127.0.0.1:26091",
+                0
+            ),
+            "http://default--sandbox.openshell.localhost:26091/"
+        );
     }
 }

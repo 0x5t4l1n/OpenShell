@@ -379,6 +379,7 @@ impl OpenShell for TestOpenShell {
         Ok(Response::new(proto::SandboxResponse {
             sandbox: Some(sandbox_with_phase(&name, proto::SandboxPhase::Provisioning)),
             service_urls,
+            service_routing_mode: 0,
         }))
     }
 
@@ -449,6 +450,7 @@ impl OpenShell for TestOpenShell {
         Ok(Response::new(proto::SandboxResponse {
             sandbox: Some(sandbox),
             service_urls: HashMap::new(),
+            service_routing_mode: 0,
         }))
     }
 
@@ -466,6 +468,7 @@ impl OpenShell for TestOpenShell {
         Ok(Response::new(proto::SandboxResponse {
             sandbox: Some(sandbox),
             service_urls: HashMap::new(),
+            service_routing_mode: 0,
         }))
     }
 
@@ -507,6 +510,7 @@ impl OpenShell for TestOpenShell {
         Ok(Response::new(proto::SandboxResponse {
             sandbox: Some(sandbox),
             service_urls: HashMap::new(),
+            service_routing_mode: 0,
         }))
     }
 
