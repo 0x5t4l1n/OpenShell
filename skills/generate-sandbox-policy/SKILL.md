@@ -551,7 +551,7 @@ Show the generated policy YAML with:
 2. **The YAML** — the complete `network_policies` block, ready to paste
 3. **Integration guidance**:
    - Save to a local file and pass via `openshell sandbox create --policy <path>` or set `OPENSHELL_SANDBOX_POLICY=<path>`
-   - For exact `openshell policy` command syntax on the installed CLI, run `openshell agent context`
+   - For exact `openshell policy` command syntax on the installed CLI, run `openshell agent context`; `openshell policy <command> --help` explains each flag
    - For production: configure via the gateway
 4. **Caveats** — any assumptions made, anything the user should verify
 

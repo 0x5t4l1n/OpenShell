@@ -89,7 +89,7 @@ Public skills live in `skills/` and work without an OpenShell source checkout. I
 | `debug-inference` | Diagnose attached-provider inference, native endpoints, and migration from the retired managed endpoint |
 | `generate-sandbox-policy` | Generate YAML sandbox policies from requirements or API documentation |
 
-Public skills on `main` follow the latest CLI; users of an older release install the skills from its release tag. Public skills use `openshell agent context` for installed command syntax and published OpenShell documentation for product concepts and configuration. They must not depend on repository-relative source or documentation files.
+Public skills on `main` follow the latest CLI; users of an older release install the skills from its release tag. Public skills use `openshell agent context` and `openshell <command> --help` for installed command syntax and published OpenShell documentation for product concepts and configuration. They must not depend on repository-relative source or documentation files.
 
 ### Agent Skills for Contributors
 

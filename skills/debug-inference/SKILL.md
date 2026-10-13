@@ -11,7 +11,8 @@ model. The application calls the provider's native endpoint and owns its base
 URL, model, request format, and timeout.
 
 For exact `openshell` command syntax, run `openshell agent context`. It lists
-every command and flag of the installed CLI.
+every command and flag of the installed CLI, and `openshell <command> --help`
+explains what each flag does.
 Refer to the published [provider management guide](https://docs.nvidia.com/openshell/latest/how-it-works/providers/overview)
 and [provider profile guide](https://docs.nvidia.com/openshell/latest/how-it-works/providers/profiles)
 for current behavior.
