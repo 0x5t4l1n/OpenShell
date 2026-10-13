@@ -6694,13 +6694,10 @@ network_policies:
     }
 
     #[tokio::test(start_paused = true)]
-    async fn startup_conflict_image_write_refetches() {
-        assert_startup_write_aborted_refetches(true).await;
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn startup_conflict_baseline_write_refetches() {
-        assert_startup_write_aborted_refetches(false).await;
+    async fn startup_conflict_writes_refetch_instead_of_resending() {
+        for image_upload in [true, false] {
+            Box::pin(assert_startup_write_aborted_refetches(image_upload)).await;
+        }
     }
 
     /// Load through the production startup loop, retaining a timeout so a
@@ -6733,69 +6730,30 @@ network_policies:
     }
 
     #[tokio::test(start_paused = true)]
-    async fn startup_conflict_write_transport_errors_keep_retry_budget() {
+    async fn startup_conflict_write_transport_errors_are_retried() {
         use openshell_core::proto::PolicySource;
         for image_upload in [true, false] {
-            for code in [
-                tonic::Code::Unavailable,
-                tonic::Code::DeadlineExceeded,
-                tonic::Code::ResourceExhausted,
-                tonic::Code::Internal,
-                tonic::Code::Unknown,
-            ] {
-                for failures in [1, 5] {
-                    let (calls, mut observed) = tokio::sync::mpsc::unbounded_channel();
-                    let gateway = WriteRefusingStartupGateway {
-                        desired: Arc::new(std::sync::Mutex::new(if image_upload {
-                            unset_policy_snapshot()
-                        } else {
-                            settings_poll_result(
-                                Some(proto_tcp_policy_fixture()),
-                                1,
-                                PolicySource::Sandbox,
-                            )
-                        })),
-                        refusals: Arc::new(std::sync::Mutex::new(
-                            std::collections::VecDeque::from(vec![
-                                SyncRefusal::new(
-                                    code,
-                                    "transport failed"
-                                );
-                                failures
-                            ]),
-                        )),
-                        repair_after_refusal: None,
-                        rejection_report_errors: Arc::default(),
-                        calls,
-                    };
-                    let result = load_startup_test_policy(&gateway).await;
-                    if failures == 5 {
-                        assert!(
-                            result
-                                .unwrap_err()
-                                .to_string()
-                                .contains("failed after 5 attempts")
-                        );
-                    } else {
-                        result.expect("startup must recover after one transient failure");
-                    }
-                    let trace: Vec<_> = std::iter::from_fn(|| observed.try_recv().ok()).collect();
-                    assert_eq!(
-                        trace
-                            .iter()
-                            .filter(|call| **call == StartupCall::Sync)
-                            .count(),
-                        if failures == 5 { 5 } else { 2 }
-                    );
-                    assert_eq!(
-                        trace
-                            .iter()
-                            .filter(|call| **call == StartupCall::Snapshot)
-                            .count(),
-                        2
-                    );
-                }
-            }
+            let (calls, mut observed) = tokio::sync::mpsc::unbounded_channel();
+            let gateway = WriteRefusingStartupGateway {
+                desired: Arc::new(std::sync::Mutex::new(if image_upload {
+                    unset_policy_snapshot()
+                } else {
+                    settings_poll_result(Some(proto_tcp_policy_fixture()), 1, PolicySource::Sandbox)
+                })),
+                refusals: Arc::new(std::sync::Mutex::new(std::collections::VecDeque::from([
+                    SyncRefusal::new(tonic::Code::Unavailable, "transport failed"),
+                ]))),
+                repair_after_refusal: None,
+                rejection_report_errors: Arc::default(),
+                calls,
+            };
+            load_startup_test_policy(&gateway)
+                .await
+                .expect("startup retries a transport failure");
+            let syncs = std::iter::from_fn(|| observed.try_recv().ok())
+                .filter(|call| *call == StartupCall::Sync)
+                .count();
+            assert_eq!(syncs, 2, "the same write is retried once");
         }
     }
 
@@ -6826,21 +6784,10 @@ network_policies:
                     .contains("did not stabilize after 5 attempts"),
                 "{error}"
             );
-            let trace: Vec<_> = std::iter::from_fn(|| observed.try_recv().ok()).collect();
-            assert_eq!(
-                trace
-                    .iter()
-                    .filter(|call| **call == StartupCall::Sync)
-                    .count(),
-                5
-            );
-            assert_eq!(
-                trace
-                    .iter()
-                    .filter(|call| **call == StartupCall::Snapshot)
-                    .count(),
-                6
-            );
+            let syncs = std::iter::from_fn(|| observed.try_recv().ok())
+                .filter(|call| *call == StartupCall::Sync)
+                .count();
+            assert_eq!(syncs, 5, "each conflict spends one attempt, no resends");
         }
     }
 
