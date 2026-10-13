@@ -277,10 +277,11 @@ The labels take these values:
   `unsupported_peer`, `peer_error`, or `timeout`.
 - On result writes, `kind` is `admission` or `policy_result`, and `outcome`
   is `written`, `coalesced` (a newer admission for the sandbox replaced a
-  queued one), `stale_session` (the session ended before its admission was
-  written), `retried`, or `dropped` (retries ran out; the next reconciliation
-  redelivers the sandbox configuration so the supervisor reports the result
-  again).
+  queued one), `duplicate` (a policy result repeated the last one written or
+  queued for the sandbox), `stale_session` (the session ended before its
+  admission was written), `retried`, or `dropped` (retries ran out; the next
+  reconciliation redelivers the sandbox configuration so the supervisor
+  reports the result again).
 
 ## Gateway Interceptor Metrics
 

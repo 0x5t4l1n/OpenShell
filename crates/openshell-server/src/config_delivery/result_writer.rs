@@ -12,13 +12,16 @@
 //! for running workloads are queued here and written by one task. A user
 //! write then waits for at most one result write, and repeated admissions for
 //! one sandbox collapse into the newest. Policy results are all kept, because
-//! each one settles the status of its own policy revision.
+//! each one settles the status of its own policy revision, but a result that
+//! repeats the last one recorded for the sandbox is skipped: every sandbox
+//! configuration update reports its policy, even when only settings changed.
 //!
 //! The session acknowledged these results before they were persisted, so it
 //! would suppress the unchanged snapshot on reconciliation. A write that
 //! exhausts its retries therefore reopens the session's sandbox
 //! configuration: the next reconciliation redelivers it, and the supervisor
-//! reports the result again.
+//! reports the result again. A dropped result was never recorded, so the
+//! repeat is not skipped.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex, PoisonError};
@@ -70,6 +73,8 @@ struct Queue {
     running: bool,
     order: VecDeque<String>,
     pending: HashMap<String, PendingWrites>,
+    /// Last policy result written for each sandbox.
+    recorded: HashMap<String, PolicyResult>,
 }
 
 impl Queue {
@@ -83,6 +88,23 @@ impl Queue {
     /// Mark the writer running, returning whether the caller must start it.
     fn claim_start(&mut self) -> bool {
         !std::mem::replace(&mut self.running, true)
+    }
+
+    /// Whether `result` repeats one already written or queued for the sandbox.
+    fn is_duplicate_policy_result(&self, sandbox_id: &str, result: &PolicyResult) -> bool {
+        if self.pending.get(sandbox_id).is_some_and(|pending| {
+            pending
+                .policy_results
+                .last()
+                .is_some_and(|queued| &queued.result == result)
+        }) {
+            return true;
+        }
+        let queued_other = self
+            .pending
+            .get(sandbox_id)
+            .is_some_and(|pending| !pending.policy_results.is_empty());
+        !queued_other && self.recorded.get(sandbox_id) == Some(result)
     }
 
     fn report_pending(&self) {
@@ -156,6 +178,11 @@ pub(super) fn queue_policy_result(
     let writer = &state.config_delivery.results;
     let start = {
         let mut queue = writer.queue();
+        if queue.is_duplicate_policy_result(sandbox_id, &result) {
+            drop(queue);
+            record_write("policy_result", "duplicate");
+            return;
+        }
         queue
             .entry(sandbox_id)
             .policy_results
@@ -218,8 +245,22 @@ async fn write(
         )
         .await
         {
-            Ok(()) => record_write("policy_result", "written"),
+            Ok(()) => {
+                state
+                    .config_delivery
+                    .results
+                    .queue()
+                    .recorded
+                    .insert(sandbox_id.to_string(), result.clone());
+                record_write("policy_result", "written");
+            }
             Err(error) if error.code() == tonic::Code::NotFound => {
+                state
+                    .config_delivery
+                    .results
+                    .queue()
+                    .recorded
+                    .remove(sandbox_id);
                 // The sandbox or its revision is gone; nothing left to record.
                 debug!(sandbox_id, version = result.version, error = %error, "dropped policy result for a missing revision");
                 record_write("policy_result", "dropped");
@@ -332,6 +373,29 @@ mod tests {
             VecDeque::from(["a".to_string(), "b".to_string()])
         );
         assert_eq!(queue.pending["a"].policy_results.len(), 2);
+    }
+
+    #[test]
+    fn repeated_policy_results_are_duplicates_until_another_is_queued() {
+        let loaded = |version| PolicyResult {
+            version,
+            loaded: true,
+            error: None,
+        };
+        let mut queue = Queue::default();
+        queue.recorded.insert("a".into(), loaded(3));
+        assert!(queue.is_duplicate_policy_result("a", &loaded(3)));
+        assert!(!queue.is_duplicate_policy_result("a", &loaded(4)));
+        assert!(!queue.is_duplicate_policy_result("b", &loaded(3)));
+
+        // Once version 4 is queued, version 3 settles a different state again.
+        queue.entry("a").policy_results.push(QueuedPolicyResult {
+            session_id: "session-1".into(),
+            result: loaded(4),
+            attempts: 0,
+        });
+        assert!(queue.is_duplicate_policy_result("a", &loaded(4)));
+        assert!(!queue.is_duplicate_policy_result("a", &loaded(3)));
     }
 
     #[test]
