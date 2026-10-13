@@ -10,8 +10,8 @@ longer supplies a managed inference route, rewrites request shapes, or selects a
 model. The application calls the provider's native endpoint and owns its base
 URL, model, request format, and timeout.
 
-Use installed `openshell agent context` output, or `openshell --help` on a CLI
-without that command, as the authority for command syntax.
+For exact `openshell` command syntax, run `openshell agent context`. It lists
+every command and flag of the installed CLI.
 Refer to the published [provider management guide](https://docs.nvidia.com/openshell/latest/how-it-works/providers/overview)
 and [provider profile guide](https://docs.nvidia.com/openshell/latest/how-it-works/providers/profiles)
 for current behavior.

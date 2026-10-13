@@ -397,7 +397,7 @@ Write the policy to a file and check it locally:
 openshell policy validate --policy policy.yaml
 ```
 
-The command runs the gateway's schema and safety checks without contacting a gateway and prints every violation. Fix each one and run it again until the file is valid. A policy file needs `version: 1`, so to check a `network_policies` fragment, put it under `version: 1` in a scratch file. When the policy is applied, the gateway also checks endpoint ambiguity, provider-composed entries, and registered middleware, so also confirm the items below that depend on them. On a CLI without `policy validate`, check every item below by hand.
+The command runs the gateway's schema and safety checks without contacting a gateway and prints every violation. Fix each one and run it again until the file is valid. A policy file needs `version: 1`, so to check a `network_policies` fragment, put it under `version: 1` in a scratch file. When the policy is applied, the gateway also checks endpoint ambiguity, provider-composed entries, and registered middleware, so also confirm the items below that depend on them.
 
 ### Hard Errors (would block sandbox startup)
 

@@ -74,7 +74,7 @@ Install the public OpenShell skills for your coding agent:
 npx skills add NVIDIA/OpenShell
 ```
 
-This installs the skills from `main`. To match the skills to your installed CLI, add its release tag: `npx skills add NVIDIA/OpenShell#<release-tag>`, such as `#v0.1.3`.
+This installs the skills from `main`, which follow the latest CLI. To match the skills to your installed CLI, add its release tag: `npx skills add NVIDIA/OpenShell#<release-tag>`, such as `#v0.1.3`.
 
 The skills teach your agent to drive the OpenShell CLI, write sandbox policies, and debug gateways and inference routing. They live in [`skills/`](skills/) and work without an OpenShell source checkout. The skills start by running `openshell agent context`, which prints a map of every command and flag in the installed CLI.
 
