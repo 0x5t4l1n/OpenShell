@@ -1,6 +1,6 @@
 # Providers and profiles
 
-Providers supply credentials and provider-specific configuration to sandboxes. Check exact flags with `openshell agent context` and `openshell provider <cmd> --help`.
+Providers supply credentials and provider-specific configuration to sandboxes. `openshell agent context` lists the exact flags.
 
 Providers supply credentials and provider-specific configuration to sandboxes. Provider profiles are import-only: a gateway serves exactly what an operator imported, and a new gateway serves an empty catalog. Never rely on a hard-coded type list or on a legacy alias such as `gh` or `claude` — `--type` matches a profile ID exactly. Discover the profiles available on the selected gateway:
 

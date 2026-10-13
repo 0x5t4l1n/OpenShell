@@ -1,6 +1,6 @@
 # Sandboxes
 
-Create, run, connect to, and clean up sandboxes. Check exact flags with `openshell agent context` and `openshell sandbox <cmd> --help`.
+Create, run, connect to, and clean up sandboxes. `openshell agent context` lists the exact flags.
 
 ## Create your first sandbox
 

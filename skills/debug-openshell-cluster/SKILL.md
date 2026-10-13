@@ -29,7 +29,7 @@ For local evaluation only, TLS may be disabled and the gateway can be reached th
 - For Kubernetes: `kubectl` must target the cluster that hosts OpenShell and Helm version 3 or later must be available.
 - For Docker or Podman: the runtime socket must be reachable from the gateway host.
 
-Use `openshell agent context` output as the authority for the installed CLI version. On a CLI without that command, use `openshell --help` and nested `--help` output. Use the published [installation guide](https://docs.nvidia.com/openshell/latest/about/installation.md), [compute-driver reference](https://docs.nvidia.com/openshell/latest/how-it-works/sandboxes/runtimes), [gateway configuration reference](https://docs.nvidia.com/openshell/latest/how-it-works/gateways/configuration), and [Kubernetes setup guide](https://docs.nvidia.com/openshell/latest/kubernetes/setup.md) as the authority for deployment and configuration behavior.
+This skill and its references give the diagnostic commands for each platform and for `openshell-gateway`. Run `openshell agent context` only when you need an `openshell` command they do not show; it lists every `openshell` command and flag of the installed CLI, and nothing for `openshell-gateway`, `docker`, `podman`, `kubectl`, `helm`, or `systemctl`. On a CLI without that command, use `openshell --help` and nested `--help` output. Use the published [installation guide](https://docs.nvidia.com/openshell/latest/about/installation.md), [compute-driver reference](https://docs.nvidia.com/openshell/latest/how-it-works/sandboxes/runtimes), [gateway configuration reference](https://docs.nvidia.com/openshell/latest/how-it-works/gateways/configuration), and [Kubernetes setup guide](https://docs.nvidia.com/openshell/latest/kubernetes/setup.md) as the authority for deployment and configuration behavior.
 
 ## Workflow
 
@@ -61,7 +61,7 @@ Common findings:
 
 ### Step 2: Identify the Compute Platform
 
-Use gateway metadata, deployment values, or the user's setup notes to identify the driver, then read only the matching reference.
+Use gateway metadata, deployment values, or the user's setup notes to identify the driver, then read only the matching reference. When a task needs several references, such as a platform reference and [references/gateway-startup.md](references/gateway-startup.md), read them together in one step.
 
 | Platform | Primary checks | Reference |
 |---|---|---|

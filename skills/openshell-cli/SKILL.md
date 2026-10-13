@@ -13,7 +13,12 @@ The `openshell` CLI manages gateway registrations, sandboxes, providers, policie
 openshell agent context
 ```
 
-The map lists every command of the installed CLI with its usage line and summary, and every flag with its allowed values, default, environment variable, and the flags it cannot be combined with. It is generated from the binary, so when it disagrees with this skill, follow the map. Read all of it, then run `openshell <group> <cmd> --help` for flag descriptions of the commands you will use.
+The map lists every command of the installed CLI with its usage line and summary, and every flag with its allowed values, default, environment variable, and the flags it cannot be combined with. It is generated from the binary, so when it disagrees with this skill, follow the map. Read all of it.
+
+Each step costs a round trip, so batch your reads:
+
+- Run the map and read every [workflow reference](#workflow-references) your task needs in the same step.
+- Run `openshell <group> <cmd> --help` only when the map and references leave a flag's meaning unclear, and combine those calls into one command.
 
 On a CLI without `agent context`, walk `openshell --help`, then `openshell <group> --help`, then `openshell <group> <cmd> --help`.
 
@@ -41,7 +46,7 @@ On a CLI without `agent context`, walk `openshell --help`, then `openshell <grou
 
 ## Workflow references
 
-Single commands need only the map and `--help`. Read the matching reference before a multi-step workflow, before changing credentials or policy, or when a command fails:
+Single commands need only the map. Read the matching reference before a multi-step workflow, before changing credentials or policy, or when a command fails:
 
 | Task | Reference |
 |------|-----------|
