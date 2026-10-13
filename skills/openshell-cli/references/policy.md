@@ -81,6 +81,8 @@ openshell policy get dev --base | sed '1,/^---$/d' > current-policy.yaml
 
 `--base` returns the editable policy without provider-composed entries; OpenShell composes attached provider rules separately. The command prints revision details, a `---` line, and then the policy YAML. The `sed` expression keeps only the YAML, because `policy set` cannot parse the revision details. Use `--full` only to inspect the effective policy, not as input to `policy set`.
 
+To view the active policy without editing it, run `openshell sandbox get dev --policy-only`. It prints only the effective policy YAML, so like `--full` it is not input for `policy set`.
+
 ### Step 4: Modify the policy
 
 Edit `current-policy.yaml` to allow the blocked actions. **For policy content authoring, delegate to the `generate-sandbox-policy` skill.** That skill handles:
