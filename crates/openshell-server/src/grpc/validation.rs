@@ -481,6 +481,28 @@ pub(super) fn validate_annotations(
     Ok(())
 }
 
+/// Annotation key prefix for sandbox state that only the gateway writes.
+const GATEWAY_RESERVED_ANNOTATION_PREFIX: &str = "internal.openshell.ai/";
+
+/// Reject caller-supplied annotations under the gateway-reserved prefix.
+///
+/// Run this on request input only: the gateway itself writes these keys into
+/// sandbox metadata.
+pub(super) fn validate_no_reserved_annotations(
+    annotations: &std::collections::HashMap<String, String>,
+    field_name: &str,
+) -> Result<(), Status> {
+    if let Some(key) = annotations
+        .keys()
+        .find(|key| key.starts_with(GATEWAY_RESERVED_ANNOTATION_PREFIX))
+    {
+        return Err(Status::invalid_argument(format!(
+            "{field_name} key '{key}' uses the reserved '{GATEWAY_RESERVED_ANNOTATION_PREFIX}' prefix"
+        )));
+    }
+    Ok(())
+}
+
 /// OPENSHELL_* keys that are allowed in exec environment. The Python SDK's
 /// `exec_python()` sends a serialized callable via this key.
 const EXEC_ALLOWED_OPENSHELL_KEYS: &[&str] = &["OPENSHELL_PYFUNC_B64"];

@@ -792,6 +792,7 @@ fn validate_create_sandbox_request_pre_io(
         crate::grpc::validation::validate_label_value(value)?;
     }
     crate::grpc::validation::validate_annotations(&request.annotations, "annotations")?;
+    crate::grpc::validation::validate_no_reserved_annotations(&request.annotations, "annotations")?;
 
     if request.service_exposures.len() > MAX_CREATE_SERVICE_EXPOSURES {
         return Err(Status::invalid_argument(format!(
@@ -7225,6 +7226,44 @@ mod tests {
                 .as_ref()
                 .and_then(|metadata| metadata.annotations.get(&annotation_key)),
             Some(&annotation_value)
+        );
+    }
+
+    #[tokio::test]
+    async fn create_sandbox_rejects_reserved_annotations() {
+        let state = test_server_state().await;
+
+        let err = handle_create_sandbox(
+            &state,
+            authed_request(CreateSandboxRequest {
+                request_id: String::new(),
+                name: "reserved".to_string(),
+                spec: Some(SandboxSpec::default()),
+                labels: HashMap::new(),
+                annotations: HashMap::from([(
+                    crate::compute::COMPUTE_RUNTIME_IDENTITY_ANNOTATION.to_string(),
+                    "caller-chosen-identity".to_string(),
+                )]),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "default".to_string(),
+                )),
+                await_main_process_attachment: false,
+                workload_template: String::new(),
+                service_exposures: Vec::new(),
+            }),
+        )
+        .await
+        .expect_err("reserved annotations must be rejected");
+
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+        assert!(err.message().contains("reserved"), "{}", err.message());
+        assert!(
+            state
+                .store
+                .get_message_by_name::<Sandbox>("default", "reserved")
+                .await
+                .unwrap()
+                .is_none()
         );
     }
 

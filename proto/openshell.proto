@@ -1268,7 +1268,9 @@ message CreateSandboxRequest {
   string name = 2;
   // Optional labels for the sandbox (key-value metadata).
   map<string, string> labels = 3;
-  // Optional annotations for the sandbox (non-selector metadata).
+  // Optional annotations for the sandbox (non-selector metadata). Keys under
+  // the gateway-reserved internal.openshell.ai/ prefix are rejected with
+  // INVALID_ARGUMENT.
   map<string, string> annotations = 4;
   // One-shot launch hint indicating that the creating client will attach to
   // the canonical main process. The supervisor keeps the terminal transport
@@ -2779,11 +2781,11 @@ message UpdateConfigRequest {
   // Ignored for global-scoped updates.
   uint64 expected_resource_version = 8;
   // Caller-provided annotations associated with a sandbox-scoped update. Values
-  // must not contain secrets; the gateway treats them as opaque metadata and does
-  // not interpret or verify their semantics. For policy updates, the gateway
-  // stores the annotations immutably with the revision and merges them into
-  // sandbox metadata as a convenience projection. For setting-only updates, it
-  // only merges them into sandbox metadata.
+  // must not contain secrets. Keys under the gateway-reserved
+  // internal.openshell.ai/ prefix are rejected with INVALID_ARGUMENT. For policy
+  // updates, the gateway stores the annotations immutably with the revision and
+  // merges them into sandbox metadata as a convenience projection. For
+  // setting-only updates, it only merges them into sandbox metadata.
   map<string, string> annotations = 9;
   // Required for sandbox-scoped updates and empty for global updates.
   string sandbox = 1;

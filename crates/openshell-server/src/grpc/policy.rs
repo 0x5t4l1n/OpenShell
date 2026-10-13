@@ -102,8 +102,8 @@ use tracing::{debug, info, warn};
 
 use super::validation::{
     level_matches, source_matches, validate_and_canonicalize_policy, validate_annotations,
-    validate_no_reserved_provider_policy_keys, validate_policy_safety,
-    validate_static_fields_unchanged,
+    validate_no_reserved_annotations, validate_no_reserved_provider_policy_keys,
+    validate_policy_safety, validate_static_fields_unchanged,
 };
 use super::{StoredSettingValue, StoredSettings};
 use crate::persistence::current_time_ms;
@@ -3876,6 +3876,7 @@ async fn handle_update_config_inner(
     let replay_facts = super::mutation_replay::ordinary::Facts::from_request(&request);
     let req = request.into_inner();
     validate_annotations(&req.annotations, "annotations")?;
+    validate_no_reserved_annotations(&req.annotations, "annotations")?;
     let sandbox = if req.global {
         if !req.sandbox.is_empty() || req.workspace_scope.is_some() {
             return Err(Status::invalid_argument(
@@ -24649,5 +24650,154 @@ mod tests {
             "GetGatewayConfig must not require Platform Admin; got {:?}",
             response.unwrap_err()
         );
+    }
+
+    /// Store a sandbox whose live session identity is epoch 2 / token U(2)
+    /// and return a still-unexpired token from the revoked epoch 1.
+    async fn store_sandbox_with_rotated_identity(
+        state: &ServerState,
+    ) -> openshell_core::jwt::AuthenticatedSandboxSession {
+        use crate::auth::sandbox_session::{PersistedSandboxIdentity, authorize_persisted};
+        use openshell_core::jwt::{AuthenticatedSandboxSession, CredentialEpoch, SandboxId};
+        use openshell_core::proto::{SandboxPhase, SandboxSpec};
+        use openshell_core::sandbox_generation::SandboxGenerationId;
+
+        let live = PersistedSandboxIdentity {
+            runtime_generation: SandboxGenerationId::parse("generation-a").unwrap(),
+            auth_epoch: CredentialEpoch::new(2).unwrap(),
+            gateway_token_id: uuid::Uuid::from_u128(2),
+            refresh_replay: None,
+        };
+        let mut annotations = HashMap::new();
+        live.write(&mut annotations);
+        annotations.insert(
+            crate::compute::COMPUTE_RUNTIME_IDENTITY_ANNOTATION.to_string(),
+            "driver-returned-identity".to_string(),
+        );
+        let mut sandbox = Sandbox {
+            metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                id: "sb-reserved".to_string(),
+                name: "reserved".to_string(),
+                created_time: openshell_core::time::timestamp_from_millis(1_000_000).ok(),
+                labels: HashMap::new(),
+                resource_version: 0,
+                annotations,
+                workspace: "default".to_string(),
+                deletion_time: None,
+            }),
+            spec: Some(SandboxSpec {
+                policy: None,
+                providers: Vec::new(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        sandbox.set_phase(SandboxPhase::Provisioning as i32);
+        state.store.put_message(&sandbox).await.unwrap();
+
+        let revoked = AuthenticatedSandboxSession {
+            sandbox_id: SandboxId::parse("sb-reserved").unwrap(),
+            runtime_generation: SandboxGenerationId::parse("generation-a").unwrap(),
+            auth_epoch: CredentialEpoch::new(1).unwrap(),
+            token_id: uuid::Uuid::from_u128(1),
+            issued_at: 1,
+            expires_at: i64::MAX,
+        };
+        assert!(
+            authorize_persisted(&state.store, &revoked).await.is_err(),
+            "precondition: the epoch-1 token is revoked"
+        );
+        revoked
+    }
+
+    fn reserved_annotation_update() -> UpdateConfigRequest {
+        UpdateConfigRequest {
+            sandbox: "reserved".to_string(),
+            workspace_scope: Some(openshell_core::proto::workspace_selector(
+                "default".to_string(),
+            )),
+            policy: Some(ProtoSandboxPolicy::default()),
+            expected_resource_version: 0,
+            annotations: HashMap::from([
+                (
+                    crate::auth::sandbox_session::AUTH_EPOCH_ANNOTATION.to_string(),
+                    "1".to_string(),
+                ),
+                (
+                    crate::auth::sandbox_session::GATEWAY_TOKEN_ID_ANNOTATION.to_string(),
+                    uuid::Uuid::from_u128(1).to_string(),
+                ),
+                (
+                    crate::compute::COMPUTE_RUNTIME_IDENTITY_ANNOTATION.to_string(),
+                    "caller-chosen-identity".to_string(),
+                ),
+            ]),
+            ..Default::default()
+        }
+    }
+
+    async fn assert_reserved_annotation_update_rejected(
+        state: &ServerState,
+        revoked: &openshell_core::jwt::AuthenticatedSandboxSession,
+        result: Result<Response<UpdateConfigResponse>, Status>,
+    ) {
+        use crate::auth::sandbox_session::{PersistedSandboxIdentity, authorize_persisted};
+
+        let err = result.expect_err("reserved annotations must be rejected");
+        assert_eq!(err.code(), Code::InvalidArgument);
+        assert!(err.message().contains("reserved"), "{}", err.message());
+
+        let stored = state
+            .store
+            .get_message::<Sandbox>("sb-reserved")
+            .await
+            .unwrap()
+            .unwrap();
+        let stored_annotations = &stored.metadata.as_ref().unwrap().annotations;
+        assert_eq!(
+            stored_annotations[crate::compute::COMPUTE_RUNTIME_IDENTITY_ANNOTATION],
+            "driver-returned-identity"
+        );
+        let identity = PersistedSandboxIdentity::read(stored_annotations).unwrap();
+        assert_eq!(identity.auth_epoch.get(), 2);
+        assert_eq!(identity.gateway_token_id, uuid::Uuid::from_u128(2));
+        assert!(
+            state
+                .store
+                .get_latest_policy("sb-reserved")
+                .await
+                .unwrap()
+                .is_none(),
+            "a rejected update must not record a policy revision"
+        );
+        assert!(
+            authorize_persisted(&state.store, revoked).await.is_err(),
+            "the epoch-1 token must stay revoked"
+        );
+    }
+
+    #[tokio::test]
+    async fn update_config_rejects_reserved_annotations_from_sandbox_policy_sync() {
+        let state = test_server_state().await;
+        let revoked = store_sandbox_with_rotated_identity(&state).await;
+
+        let result = handle_update_config(
+            &state,
+            with_sandbox(Request::new(reserved_annotation_update()), "sb-reserved"),
+        )
+        .await;
+
+        assert_reserved_annotation_update_rejected(&state, &revoked, result).await;
+    }
+
+    #[tokio::test]
+    async fn update_config_rejects_reserved_annotations_from_workspace_admin() {
+        let state = test_server_state().await;
+        let revoked = store_sandbox_with_rotated_identity(&state).await;
+
+        let result =
+            handle_update_config(&state, authed_request(reserved_annotation_update())).await;
+
+        assert_reserved_annotation_update_rejected(&state, &revoked, result).await;
     }
 }

@@ -3459,7 +3459,9 @@ type CreateSandboxRequest struct {
 	Name string `protobuf:"bytes,2,opt,name=name,proto3" json:"name,omitempty"`
 	// Optional labels for the sandbox (key-value metadata).
 	Labels map[string]string `protobuf:"bytes,3,rep,name=labels,proto3" json:"labels,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
-	// Optional annotations for the sandbox (non-selector metadata).
+	// Optional annotations for the sandbox (non-selector metadata). Keys under
+	// the gateway-reserved internal.openshell.ai/ prefix are rejected with
+	// INVALID_ARGUMENT.
 	Annotations map[string]string `protobuf:"bytes,4,rep,name=annotations,proto3" json:"annotations,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
 	// One-shot launch hint indicating that the creating client will attach to
 	// the canonical main process. The supervisor keeps the terminal transport
@@ -11726,11 +11728,11 @@ type UpdateConfigRequest struct {
 	// Ignored for global-scoped updates.
 	ExpectedResourceVersion uint64 `protobuf:"varint,8,opt,name=expected_resource_version,json=expectedResourceVersion,proto3" json:"expected_resource_version,omitempty"`
 	// Caller-provided annotations associated with a sandbox-scoped update. Values
-	// must not contain secrets; the gateway treats them as opaque metadata and does
-	// not interpret or verify their semantics. For policy updates, the gateway
-	// stores the annotations immutably with the revision and merges them into
-	// sandbox metadata as a convenience projection. For setting-only updates, it
-	// only merges them into sandbox metadata.
+	// must not contain secrets. Keys under the gateway-reserved
+	// internal.openshell.ai/ prefix are rejected with INVALID_ARGUMENT. For policy
+	// updates, the gateway stores the annotations immutably with the revision and
+	// merges them into sandbox metadata as a convenience projection. For
+	// setting-only updates, it only merges them into sandbox metadata.
 	Annotations map[string]string `protobuf:"bytes,9,rep,name=annotations,proto3" json:"annotations,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
 	// Required for sandbox-scoped updates and empty for global updates.
 	Sandbox string `protobuf:"bytes,1,opt,name=sandbox,proto3" json:"sandbox,omitempty"`
