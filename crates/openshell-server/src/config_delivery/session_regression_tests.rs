@@ -1,64 +1,27 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-#[derive(Clone, Default)]
-struct StartupRepairLog(Arc<Mutex<Vec<u8>>>);
-
-impl std::io::Write for StartupRepairLog {
-    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-        self.0.lock().unwrap().extend_from_slice(bytes);
-        Ok(bytes.len())
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
-    }
-}
-
-impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for StartupRepairLog {
-    type Writer = Self;
-
-    fn make_writer(&'a self) -> Self::Writer {
-        self.clone()
-    }
-}
-
 #[tokio::test]
 async fn config_push_regression_global_policy_repair_wakes_pending_startup() {
     use openshell_core::proto::UpdateConfigRequest;
     use openshell_core::proto::open_shell_server::OpenShell as _;
-    use tracing::instrument::WithSubscriber as _;
 
     let sandbox_id = "sb-global-startup-repair";
     let state = state_with_startup_policy(sandbox_id, None).await;
-    let logs = StartupRepairLog::default();
-    let subscriber = tracing_subscriber::fmt()
-        .with_ansi(false)
-        .without_time()
-        .with_writer(logs.clone())
-        .finish();
     let connecting_state = Arc::clone(&state);
-    let mut connection = tokio::spawn(
-        async move {
-            build_session_bootstrap(
-                &connecting_state,
-                sandbox_id,
-                &ImagePolicyAdmission::Invalid,
-            )
-            .await
-        }
-        .with_subscriber(subscriber),
-    );
+    let mut connection = tokio::spawn(async move {
+        build_session_bootstrap(
+            &connecting_state,
+            sandbox_id,
+            &ImagePolicyAdmission::Invalid,
+        )
+        .await
+    });
 
     // Wait for the actual rejection, not an arbitrary delay that could let
     // the global write overtake the bootstrap's first database reads.
     tokio::time::timeout(Duration::from_secs(5), async {
-        loop {
-            if String::from_utf8_lossy(&logs.0.lock().unwrap())
-                .contains("waiting for a gateway policy repair")
-            {
-                break;
-            }
+        while !STARTUP_REPAIR_WAITS.lock().unwrap().contains(sandbox_id) {
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
     })

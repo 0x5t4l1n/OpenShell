@@ -60,6 +60,12 @@ const CONFIG_ACK_TIMEOUT: Duration = Duration::from_mins(1);
 static FAIL_NEXT_ADMISSION_PERSISTENCE_FOR_SANDBOX: std::sync::LazyLock<Mutex<Option<String>>> =
     std::sync::LazyLock::new(|| Mutex::new(None));
 
+/// Sandboxes whose startup build found no gateway policy and began waiting
+/// for a repair.
+#[cfg(test)]
+static STARTUP_REPAIR_WAITS: std::sync::LazyLock<Mutex<std::collections::HashSet<String>>> =
+    std::sync::LazyLock::new(|| Mutex::new(std::collections::HashSet::new()));
+
 // ---------------------------------------------------------------------------
 // Snapshot identity
 // ---------------------------------------------------------------------------
@@ -1418,6 +1424,11 @@ pub async fn build_session_bootstrap(
                 "image policy repair window expired",
             ));
         }
+        #[cfg(test)]
+        STARTUP_REPAIR_WAITS
+            .lock()
+            .unwrap()
+            .insert(sandbox_id.to_string());
         let updates = repair_updates
             .as_mut()
             .expect("only an invalid image policy waits for repair");
