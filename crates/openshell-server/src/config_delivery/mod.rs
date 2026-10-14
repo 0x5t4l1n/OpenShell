@@ -10,7 +10,6 @@ mod task;
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
@@ -203,15 +202,23 @@ impl From<ConfigComponentKind> for ConfigComponent {
 /// coalesced notifications to peer replicas.
 #[derive(Debug)]
 pub struct ConfigDelivery {
-    sessions: Mutex<HashMap<String, Arc<SessionRecord>>>,
+    sessions: Mutex<Sessions>,
     permits: Permits,
-    /// Counts publications, so a registering session can tell whether one
-    /// raced its bootstrap.
-    publications: AtomicU64,
     peer_notifies: Mutex<HashMap<PeerNotifyTarget, ConfigComponents>>,
     peer_notify_permits: Arc<Semaphore>,
     /// Admission and policy-result writes for running workloads.
     results: result_writer::ResultWriter,
+}
+
+/// This replica's push sessions and the publications that looked for them.
+#[derive(Debug, Default)]
+struct Sessions {
+    records: HashMap<String, Arc<SessionRecord>>,
+    /// Counts publications, so a registering session can tell whether one
+    /// raced its bootstrap. It shares the lock with `records`, so a
+    /// publication either finds a registered session or is counted before
+    /// that session compares the count.
+    publications: u64,
 }
 
 /// Where a peer notification goes.
@@ -232,9 +239,8 @@ impl ConfigDelivery {
             .saturating_mul(SNAPSHOT_BUILDS_PER_DB_CONNECTION)
             .max(MIN_CONCURRENT_SNAPSHOT_BUILDS);
         Self {
-            sessions: Mutex::new(HashMap::new()),
+            sessions: Mutex::new(Sessions::default()),
             permits: Permits::new(builds),
-            publications: AtomicU64::new(0),
             peer_notifies: Mutex::new(HashMap::new()),
             peer_notify_permits: Arc::new(Semaphore::new(MAX_CONCURRENT_PEER_NOTIFIES)),
             results: result_writer::ResultWriter::default(),
@@ -242,24 +248,28 @@ impl ConfigDelivery {
     }
 
     pub(crate) fn publications(&self) -> u64 {
-        self.publications.load(Ordering::SeqCst)
+        self.sessions().publications
     }
 
     #[cfg(test)]
     fn has_session(&self, sandbox_id: &str) -> bool {
-        self.sessions().contains_key(sandbox_id)
+        self.sessions().records.contains_key(sandbox_id)
     }
 
     /// Delivery is best effort beside the session lifecycle, so a poisoned
     /// lock must not turn session teardown into a panic.
-    fn sessions(&self) -> MutexGuard<'_, HashMap<String, Arc<SessionRecord>>> {
+    fn sessions(&self) -> MutexGuard<'_, Sessions> {
         self.sessions.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     /// Returns false when this gateway has no push session for the sandbox.
     fn publish_sandbox(&self, sandbox_id: &str, components: ConfigComponents) -> bool {
-        self.publications.fetch_add(1, Ordering::SeqCst);
-        let Some(record) = self.sessions().get(sandbox_id).cloned() else {
+        let record = {
+            let mut sessions = self.sessions();
+            sessions.publications += 1;
+            sessions.records.get(sandbox_id).cloned()
+        };
+        let Some(record) = record else {
             return false;
         };
         record.mark(components, Lane::Sandbox);
@@ -267,8 +277,9 @@ impl ConfigDelivery {
     }
 
     fn publish_fanout(&self, scope: &FanoutScope, components: ConfigComponents) {
-        self.publications.fetch_add(1, Ordering::SeqCst);
-        for record in self.sessions().values() {
+        let mut sessions = self.sessions();
+        sessions.publications += 1;
+        for record in sessions.records.values() {
             if record.in_scope(scope) {
                 record.mark(components, Lane::Fanout);
             }
@@ -349,11 +360,10 @@ fn publish_fanout(state: &Arc<ServerState>, scope: &FanoutScope, components: Con
 /// Make a streamed-apply session visible to publications and start its
 /// delivery task.
 pub fn register_session(state: &Arc<ServerState>, registration: Registration) {
-    let delivery = &state.config_delivery;
-    let raced = delivery.publications() > registration.captured_seq;
+    let captured_seq = registration.captured_seq;
     let record = Arc::new(SessionRecord::new(registration));
-    {
-        let mut sessions = delivery.sessions();
+    let raced = {
+        let mut sessions = state.config_delivery.sessions();
         // A concurrent reconnect may already own the registry entry. Checking
         // under the sessions lock keeps the newest session registered.
         if !state
@@ -362,10 +372,14 @@ pub fn register_session(state: &Arc<ServerState>, registration: Registration) {
         {
             return;
         }
-        if let Some(previous) = sessions.insert(record.sandbox_id.clone(), Arc::clone(&record)) {
+        if let Some(previous) = sessions
+            .records
+            .insert(record.sandbox_id.clone(), Arc::clone(&record))
+        {
             previous.close();
         }
-    }
+        sessions.publications > captured_seq
+    };
     // A publication between the bootstrap read and registration may have
     // missed this session.
     if raced {
@@ -386,9 +400,10 @@ pub fn register_session(state: &Arc<ServerState>, registration: Registration) {
 pub fn unregister_session(state: &ServerState, sandbox_id: &str, session_id: &str) {
     let mut sessions = state.config_delivery.sessions();
     if sessions
+        .records
         .get(sandbox_id)
         .is_some_and(|record| record.session_id == session_id)
-        && let Some(record) = sessions.remove(sandbox_id)
+        && let Some(record) = sessions.records.remove(sandbox_id)
     {
         record.close();
     }
@@ -931,6 +946,19 @@ pub fn register_test_apply_session(
     sandbox: &Sandbox,
     session_id: &str,
 ) -> TestApplySession {
+    let captured_seq = state.config_delivery.publications();
+    register_test_apply_session_after(state, sandbox, session_id, captured_seq)
+}
+
+/// Register a test session whose bootstrap was read when the publication
+/// count was `captured_seq`.
+#[cfg(test)]
+fn register_test_apply_session_after(
+    state: &Arc<ServerState>,
+    sandbox: &Sandbox,
+    session_id: &str,
+    captured_seq: u64,
+) -> TestApplySession {
     use crate::persistence::{ObjectId, ObjectWorkspace};
 
     let (control, rx) = tokio::sync::mpsc::channel(4);
@@ -954,7 +982,7 @@ pub fn register_test_apply_session(
                 .as_ref()
                 .map(|spec| spec.providers.iter().cloned().collect())
                 .unwrap_or_default(),
-            captured_seq: state.config_delivery.publications(),
+            captured_seq,
         },
     );
     TestApplySession {
@@ -1345,6 +1373,41 @@ mod tests {
         .expect("the notification task drains its target");
     }
 
+    #[tokio::test]
+    async fn registration_delivers_a_publication_that_found_no_session() {
+        let state = push_state().await;
+        put_sandbox(&state, "sandbox", &[]).await;
+        let sandbox = state
+            .store
+            .get_message::<Sandbox>("sandbox")
+            .await
+            .unwrap()
+            .unwrap();
+        let captured_seq = state.config_delivery.publications();
+        // The change commits after the session read its bootstrap, and its
+        // publication runs before the session registers.
+        change_policy(&state, "sandbox", 1).await;
+        assert!(
+            !state
+                .config_delivery
+                .publish_sandbox("sandbox", ConfigComponents::SANDBOX_CONFIG)
+        );
+
+        let mut session =
+            register_test_apply_session_after(&state, &sandbox, "session-1", captured_seq);
+        // Reconciliation is at least 30 seconds away, so only registration
+        // can have caught the publication.
+        let update = tokio::time::timeout(
+            Duration::from_secs(5),
+            tokio_stream::StreamExt::next(&mut session.outbound),
+        )
+        .await
+        .expect("registration delivers the missed publication")
+        .expect("outbound frame")
+        .expect("outbound message");
+        assert!(is_config_update(&update));
+    }
+
     #[test]
     fn fanout_marks_ten_thousand_sessions_once_each() {
         let delivery = ConfigDelivery::for_db_connections(5);
@@ -1359,7 +1422,7 @@ mod tests {
                 }))
             })
             .collect();
-        delivery.sessions().extend(
+        delivery.sessions().records.extend(
             records
                 .iter()
                 .map(|record| (record.sandbox_id.clone(), Arc::clone(record))),
