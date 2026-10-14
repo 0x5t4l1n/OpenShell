@@ -941,17 +941,10 @@ pub(crate) fn http_response_middleware_relay<'a>(
     runner: &'a openshell_supervisor_middleware::ChainRunner,
     generation_guard: Option<&'a PolicyGenerationGuard>,
 ) -> crate::l7::rest::HttpResponseMiddlewareRelay<'a> {
-    let sandbox = openshell_ocsf::ctx::ctx();
     crate::l7::rest::HttpResponseMiddlewareRelay {
         chain,
         runner,
-        request_context: openshell_core::proto::RequestContext {
-            request_id: request_id.to_string(),
-            sandbox_id: sandbox.sandbox_id.clone(),
-            sandbox: sandbox.sandbox_name.clone(),
-            workspace: ctx.workspace.clone(),
-            originating_process: None,
-        },
+        request_context: crate::l7::middleware::middleware_request_context(ctx, request_id),
         target: openshell_core::proto::HttpRequestTarget {
             scheme: scheme.to_string(),
             host: ctx.host.clone(),
@@ -7688,6 +7681,8 @@ network_policies:
             port: 443,
             workspace: "workspace-1".into(),
             policy_name: "api".into(),
+            binary_path: "/usr/bin/curl".into(),
+            ancestors: vec!["/usr/bin/bash".into()],
             ..Default::default()
         };
         let runner = openshell_supervisor_middleware::ChainRunner::default();
@@ -7710,6 +7705,13 @@ network_policies:
         assert!(!response.target.query.contains("sk-live-secret"));
         assert!(!response.target.query.contains("API_TOKEN"));
         assert_eq!(response.target.scheme, "https");
+        let process = response
+            .request_context
+            .originating_process
+            .expect("originating process");
+        assert_eq!(process.binary, "/usr/bin/curl");
+        assert_eq!(process.ancestors, ["/usr/bin/bash"]);
+        assert_eq!(process.pid, 0);
     }
 
     #[test]
