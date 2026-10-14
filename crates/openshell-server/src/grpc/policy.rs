@@ -5202,47 +5202,62 @@ pub async fn record_policy_apply_result(
         return Err(Status::not_found("policy revision not found"));
     }
     if loaded {
+        let newest_loaded = {
+            let _sandbox_sync_guard =
+                state.compute.sandbox_sync_guard().await.map_err(|error| {
+                    super::persistence_error_to_status(error, "acquire policy mutation lock")
+                })?;
+            let sandbox = state
+                .store
+                .get_message::<Sandbox>(sandbox_id)
+                .await
+                .map_err(|error| Status::internal(format!("fetch sandbox failed: {error}")))?
+                .ok_or_else(|| Status::not_found("sandbox not found"))?;
+            let current_version = sandbox.current_policy_version();
+            if current_version > version {
+                // A result can arrive after a newer revision loaded, such as
+                // one queued by a replaced supervisor session. The newer
+                // policy stays active, and so does its endpoint inventory.
+                current_version
+            } else {
+                let endpoint_reset = endpoint_status::endpoint_status_reset_for_loaded_policy(
+                    state.as_ref(),
+                    &sandbox,
+                    version_i64,
+                )
+                .await?;
+                let updated = state
+                    .store
+                    .update_message_cas::<Sandbox, _>(sandbox_id, 0, |sandbox| {
+                        if sandbox.current_policy_version() < version {
+                            sandbox.set_current_policy_version(version);
+                        }
+                        if let Some(endpoints) = &endpoint_reset {
+                            endpoint_status::reconcile_endpoint_statuses(
+                                sandbox,
+                                endpoints,
+                                &HashSet::new(),
+                                &prost_types::Timestamp::default(),
+                            );
+                        }
+                    })
+                    .await
+                    .map_err(|error| {
+                        super::persistence_error_to_status(error, "update current_policy_version")
+                    })?;
+                state.sandbox_index.update_from_sandbox(&updated);
+                state.sandbox_watch_bus.notify(sandbox_id);
+                updated.current_policy_version()
+            }
+        };
+        // Supersede below the newest loaded revision, after the current
+        // version settles. Of two results racing, the one finishing last then
+        // supersedes the older revision, even when the older revision's status
+        // write landed after the newer result superseded it.
         let _ = state
             .store
-            .supersede_older_policies(sandbox_id, version_i64)
+            .supersede_older_policies(sandbox_id, i64::from(newest_loaded))
             .await;
-
-        let _sandbox_sync_guard = state.compute.sandbox_sync_guard().await.map_err(|error| {
-            super::persistence_error_to_status(error, "acquire policy mutation lock")
-        })?;
-        let sandbox = state
-            .store
-            .get_message::<Sandbox>(sandbox_id)
-            .await
-            .map_err(|error| Status::internal(format!("fetch sandbox failed: {error}")))?
-            .ok_or_else(|| Status::not_found("sandbox not found"))?;
-        let endpoint_reset = endpoint_status::endpoint_status_reset_for_loaded_policy(
-            state.as_ref(),
-            &sandbox,
-            version_i64,
-        )
-        .await?;
-        let updated = state
-            .store
-            .update_message_cas::<Sandbox, _>(sandbox_id, 0, |sandbox| {
-                if sandbox.current_policy_version() < version {
-                    sandbox.set_current_policy_version(version);
-                }
-                if let Some(endpoints) = &endpoint_reset {
-                    endpoint_status::reconcile_endpoint_statuses(
-                        sandbox,
-                        endpoints,
-                        &HashSet::new(),
-                        &prost_types::Timestamp::default(),
-                    );
-                }
-            })
-            .await
-            .map_err(|error| {
-                super::persistence_error_to_status(error, "update current_policy_version")
-            })?;
-        state.sandbox_index.update_from_sandbox(&updated);
-        state.sandbox_watch_bus.notify(sandbox_id);
     }
     info!(
         sandbox_id,

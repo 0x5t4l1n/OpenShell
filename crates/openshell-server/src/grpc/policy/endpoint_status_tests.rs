@@ -1231,3 +1231,76 @@ async fn loaded_policy_and_unknown_endpoint_inventory_commit_atomically() {
     assert_eq!(cleared.conditions, replaced.conditions);
     assert_eq!(cleared.phase, replaced.phase);
 }
+
+#[tokio::test]
+async fn late_result_for_an_older_revision_keeps_the_newer_policy_active() {
+    let state = test_server_state().await;
+    let sandbox_id = "endpoint-late-policy-result";
+    let mut older_policy = mcp_policy_with_versions(&["2025-11-25"]);
+    older_policy
+        .network_policies
+        .get_mut("mcp")
+        .expect("MCP policy")
+        .endpoints[0]
+        .host = "older.example.com".to_string();
+    let mut newer_policy = older_policy.clone();
+    newer_policy
+        .network_policies
+        .get_mut("mcp")
+        .expect("MCP policy")
+        .endpoints[0]
+        .host = "newer.example.com".to_string();
+    let initial_newer = initial_endpoint_status(&newer_policy.network_policies["mcp"].endpoints[0]);
+    state
+        .store
+        .put_message(&test_sandbox(
+            sandbox_id,
+            sandbox_id,
+            older_policy.clone(),
+            Vec::new(),
+        ))
+        .await
+        .expect("store sandbox");
+    for (version, policy) in [(1, &older_policy), (2, &newer_policy)] {
+        state
+            .store
+            .put_policy_revision(
+                &format!("{sandbox_id}-v{version}"),
+                sandbox_id,
+                "default",
+                version,
+                &policy.encode_to_vec(),
+                &deterministic_policy_hash(policy),
+            )
+            .await
+            .expect("store policy revision");
+    }
+    acknowledge_loaded_policy(&state, sandbox_id, 1).await;
+    acknowledge_loaded_policy(&state, sandbox_id, 2).await;
+    let active = stored_sandbox(&state, sandbox_id)
+        .await
+        .status
+        .expect("active status");
+    assert_eq!(active.current_policy_version, 2);
+    assert_eq!(active.endpoint_statuses, vec![initial_newer]);
+
+    // The older revision's result arrives last, as one queued by a supervisor
+    // session that was replaced before the result was written.
+    acknowledge_loaded_policy(&state, sandbox_id, 1).await;
+
+    let after = stored_sandbox(&state, sandbox_id)
+        .await
+        .status
+        .expect("status after the late result");
+    assert_eq!(after.current_policy_version, 2);
+    assert_eq!(after.endpoint_statuses, active.endpoint_statuses);
+    for (version, status) in [(1, "superseded"), (2, "loaded")] {
+        let revision = state
+            .store
+            .get_policy_by_version(sandbox_id, version)
+            .await
+            .expect("load policy revision")
+            .expect("policy revision exists");
+        assert_eq!(revision.status, status, "policy revision {version}");
+    }
+}
