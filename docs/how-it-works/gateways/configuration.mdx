@@ -549,8 +549,6 @@ provider_profile_sources = [
 
 The gateway validates snapshot structure and provider-profile semantics. It treats a configured interceptor as the source trust boundary and does not verify signature, hash, or key annotations in profile payloads.
 
-The gateway fetches each interceptor source's snapshot at startup and then every 10 seconds, and serves profile reads from that copy. When the snapshot revision changes, the gateway pushes new configuration to sandboxes that receive it over their supervisor session. If refreshes keep failing, the gateway serves the last snapshot for up to 30 seconds, then fails reads that need the catalog with `UNAVAILABLE` until a refresh succeeds.
-
 `failure_policy` accepts `fail_closed` or `fail_open`. `timeout` accepts `ms` and `s` suffixes. In `dynamic` mode, binding overrides may select a manifest binding by `id`, `rpc`, or `service` plus `method`; they can disable a binding, narrow its phases, or override its failure policy.
 
 `image_pull_policy` is a shared driver setting with the canonical values `always`, `if_not_present`, `never`, and `newer`. Set it inside the relevant driver table. Drivers translate these values to their runtime APIs; `newer` is supported only by Podman and is rejected at Docker and Kubernetes startup.
