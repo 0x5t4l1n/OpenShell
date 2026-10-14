@@ -397,9 +397,9 @@ Every PR except an automated dependency update must close an existing issue. In 
 
 Authors without write access to the target repository must link at least one issue with `state:accepted`, and every linked issue must be accepted. This applies to drafts and direct requests to agents. Authors with verified `WRITE`, `MAINTAIN`, or `ADMIN` access may create a PR without the acceptance label; they must still follow the issue-linking requirement above. PR body text, roadmap placement, other labels, and vouch status do not bypass acceptance.
 
-The `PR Issue Acceptance` workflow is disabled and does not check linked issue acceptance. Maintainers review issue acceptance manually.
+Issue acceptance is reviewed manually by maintainers; there is no automated PR issue acceptance check.
 
-Automated dependency update PRs, including Dependabot PRs, are exempt from the separate issue and closing-reference requirement. Human-authored dependency updates follow the normal issue requirement. The exception does not bypass `PR Issue Acceptance` for authors without repository write access or change applicable verification, review, or private vulnerability disclosure requirements.
+Automated dependency update PRs, including Dependabot PRs, are exempt from the separate issue and closing-reference requirement. Human-authored dependency updates follow the normal issue requirement. The exception does not change applicable verification, review, or private vulnerability disclosure requirements.
 
 ### Branch Names
 
