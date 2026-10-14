@@ -3235,6 +3235,27 @@ BEGIN SELECT RAISE(ABORT, 'database unavailable'); END;
             "a stalled provider build must not resend the staged sandbox configuration"
         );
         release_resolve.send(()).unwrap();
+        // The failed build delivers an unresolved provider environment, so the
+        // supervisor revokes its static credentials.
+        let unresolved = sent_update(
+            tokio::time::timeout(
+                Duration::from_secs(5),
+                tokio_stream::StreamExt::next(&mut session.outbound),
+            )
+            .await
+            .expect("unresolved provider environment")
+            .unwrap()
+            .unwrap(),
+        );
+        let Some(config_update::Component::ProviderEnvironment(snapshot)) = unresolved.component
+        else {
+            panic!("expected a provider environment");
+        };
+        assert!(snapshot.values.is_empty());
+        assert_eq!(
+            snapshot.readiness_reason,
+            i32::from(openshell_core::proto::ProviderReadinessReason::CredentialInstallFailed)
+        );
         assert!(
             tokio::time::timeout(
                 Duration::from_millis(500),

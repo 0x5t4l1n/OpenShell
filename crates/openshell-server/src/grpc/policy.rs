@@ -3794,23 +3794,24 @@ pub async fn build_provider_environment_snapshot(
     .await
 }
 
-/// Build the provider environment from captured inputs. This is the only
-/// configuration build step that resolves credential values.
-pub async fn build_provider_environment_snapshot_from_inputs(
-    state: &ServerState,
-    inputs: &SandboxConfigInputs,
-    supports_static_credential_bindings: bool,
-    supports_stable_placeholder_environment_keys: bool,
-) -> Result<ProviderEnvironmentSnapshot, Status> {
-    let sandbox = &inputs.sandbox;
-    let sandbox_id = sandbox.object_id().to_string();
+/// What a provider environment is built for, settled before any credential
+/// is resolved.
+struct ProviderEnvironmentTarget<'a> {
+    spec: &'a openshell_core::proto::SandboxSpec,
+    effective_policy: ProtoSandboxPolicy,
+    policy_source: PolicySource,
+    policy_credential_bindings: HashMap<String, Vec<StaticCredentialEndpointBinding>>,
+    provider_env_revision: u64,
+}
 
+fn provider_environment_target(
+    inputs: &SandboxConfigInputs,
+) -> Result<ProviderEnvironmentTarget<'_>, Status> {
+    let sandbox = &inputs.sandbox;
     let spec = sandbox
         .spec
         .as_ref()
         .ok_or_else(|| Status::internal("sandbox has no spec"))?;
-
-    let provider_names = &spec.providers;
     let provider_profile_catalog = &inputs.catalog;
     let provider_records = &inputs.provider_records;
     let (effective_policy, policy_source) = effective_policy_from_captured_inputs(
@@ -3834,6 +3835,52 @@ pub async fn build_provider_environment_snapshot_from_inputs(
         &policy_credential_bindings,
         matches!(policy_source, PolicySource::Global).then_some(&effective_policy),
     )?;
+    Ok(ProviderEnvironmentTarget {
+        spec,
+        effective_policy,
+        policy_source,
+        policy_credential_bindings,
+        provider_env_revision,
+    })
+}
+
+/// The provider environment to deliver when one cannot be built from
+/// `inputs`: no values, marked as failed. The supervisor revokes its static
+/// credentials, as it does when a polling fetch fails, and keeps a sandbox
+/// configuration for this revision waiting for a successful build.
+pub fn unresolved_provider_environment_snapshot(
+    inputs: &SandboxConfigInputs,
+) -> Result<ProviderEnvironmentSnapshot, Status> {
+    let target = provider_environment_target(inputs)?;
+    Ok(ProviderEnvironmentSnapshot {
+        provider_env_revision: target.provider_env_revision,
+        provider_attachment_epoch: target.spec.provider_attachment_epoch.clone(),
+        policy_hash: deterministic_policy_hash(&target.effective_policy),
+        readiness_reason: ProviderReadinessReason::CredentialInstallFailed.into(),
+        ..Default::default()
+    })
+}
+
+/// Build the provider environment from captured inputs. This is the only
+/// configuration build step that resolves credential values.
+pub async fn build_provider_environment_snapshot_from_inputs(
+    state: &ServerState,
+    inputs: &SandboxConfigInputs,
+    supports_static_credential_bindings: bool,
+    supports_stable_placeholder_environment_keys: bool,
+) -> Result<ProviderEnvironmentSnapshot, Status> {
+    let sandbox_id = inputs.sandbox.object_id().to_string();
+    let ProviderEnvironmentTarget {
+        spec,
+        effective_policy,
+        policy_source,
+        policy_credential_bindings,
+        provider_env_revision,
+    } = provider_environment_target(inputs)?;
+
+    let provider_names = &spec.providers;
+    let provider_profile_catalog = &inputs.catalog;
+    let provider_records = &inputs.provider_records;
     let mut provider_environment =
         super::provider::resolve_provider_environment_from_records_with_policy_bindings_and_credentials(
             provider_profile_catalog,

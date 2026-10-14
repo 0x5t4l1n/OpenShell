@@ -4197,6 +4197,13 @@ mod tests {
                 openshell_core::proto::ProviderEnvironmentValueClassification::Unspecified,
                 "invalid_provider_environment",
             ),
+            // The gateway could not build the environment.
+            (
+                4,
+                ProviderReadinessReason::CredentialInstallFailed,
+                openshell_core::proto::ProviderEnvironmentValueClassification::NonSecret,
+                "provider_environment_unavailable",
+            ),
         ] {
             ctx.provider_credentials = initial_provider_credentials(
                 static_provider_environment(1, Some("initial")),

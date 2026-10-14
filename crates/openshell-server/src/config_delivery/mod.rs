@@ -30,6 +30,7 @@ use crate::auth::principal::Principal;
 use crate::grpc::policy::{
     SandboxConfigInputs, build_provider_environment_snapshot_from_inputs,
     build_sandbox_config_snapshot_from_inputs, load_sandbox_config_inputs,
+    unresolved_provider_environment_snapshot,
 };
 use crate::supervisor_owner::{OWNER_TTL, SupervisorOwnerIndex};
 
@@ -555,47 +556,58 @@ async fn run_build(
     )
     .await;
     let elapsed = load_elapsed + started.elapsed();
-    let message = match built {
-        Ok(Ok(message)) => message,
-        Ok(Err(error)) => {
-            record_build_failure(sandbox_id, component, lane, "failed", error.code(), elapsed);
-            return BuildResult::Failed;
+    let (outcome, error_code) = match built {
+        Ok(Ok(message)) => {
+            record_build(component, lane, "ok", elapsed);
+            return match deliver_if_owner(state, sandbox_id, session_id, component, message).await {
+                OwnerCheck::Unknown => BuildResult::Failed,
+                owner => BuildResult::Built {
+                    owner_moved: matches!(owner, OwnerCheck::Remote),
+                },
+            };
         }
-        Err(_) => {
-            record_build_failure(
-                sandbox_id,
-                component,
-                lane,
-                "timeout",
-                Code::DeadlineExceeded,
-                elapsed,
-            );
-            return BuildResult::Failed;
-        }
+        Ok(Err(error)) => ("failed", error.code()),
+        Err(_) => ("timeout", Code::DeadlineExceeded),
     };
-    record_build(component, lane, "ok", elapsed);
-    let owner_moved = match owner_check(state, sandbox_id, session_id).await {
-        OwnerCheck::Current => {
-            let disposition = state
-                .supervisor_sessions
-                .deliver_config(sandbox_id, session_id, message);
-            record_delivery(component, disposition.metric_label());
-            false
-        }
-        OwnerCheck::Remote => {
-            record_delivery(component, "owner_moved");
-            true
-        }
-        OwnerCheck::Gone => {
-            record_delivery(component, "no_active_session");
-            false
-        }
-        OwnerCheck::Unknown => {
-            record_delivery(component, "owner_lookup_failed");
-            return BuildResult::Failed;
-        }
+    record_build_failure(sandbox_id, component, lane, outcome, error_code, elapsed);
+    // A provider environment that cannot be built revokes the supervisor's
+    // static credentials, as a failed fetch does when polling. A supervisor
+    // that already holds this revision ignores it as a duplicate.
+    if component == ConfigComponentKind::ProviderEnvironment
+        && let Ok(snapshot) = unresolved_provider_environment_snapshot(inputs)
+    {
+        deliver_if_owner(
+            state,
+            sandbox_id,
+            session_id,
+            component,
+            SupervisorConfigMessage::ProviderEnvironment(snapshot),
+        )
+        .await;
+    }
+    BuildResult::Failed
+}
+
+/// Deliver `message` if this gateway still owns the session it was built for.
+async fn deliver_if_owner(
+    state: &Arc<ServerState>,
+    sandbox_id: &str,
+    session_id: &str,
+    component: ConfigComponentKind,
+    message: SupervisorConfigMessage,
+) -> OwnerCheck {
+    let owner = owner_check(state, sandbox_id, session_id).await;
+    let outcome = match owner {
+        OwnerCheck::Current => state
+            .supervisor_sessions
+            .deliver_config(sandbox_id, session_id, message)
+            .metric_label(),
+        OwnerCheck::Remote => "owner_moved",
+        OwnerCheck::Gone => "no_active_session",
+        OwnerCheck::Unknown => "owner_lookup_failed",
     };
-    BuildResult::Built { owner_moved }
+    record_delivery(component, outcome);
+    owner
 }
 
 const fn build_timeout(component: ConfigComponentKind) -> Duration {
@@ -1386,6 +1398,47 @@ mod tests {
         })
         .await
         .expect("the notification task drains its target");
+    }
+
+    #[tokio::test]
+    async fn unresolved_provider_environment_names_the_revision_a_build_would() {
+        let state = push_state().await;
+        put_provider_with_token(&state, "provider", Some("token")).await;
+        put_sandbox(&state, "sandbox", &["provider"]).await;
+        let sandbox = state
+            .store
+            .get_message::<Sandbox>("sandbox")
+            .await
+            .unwrap()
+            .unwrap();
+        let inputs = load_sandbox_config_inputs(&state, sandbox).await.unwrap();
+        let built = build_provider_environment_snapshot_from_inputs(&state, &inputs, true, true)
+            .await
+            .unwrap();
+        assert!(!built.values.is_empty());
+
+        // The supervisor matches the unresolved environment to the sandbox
+        // configuration that names this revision, and to the one it holds.
+        let unresolved = unresolved_provider_environment_snapshot(&inputs).unwrap();
+        assert_eq!(
+            (
+                unresolved.provider_env_revision,
+                &unresolved.provider_attachment_epoch,
+                &unresolved.policy_hash,
+            ),
+            (
+                built.provider_env_revision,
+                &built.provider_attachment_epoch,
+                &built.policy_hash,
+            )
+        );
+        assert!(unresolved.values.is_empty());
+        assert!(unresolved.dynamic_credentials.is_empty());
+        assert!(unresolved.files.is_empty());
+        assert_eq!(
+            unresolved.readiness_reason,
+            i32::from(openshell_core::proto::ProviderReadinessReason::CredentialInstallFailed)
+        );
     }
 
     #[tokio::test]
