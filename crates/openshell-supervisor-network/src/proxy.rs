@@ -6515,7 +6515,7 @@ async fn handle_forward_proxy(
     let sigv4_request_resolver = if credential_signing.is_sigv4() {
         secret_resolver
             .as_deref()
-            .map(|resolver| resolver.with_denied_env_keys(crate::l7::rest::SIGV4_SIGNING_ENV_KEYS))
+            .map(SecretResolver::without_resolvable_placeholders)
     } else {
         None
     };
@@ -13803,8 +13803,7 @@ network_policies:
                 .flatten(),
         )
         .expect("combined resolver");
-        let request_resolver =
-            resolver.with_denied_env_keys(crate::l7::rest::SIGV4_SIGNING_ENV_KEYS);
+        let request_resolver = resolver.without_resolvable_placeholders();
         let raw = format!(
             "GET http://host/p HTTP/1.1\r\n\
              Host: host\r\n\
@@ -13843,8 +13842,7 @@ network_policies:
                 .flatten(),
         )
         .expect("combined resolver");
-        let request_resolver =
-            resolver.with_denied_env_keys(crate::l7::rest::SIGV4_SIGNING_ENV_KEYS);
+        let request_resolver = resolver.without_resolvable_placeholders();
         let raw = format!(
             "PUT http://host/bucket/key HTTP/1.1\r\n\
              Host: host\r\n\
@@ -13886,8 +13884,7 @@ network_policies:
             .collect(),
         );
         let resolver = resolver.expect("resolver");
-        let request_resolver =
-            resolver.with_denied_env_keys(crate::l7::rest::SIGV4_SIGNING_ENV_KEYS);
+        let request_resolver = resolver.without_resolvable_placeholders();
         let body = "3\r\nabc\r\n0\r\nx-amz-checksum-crc32: AAAA==\r\n\r\n";
         let raw = format!(
             "PUT http://s3.us-east-1.amazonaws.com/bucket/key HTTP/1.1\r\n\
