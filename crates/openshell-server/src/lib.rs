@@ -695,10 +695,13 @@ pub(crate) async fn run_server(
         openshell_gateway_interceptors::initialize(config.gateway_interceptors.clone()).await
     }
     .map_err(|e| Error::config(format!("gateway interceptor initialization failed: {e}")))?;
+    // Push delivery needs the refresh to notice catalog changes, so only push
+    // mode serves interceptor profiles from a cached snapshot.
     let provider_profile_sources = provider_profile_sources::ProviderProfileSources::from_config(
         &config.provider_profile_sources,
         gateway_interceptors.as_ref(),
-        provider_profile_sources::PROVIDER_PROFILE_SOURCE_REFRESH_INTERVAL,
+        (config.config_delivery_mode == openshell_core::config::ConfigDeliveryMode::Push)
+            .then_some(provider_profile_sources::PROVIDER_PROFILE_SOURCE_REFRESH_INTERVAL),
     )
     .map_err(|err| {
         Error::config(format!(

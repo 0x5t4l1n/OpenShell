@@ -337,12 +337,13 @@ impl ProviderProfileSources {
         }
     }
 
-    /// Interceptor sources are served from a snapshot refreshed every
-    /// `refresh_interval` by [`spawn_refresh`].
+    /// With a `refresh_interval`, interceptor sources are served from a
+    /// snapshot that [`spawn_refresh`] refreshes at that interval. Without
+    /// one, every read calls the interceptor.
     pub fn from_config(
         configured: &[GatewayProviderProfileSourceConfig],
         runtime: Option<&GatewayInterceptorRuntime>,
-        refresh_interval: Duration,
+        refresh_interval: Option<Duration>,
     ) -> Result<Self, String> {
         if configured.is_empty() {
             return Err("provider_profile_sources must contain at least one source".to_string());
@@ -366,12 +367,18 @@ impl ProviderProfileSources {
                                 "provider profile source interceptor '{name}' is not configured or does not advertise provider_profiles"
                             )
                         })?;
-                    let source = Arc::new(CachedProviderProfileSource::new(
-                        Arc::new(source),
-                        refresh_interval,
-                    ));
-                    cached.push(Arc::clone(&source));
-                    source
+                    let source: Arc<dyn ProviderProfileSource> = Arc::new(source);
+                    match refresh_interval {
+                        Some(refresh_interval) => {
+                            let source = Arc::new(CachedProviderProfileSource::new(
+                                source,
+                                refresh_interval,
+                            ));
+                            cached.push(Arc::clone(&source));
+                            source
+                        }
+                        None => source,
+                    }
                 }
             };
             let source_id = source.source_id().to_string();
@@ -385,12 +392,15 @@ impl ProviderProfileSources {
         Ok(Self {
             sources,
             cached,
-            refresh_interval,
+            refresh_interval: refresh_interval.unwrap_or_default(),
         })
     }
 
     /// Refresh every cached source. Returns whether any revision changed.
     pub(crate) async fn refresh_cached(&self, store: &Store) -> bool {
+        if self.cached.is_empty() {
+            return false;
+        }
         let mut changed = false;
         let mut oldest = Duration::ZERO;
         for source in &self.cached {
@@ -1467,7 +1477,7 @@ mod tests {
                 GatewayProviderProfileSourceConfig::User,
             ],
             Some(&runtime),
-            Duration::from_secs(10),
+            Some(Duration::from_secs(10)),
         )
         .unwrap();
 
@@ -1475,10 +1485,53 @@ mod tests {
         task.abort();
     }
 
+    #[tokio::test]
+    async fn interceptor_sources_are_cached_only_with_a_refresh_interval() {
+        let (runtime, task) = interceptor_runtime(
+            ProtoProviderProfileSnapshot {
+                revision: "external".to_string(),
+                profiles: vec![profile("governed-github")],
+            },
+            true,
+        )
+        .await;
+        let store = crate::persistence::test_store().await;
+        let configured = [GatewayProviderProfileSourceConfig::Interceptor {
+            name: "governance".to_string(),
+        }];
+
+        // A cached source fails closed until its first refresh, so a read
+        // that succeeds without one went to the interceptor.
+        let uncached =
+            ProviderProfileSources::from_config(&configured, Some(&runtime), None).unwrap();
+        assert!(uncached.cached.is_empty());
+        uncached
+            .snapshot_catalog(&store, "default")
+            .await
+            .expect("an uncached interceptor source is read on request");
+
+        let cached = ProviderProfileSources::from_config(
+            &configured,
+            Some(&runtime),
+            Some(Duration::from_secs(10)),
+        )
+        .unwrap();
+        assert_eq!(cached.cached.len(), 1);
+        assert_eq!(
+            cached
+                .snapshot_catalog(&store, "default")
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::Unavailable
+        );
+        task.abort();
+    }
+
     #[test]
     fn configured_sources_must_not_be_empty() {
-        let err =
-            ProviderProfileSources::from_config(&[], None, Duration::from_secs(10)).unwrap_err();
+        let err = ProviderProfileSources::from_config(&[], None, Some(Duration::from_secs(10)))
+            .unwrap_err();
         assert!(err.contains("at least one source"));
     }
 
@@ -1490,7 +1543,7 @@ mod tests {
                 GatewayProviderProfileSourceConfig::User,
             ],
             None,
-            Duration::from_secs(10),
+            Some(Duration::from_secs(10)),
         )
         .unwrap_err();
         assert!(err.contains("duplicate provider profile source 'user'"));
@@ -1503,7 +1556,7 @@ mod tests {
                 name: "governance".to_string(),
             }],
             None,
-            Duration::from_secs(10),
+            Some(Duration::from_secs(10)),
         )
         .unwrap_err();
         assert!(err.contains("not configured or does not advertise provider_profiles"));
@@ -1569,7 +1622,7 @@ mod tests {
                 name: "governance".to_string(),
             }],
             Some(&runtime),
-            Duration::from_secs(10),
+            Some(Duration::from_secs(10)),
         )
         .unwrap();
         let store = crate::persistence::test_store().await;
@@ -1607,7 +1660,7 @@ mod tests {
                 name: "governance".to_string(),
             }],
             Some(&runtime),
-            Duration::from_secs(10),
+            Some(Duration::from_secs(10)),
         )
         .unwrap();
         let store = crate::persistence::test_store().await;
@@ -1636,7 +1689,7 @@ mod tests {
                 name: "governance".to_string(),
             }],
             Some(&runtime),
-            Duration::from_secs(10),
+            Some(Duration::from_secs(10)),
         )
         .unwrap();
         let store = crate::persistence::test_store().await;
@@ -1668,7 +1721,7 @@ mod tests {
                 },
             ],
             Some(&runtime),
-            Duration::from_secs(10),
+            Some(Duration::from_secs(10)),
         )
         .unwrap();
         let store = crate::persistence::test_store().await;
@@ -1710,7 +1763,7 @@ mod tests {
                 },
             ],
             Some(&runtime),
-            Duration::from_secs(10),
+            Some(Duration::from_secs(10)),
         )
         .unwrap();
         let store = crate::persistence::test_store().await;
@@ -1746,7 +1799,7 @@ mod tests {
                 name: "governance".to_string(),
             }],
             Some(&runtime),
-            Duration::from_secs(10),
+            Some(Duration::from_secs(10)),
         )
         .unwrap();
         let store = crate::persistence::test_store().await;
@@ -1778,7 +1831,7 @@ mod tests {
                 },
             ],
             Some(&runtime),
-            Duration::from_secs(10),
+            Some(Duration::from_secs(10)),
         )
         .unwrap();
         let store = crate::persistence::test_store().await;
@@ -1805,7 +1858,7 @@ mod tests {
                 name: "governance".to_string(),
             }],
             Some(&runtime),
-            Duration::from_secs(10),
+            Some(Duration::from_secs(10)),
         )
         .unwrap_err();
 

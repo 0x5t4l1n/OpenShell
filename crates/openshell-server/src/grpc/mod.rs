@@ -1195,7 +1195,7 @@ pub mod test_support {
         crate::provider_profile_sources::ProviderProfileSources::from_config(
             &[openshell_core::GatewayProviderProfileSourceConfig::User],
             None,
-            crate::provider_profile_sources::PROVIDER_PROFILE_SOURCE_REFRESH_INTERVAL,
+            None,
         )
         .expect("user-only provider profile source configuration should be valid")
     }
