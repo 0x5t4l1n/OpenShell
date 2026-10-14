@@ -26,7 +26,7 @@ use std::time::Duration;
 
 use openshell_core::proto::{
     HttpBodyMode, HttpBodyUnavailableReason, HttpHeader, HttpResponsePreflightHead,
-    MiddlewareSessionEndReason, RequestContext, http_preflight,
+    MiddlewareSessionEndReason, RequestContext,
 };
 use tokio::sync::mpsc;
 use tokio::time::Instant;
@@ -34,9 +34,10 @@ use tokio::time::Instant;
 use super::pipeline::{
     self, BodyModeOffer, HTTP_BUFFERED_BODY_TIMEOUT, HttpBodyInput, HttpBodyOutput, HttpDirection,
     HttpFailureCode, HttpMiddlewareFailure, HttpPipelineFinish, HttpStageDiagnostics,
-    MiddlewareFailureDetail, Pipeline, PipelineSpec, PipelineTimeouts, StageHead,
+    MiddlewareFailureDetail, Pipeline, PipelineSpec, PipelineTimeouts, PreflightFields, StageHead,
+    StagePreflight,
 };
-use super::validate_head_input;
+use super::{has_content_coding, validate_head_input};
 use crate::headers::HeaderAuthority;
 use crate::{
     ChainRunner, DescribedChainEntry, HttpResponsePreflightInput, MAX_MIDDLEWARE_CHAIN_TIMEOUT,
@@ -176,11 +177,7 @@ fn body_restriction(input: &HttpResponsePreflightInput) -> Option<BodyRestrictio
     }) {
         return Some(BodyRestriction::NoTransform);
     }
-    if headers("content-encoding").any(|value| {
-        value
-            .split(',')
-            .any(|coding| !coding.trim().eq_ignore_ascii_case("identity"))
-    }) {
+    if has_content_coding(&input.headers) {
         return Some(BodyRestriction::Encoded);
     }
     None
@@ -220,9 +217,15 @@ impl<'a> ResponseHead<'a> {
         }
     }
 
-    /// Why `mode` is not offered to a stage with payload limit `limit`, by
-    /// the first eligibility rule that removes it.
-    fn unavailable(&self, mode: HttpBodyMode, limit: usize) -> Option<HttpBodyUnavailableReason> {
+    /// Why `mode` is not offered to a stage with payload limit `limit` that
+    /// receives a body of `declared_body_bytes`, by the first eligibility
+    /// rule that removes it.
+    fn unavailable(
+        &self,
+        mode: HttpBodyMode,
+        limit: usize,
+        declared_body_bytes: Option<u64>,
+    ) -> Option<HttpBodyUnavailableReason> {
         if let Some(restriction) = self.restriction {
             return Some(restriction.reason());
         }
@@ -232,10 +235,7 @@ impl<'a> ResponseHead<'a> {
             }
             HttpBodyMode::Buffered if self.open_ended => Some(HttpBodyUnavailableReason::OpenEnded),
             HttpBodyMode::Buffered
-                if self
-                    .input
-                    .declared_body_length
-                    .is_some_and(|length| length > limit as u64) =>
+                if declared_body_bytes.is_some_and(|length| length > limit as u64) =>
             {
                 Some(HttpBodyUnavailableReason::OverLimit)
             }
@@ -249,22 +249,26 @@ impl StageHead for ResponseHead<'_> {
         &self.input.context
     }
 
-    fn preflight_subject(&self, headers: &[HttpHeader]) -> http_preflight::Subject {
-        http_preflight::Subject::Response(HttpResponsePreflightHead {
+    fn preflight(&self, headers: &[HttpHeader], fields: PreflightFields) -> StagePreflight {
+        fields.response(HttpResponsePreflightHead {
             target: Some(self.input.target.clone()),
             status_code: u32::from(self.input.status_code),
             headers: headers.to_vec(),
         })
     }
 
-    fn body_modes(&self, entry: &DescribedChainEntry) -> BodyModeOffer {
+    fn body_modes(
+        &self,
+        entry: &DescribedChainEntry,
+        declared_body_bytes: Option<u64>,
+    ) -> BodyModeOffer {
         let limit = entry.max_payload_bytes();
         let mut offer = BodyModeOffer::default();
         if limit == 0 {
             return offer;
         }
         for mode in [HttpBodyMode::Buffered, HttpBodyMode::Stream] {
-            match self.unavailable(mode, limit) {
+            match self.unavailable(mode, limit, declared_body_bytes) {
                 Some(reason) => offer.withhold(mode, reason),
                 None => offer.permit(mode),
             }
@@ -608,7 +612,8 @@ mod tests {
             ),
         ];
         for (case, input, chunked, permitted, unavailable) in cases {
-            let offer = ResponseHead::new(&input, chunked).body_modes(&entry(1024));
+            let offer = ResponseHead::new(&input, chunked)
+                .body_modes(&entry(1024), input.declared_body_length);
             assert_eq!(offer.permitted, permitted, "{case}");
             assert_eq!(
                 offer.unavailable,

@@ -4755,11 +4755,14 @@ network_policies:
         type EvaluateWebSocketSessionStream =
             openshell_supervisor_middleware::WebSocketResponseStream;
 
-        type EvaluateHttpRequestSessionStream = openshell_core::middleware::HttpResultStream;
+        type EvaluateHttpRequestSessionStream =
+            openshell_core::middleware::HttpRequestSessionResultStream;
 
         async fn evaluate_http_request_session(
             &self,
-            _request: tonic::Request<tonic::Streaming<openshell_core::proto::HttpEvent>>,
+            _request: tonic::Request<
+                tonic::Streaming<openshell_core::proto::HttpRequestSessionEvent>,
+            >,
         ) -> std::result::Result<
             tonic::Response<Self::EvaluateHttpRequestSessionStream>,
             tonic::Status,
@@ -4767,11 +4770,14 @@ network_policies:
             Err(tonic::Status::unimplemented("v1 HTTP hook test service"))
         }
 
-        type EvaluateHttpResponseSessionStream = openshell_core::middleware::HttpResultStream;
+        type EvaluateHttpResponseSessionStream =
+            openshell_core::middleware::HttpResponseSessionResultStream;
 
         async fn evaluate_http_response_session(
             &self,
-            _request: tonic::Request<tonic::Streaming<openshell_core::proto::HttpEvent>>,
+            _request: tonic::Request<
+                tonic::Streaming<openshell_core::proto::HttpResponseSessionEvent>,
+            >,
         ) -> std::result::Result<
             tonic::Response<Self::EvaluateHttpResponseSessionStream>,
             tonic::Status,
@@ -11672,13 +11678,16 @@ network_policies:
 
         async fn open_http_request_session(
             &self,
-            mut events: tokio::sync::mpsc::Receiver<openshell_core::proto::HttpEvent>,
-        ) -> std::result::Result<openshell_core::middleware::HttpResultStream, tonic::Status>
-        {
+            mut events: tokio::sync::mpsc::Receiver<openshell_core::proto::HttpRequestSessionEvent>,
+        ) -> std::result::Result<
+            openshell_core::middleware::HttpRequestSessionResultStream,
+            tonic::Status,
+        > {
             use openshell_core::proto::{
                 HttpFinish, HttpInspect, HttpOutputChunk, HttpOutputStart, HttpPreflightResult,
-                HttpReject, HttpResult, HttpStreamMode, MiddlewareDiagnostics, http_event,
-                http_inspect, http_preflight_result, http_result,
+                HttpReject, HttpRequestSessionResult, HttpStreamMode, MiddlewareDiagnostics,
+                http_inspect, http_preflight_result, http_request_session_event,
+                http_request_session_result,
             };
             let (drop_body, reject) = (self.drop_body, self.reject);
             let (sender, receiver) = tokio::sync::mpsc::channel(4);
@@ -11686,46 +11695,54 @@ network_policies:
                 let mut declared = None;
                 while let Some(event) = events.recv().await {
                     let result = match event.event {
-                        Some(http_event::Event::Preflight(preflight)) => {
+                        Some(http_request_session_event::Event::Preflight(preflight)) => {
                             declared = if drop_body {
                                 Some(0)
                             } else {
                                 preflight.declared_body_bytes
                             };
-                            http_result::Result::PreflightResult(HttpPreflightResult {
-                                decision: Some(http_preflight_result::Decision::Inspect(
-                                    HttpInspect {
-                                        mode: Some(http_inspect::Mode::Stream(HttpStreamMode {})),
-                                    },
-                                )),
-                                ..Default::default()
-                            })
+                            http_request_session_result::Result::PreflightResult(
+                                HttpPreflightResult {
+                                    decision: Some(http_preflight_result::Decision::Inspect(
+                                        HttpInspect {
+                                            mode: Some(http_inspect::Mode::Stream(
+                                                HttpStreamMode {},
+                                            )),
+                                        },
+                                    )),
+                                    ..Default::default()
+                                },
+                            )
                         }
-                        Some(http_event::Event::Begin(_)) => {
-                            http_result::Result::OutputStart(HttpOutputStart {
+                        Some(http_request_session_event::Event::Begin(_)) => {
+                            http_request_session_result::Result::OutputStart(HttpOutputStart {
                                 header_mutations: Vec::new(),
                                 output_body_bytes: declared,
                             })
                         }
-                        Some(http_event::Event::InputChunk(_)) if drop_body => continue,
-                        Some(http_event::Event::InputChunk(chunk)) => {
-                            http_result::Result::OutputChunk(HttpOutputChunk { data: chunk.data })
+                        Some(http_request_session_event::Event::InputChunk(_)) if drop_body => {
+                            continue;
                         }
-                        Some(http_event::Event::InputEnd(_)) if reject => {
-                            http_result::Result::Reject(HttpReject {
+                        Some(http_request_session_event::Event::InputChunk(chunk)) => {
+                            http_request_session_result::Result::OutputChunk(HttpOutputChunk {
+                                data: chunk.data,
+                            })
+                        }
+                        Some(http_request_session_event::Event::InputEnd(_)) if reject => {
+                            http_request_session_result::Result::Reject(HttpReject {
                                 diagnostics: Some(MiddlewareDiagnostics {
                                     reason_code: "late_match".into(),
                                     ..Default::default()
                                 }),
                             })
                         }
-                        Some(http_event::Event::InputEnd(_)) => {
-                            http_result::Result::Finish(HttpFinish::default())
+                        Some(http_request_session_event::Event::InputEnd(_)) => {
+                            http_request_session_result::Result::Finish(HttpFinish::default())
                         }
                         _ => break,
                     };
                     if sender
-                        .send(Ok(HttpResult {
+                        .send(Ok(HttpRequestSessionResult {
                             result: Some(result),
                         }))
                         .await
@@ -11937,13 +11954,18 @@ network_policies:
 
         async fn open_http_request_session(
             &self,
-            mut requests: tokio::sync::mpsc::Receiver<openshell_core::proto::HttpEvent>,
-        ) -> std::result::Result<openshell_core::middleware::HttpResultStream, tonic::Status>
-        {
+            mut requests: tokio::sync::mpsc::Receiver<
+                openshell_core::proto::HttpRequestSessionEvent,
+            >,
+        ) -> std::result::Result<
+            openshell_core::middleware::HttpRequestSessionResultStream,
+            tonic::Status,
+        > {
             use openshell_core::proto::{
                 ExistingHeaderAction, HeaderMutation, HttpBufferedMode, HttpBufferedResult,
-                HttpInspect, HttpPreflightResult, HttpResult, WriteHeader, header_mutation,
-                http_buffered_result, http_event, http_inspect, http_preflight_result, http_result,
+                HttpInspect, HttpPreflightResult, HttpRequestSessionResult, WriteHeader,
+                header_mutation, http_buffered_result, http_inspect, http_preflight_result,
+                http_request_session_event, http_request_session_result,
             };
             let mirror = vec![HeaderMutation {
                 operation: Some(header_mutation::Operation::Write(WriteHeader {
@@ -11963,43 +11985,47 @@ network_policies:
             tokio::spawn(async move {
                 while let Some(event) = requests.recv().await {
                     let result = match event.event {
-                        Some(http_event::Event::Preflight(preflight)) => {
-                            http_result::Result::PreflightResult(HttpPreflightResult {
-                                decision: Some(http_preflight_result::Decision::Inspect(
-                                    HttpInspect {
-                                        mode: Some(http_inspect::Mode::Buffered(
-                                            HttpBufferedMode {
-                                                max_body_bytes: preflight
-                                                    .limits
-                                                    .map_or(1, |limits| {
-                                                        limits.max_buffered_body_bytes
-                                                    }),
-                                            },
-                                        )),
-                                    },
-                                )),
-                                header_mutations: preflight_mutations.clone(),
-                                diagnostics: None,
-                            })
+                        Some(http_request_session_event::Event::Preflight(preflight)) => {
+                            http_request_session_result::Result::PreflightResult(
+                                HttpPreflightResult {
+                                    decision: Some(http_preflight_result::Decision::Inspect(
+                                        HttpInspect {
+                                            mode: Some(http_inspect::Mode::Buffered(
+                                                HttpBufferedMode {
+                                                    max_body_bytes: preflight
+                                                        .limits
+                                                        .map_or(1, |limits| {
+                                                            limits.max_buffered_body_bytes
+                                                        }),
+                                                },
+                                            )),
+                                        },
+                                    )),
+                                    header_mutations: preflight_mutations.clone(),
+                                    diagnostics: None,
+                                },
+                            )
                         }
-                        Some(http_event::Event::BufferedBody(body)) => {
+                        Some(http_request_session_event::Event::BufferedBody(body)) => {
                             let original: serde_json::Value =
                                 serde_json::from_slice(&body.data).unwrap();
                             assert_eq!(original["params"]["name"], "read_status");
                             invocations.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                            http_result::Result::BufferedResult(HttpBufferedResult {
-                                body: Some(http_buffered_result::Body::Replacement(
-                                    replacement.clone(),
-                                )),
-                                header_mutations: late_mutations.clone(),
-                                ..Default::default()
-                            })
+                            http_request_session_result::Result::BufferedResult(
+                                HttpBufferedResult {
+                                    body: Some(http_buffered_result::Body::Replacement(
+                                        replacement.clone(),
+                                    )),
+                                    header_mutations: late_mutations.clone(),
+                                    ..Default::default()
+                                },
+                            )
                         }
-                        Some(http_event::Event::SessionEnd(_)) | None => break,
+                        Some(http_request_session_event::Event::SessionEnd(_)) | None => break,
                         Some(_) => continue,
                     };
                     if sender
-                        .send(Ok(HttpResult {
+                        .send(Ok(HttpRequestSessionResult {
                             result: Some(result),
                         }))
                         .await

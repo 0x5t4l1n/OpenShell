@@ -20,15 +20,17 @@ use clap::Parser;
 use openshell_core::extension_protocol::{
     ExtensionFamily, http_session_middleware_metadata, validate_gateway_metadata,
 };
-use openshell_core::middleware::{HttpResultStream, WebSocketResponseStream};
+use openshell_core::middleware::{
+    HttpRequestSessionResultStream, HttpResponseSessionResultStream, WebSocketResponseStream,
+};
 use openshell_core::proto::middleware::v1::supervisor_middleware_server::{
     SupervisorMiddleware, SupervisorMiddlewareServer,
 };
 use openshell_core::proto::{
-    HttpEvent, HttpRequestEvaluation, HttpRequestResult, MiddlewareBinding,
-    MiddlewareDescribeRequest, MiddlewareManifest, SupervisorMiddlewareOperation,
-    SupervisorMiddlewarePhase, ValidateConfigRequest, ValidateConfigResponse,
-    WebSocketSessionEvent,
+    HttpRequestEvaluation, HttpRequestResult, HttpRequestSessionEvent, HttpResponseSessionEvent,
+    MiddlewareBinding, MiddlewareDescribeRequest, MiddlewareManifest,
+    SupervisorMiddlewareOperation, SupervisorMiddlewarePhase, ValidateConfigRequest,
+    ValidateConfigResponse, WebSocketSessionEvent,
 };
 use tonic::transport::Server;
 use tonic::{Request, Response, Status};
@@ -67,8 +69,8 @@ fn http_binding(
 #[tonic::async_trait]
 impl SupervisorMiddleware for ContentGuard {
     type EvaluateWebSocketSessionStream = WebSocketResponseStream;
-    type EvaluateHttpRequestSessionStream = HttpResultStream;
-    type EvaluateHttpResponseSessionStream = HttpResultStream;
+    type EvaluateHttpRequestSessionStream = HttpRequestSessionResultStream;
+    type EvaluateHttpResponseSessionStream = HttpResponseSessionResultStream;
 
     async fn describe(
         &self,
@@ -140,16 +142,16 @@ impl SupervisorMiddleware for ContentGuard {
 
     async fn evaluate_http_request_session(
         &self,
-        request: Request<tonic::Streaming<HttpEvent>>,
+        request: Request<tonic::Streaming<HttpRequestSessionEvent>>,
     ) -> Result<Response<Self::EvaluateHttpRequestSessionStream>, Status> {
-        Ok(Response::new(http::stage_stream(request.into_inner())))
+        Ok(Response::new(http::request_stream(request.into_inner())))
     }
 
     async fn evaluate_http_response_session(
         &self,
-        request: Request<tonic::Streaming<HttpEvent>>,
+        request: Request<tonic::Streaming<HttpResponseSessionEvent>>,
     ) -> Result<Response<Self::EvaluateHttpResponseSessionStream>, Status> {
-        Ok(Response::new(http::stage_stream(request.into_inner())))
+        Ok(Response::new(http::response_stream(request.into_inner())))
     }
 
     async fn evaluate_web_socket_session(

@@ -7284,12 +7284,12 @@ mod tests {
 
     async fn emit_session_result(
         sender: &mpsc::Sender<
-            std::result::Result<openshell_core::proto::HttpResult, tonic::Status>,
+            std::result::Result<openshell_core::proto::HttpResponseSessionResult, tonic::Status>,
         >,
-        result: openshell_core::proto::http_result::Result,
+        result: openshell_core::proto::http_response_session_result::Result,
     ) -> bool {
         sender
-            .send(Ok(openshell_core::proto::HttpResult {
+            .send(Ok(openshell_core::proto::HttpResponseSessionResult {
                 result: Some(result),
             }))
             .await
@@ -7335,53 +7335,65 @@ mod tests {
 
         async fn open_http_response_session(
             &self,
-            mut events: mpsc::Receiver<openshell_core::proto::HttpEvent>,
-        ) -> std::result::Result<openshell_supervisor_middleware::HttpResultStream, tonic::Status>
-        {
+            mut events: mpsc::Receiver<openshell_core::proto::HttpResponseSessionEvent>,
+        ) -> std::result::Result<
+            openshell_supervisor_middleware::HttpResponseSessionResultStream,
+            tonic::Status,
+        > {
             use openshell_core::proto::{
                 HttpFinish, HttpInspect, HttpOutputChunk, HttpOutputStart, HttpPreflightResult,
-                HttpReject, HttpStreamMode, MiddlewareDiagnostics, http_event, http_inspect,
-                http_preflight_result, http_result,
+                HttpReject, HttpStreamMode, MiddlewareDiagnostics, http_inspect,
+                http_preflight_result, http_response_session_event, http_response_session_result,
             };
             let (declared, reject, gate) = (self.declared, self.reject, self.gate.clone());
             let (sender, receiver) = mpsc::channel(4);
             tokio::spawn(async move {
                 while let Some(event) = events.recv().await {
                     let sent = match event.event {
-                        Some(http_event::Event::Preflight(_)) => {
+                        Some(http_response_session_event::Event::Preflight(_)) => {
                             emit_session_result(
                                 &sender,
-                                http_result::Result::PreflightResult(HttpPreflightResult {
-                                    decision: Some(http_preflight_result::Decision::Inspect(
-                                        HttpInspect {
-                                            mode: Some(http_inspect::Mode::Stream(
-                                                HttpStreamMode {},
-                                            )),
-                                        },
-                                    )),
-                                    ..Default::default()
-                                }),
+                                http_response_session_result::Result::PreflightResult(
+                                    HttpPreflightResult {
+                                        decision: Some(http_preflight_result::Decision::Inspect(
+                                            HttpInspect {
+                                                mode: Some(http_inspect::Mode::Stream(
+                                                    HttpStreamMode {},
+                                                )),
+                                            },
+                                        )),
+                                        ..Default::default()
+                                    },
+                                ),
                             )
                             .await
                         }
-                        Some(http_event::Event::Begin(_)) => {
+                        Some(http_response_session_event::Event::Begin(_)) => {
                             emit_session_result(
                                 &sender,
-                                http_result::Result::OutputStart(HttpOutputStart {
-                                    header_mutations: Vec::new(),
-                                    output_body_bytes: declared,
-                                }),
+                                http_response_session_result::Result::OutputStart(
+                                    HttpOutputStart {
+                                        header_mutations: Vec::new(),
+                                        output_body_bytes: declared,
+                                    },
+                                ),
                             )
                             .await
                         }
-                        Some(http_event::Event::InputChunk(_)) if declared == Some(0) => true,
-                        Some(http_event::Event::InputChunk(chunk)) => {
+                        Some(http_response_session_event::Event::InputChunk(_))
+                            if declared == Some(0) =>
+                        {
+                            true
+                        }
+                        Some(http_response_session_event::Event::InputChunk(chunk)) => {
                             let (first, rest) = chunk.data.split_at(1);
                             let mut sent = emit_session_result(
                                 &sender,
-                                http_result::Result::OutputChunk(HttpOutputChunk {
-                                    data: first.to_vec(),
-                                }),
+                                http_response_session_result::Result::OutputChunk(
+                                    HttpOutputChunk {
+                                        data: first.to_vec(),
+                                    },
+                                ),
                             )
                             .await;
                             if let Some(gate) = &gate {
@@ -7391,18 +7403,20 @@ mod tests {
                             if sent && !rest.is_empty() {
                                 sent = emit_session_result(
                                     &sender,
-                                    http_result::Result::OutputChunk(HttpOutputChunk {
-                                        data: rest.to_vec(),
-                                    }),
+                                    http_response_session_result::Result::OutputChunk(
+                                        HttpOutputChunk {
+                                            data: rest.to_vec(),
+                                        },
+                                    ),
                                 )
                                 .await;
                             }
                             sent
                         }
-                        Some(http_event::Event::InputEnd(_)) if reject => {
+                        Some(http_response_session_event::Event::InputEnd(_)) if reject => {
                             emit_session_result(
                                 &sender,
-                                http_result::Result::Reject(HttpReject {
+                                http_response_session_result::Result::Reject(HttpReject {
                                     diagnostics: Some(MiddlewareDiagnostics {
                                         reason_code: "late_match".into(),
                                         ..Default::default()
@@ -7411,10 +7425,10 @@ mod tests {
                             )
                             .await
                         }
-                        Some(http_event::Event::InputEnd(_)) => {
+                        Some(http_response_session_event::Event::InputEnd(_)) => {
                             emit_session_result(
                                 &sender,
-                                http_result::Result::Finish(HttpFinish::default()),
+                                http_response_session_result::Result::Finish(HttpFinish::default()),
                             )
                             .await
                         }

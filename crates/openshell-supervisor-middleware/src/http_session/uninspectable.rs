@@ -14,12 +14,12 @@
 
 use openshell_core::proto::{
     MiddlewareSessionEndReason, RequestContext, UninspectableTraffic, UninspectableTrafficReason,
-    http_preflight, http_preflight_result, http_result,
+    http_preflight_result, http_request_session_preflight,
 };
 
 use super::pipeline::{
     self, BodyModeOffer, HttpStageDiagnostics, HttpStageInvocation, HttpStageOutcome,
-    PipelineTimeouts, StageHead,
+    PipelineTimeouts, PreflightFields, StageHead, StagePreflight, StageResult,
 };
 use crate::{
     ChainEntry, ChainRunner, DescribedChainEntry, HttpHookVersion, MAX_MIDDLEWARE_CHAIN_TIMEOUT,
@@ -76,19 +76,22 @@ impl StageHead for UninspectableHead<'_> {
         &self.input.context
     }
 
-    fn preflight_subject(
+    fn preflight(
         &self,
         _headers: &[openshell_core::proto::HttpHeader],
-    ) -> http_preflight::Subject {
-        http_preflight::Subject::Uninspectable(UninspectableTraffic {
-            host: self.input.host.clone(),
-            port: u32::from(self.input.port),
-            endpoint: self.input.endpoint.clone(),
-            reason: self.input.reason as i32,
-        })
+        fields: PreflightFields,
+    ) -> StagePreflight {
+        fields.request(http_request_session_preflight::Subject::Uninspectable(
+            UninspectableTraffic {
+                host: self.input.host.clone(),
+                port: u32::from(self.input.port),
+                endpoint: self.input.endpoint.clone(),
+                reason: self.input.reason as i32,
+            },
+        ))
     }
 
-    fn body_modes(&self, _entry: &DescribedChainEntry) -> BodyModeOffer {
+    fn body_modes(&self, _entry: &DescribedChainEntry, _declared: Option<u64>) -> BodyModeOffer {
         BodyModeOffer::default()
     }
 }
@@ -246,7 +249,7 @@ async fn evaluate_stage(
         }
     };
     let decided = match result {
-        http_result::Result::PreflightResult(result) => {
+        StageResult::PreflightResult(result) => {
             match pipeline::validate_diagnostics(entry, result.diagnostics.as_ref()) {
                 Err(failure) => Err(failure),
                 Ok(_) if !result.header_mutations.is_empty() => Err(pipeline::entry_failure(
@@ -273,9 +276,7 @@ async fn evaluate_stage(
                 },
             }
         }
-        http_result::Result::Reject(reject) => {
-            Err(pipeline::rejection(entry, reject.diagnostics.as_ref()))
-        }
+        StageResult::Reject(reject) => Err(pipeline::rejection(entry, reject.diagnostics.as_ref())),
         _ => Err(pipeline::entry_failure(entry, "preflight_result_expected")),
     };
     let end_reason = match &decided {

@@ -34,15 +34,18 @@ use tokio::time::Instant;
 
 use openshell_core::proto::{
     Decision, HeaderMutation, HttpBegin, HttpBodyLimits, HttpBodyMode, HttpBodyModeUnavailable,
-    HttpBodyUnavailableReason, HttpBufferedBody, HttpEvent, HttpHeader, HttpInputChunk,
-    HttpInputEnd, HttpPreflight, HttpResult, MiddlewareDiagnostics, MiddlewareSessionEnd,
-    MiddlewareSessionEndReason, RequestContext, header_mutation, http_buffered_result, http_event,
-    http_inspect, http_preflight, http_preflight_result, http_result,
+    HttpBodyUnavailableReason, HttpBufferedBody, HttpBufferedResult, HttpFinish, HttpHeader,
+    HttpInputChunk, HttpInputEnd, HttpOutputChunk, HttpOutputStart, HttpPreflightResult,
+    HttpReject, HttpRequestSessionEvent, HttpRequestSessionPreflight, HttpResponsePreflightHead,
+    HttpResponseSessionEvent, HttpResponseSessionPreflight, MiddlewareDiagnostics,
+    MiddlewareSessionEnd, MiddlewareSessionEndReason, RequestContext, SupervisorMiddlewarePhase,
+    header_mutation, http_buffered_result, http_inspect, http_preflight_result,
+    http_request_session_event, http_request_session_preflight, http_response_session_event,
 };
 
 use crate::headers::{self, HeaderAuthority};
 use crate::{
-    ChainRunner, DescribedChainEntry, EXTERNAL_FINDING_LABEL, HttpHookVersion, HttpResultStream,
+    ChainRunner, DescribedChainEntry, EXTERNAL_FINDING_LABEL, HttpHookVersion,
     MAX_MIDDLEWARE_FINDING_BYTES, MAX_MIDDLEWARE_FINDINGS_PER_STAGE, MAX_MIDDLEWARE_METADATA_BYTES,
     MAX_MIDDLEWARE_METADATA_ENTRIES, MAX_MIDDLEWARE_PAYLOAD_BYTES, MAX_MIDDLEWARE_REASON_BYTES,
     MAX_MIDDLEWARE_REASON_CODE_BYTES, MiddlewareDenial, MiddlewareDiagnosticPolicy,
@@ -65,8 +68,7 @@ pub const HTTP_BUFFERED_BODY_TIMEOUT: Duration = Duration::from_mins(2);
 /// Messages each link and stage queue holds.
 pub const STAGE_QUEUE_MESSAGES: usize = 4;
 const SESSION_END_TIMEOUT: Duration = Duration::from_millis(10);
-/// Failure reason for an HTTP session hook stage that ends its stream with
-/// `FAILED_PRECONDITION`: it cannot inspect the message.
+/// Failure reason for an HTTP session hook stage that returns `cannot_inspect`.
 pub const MIDDLEWARE_CANNOT_INSPECT: &str = "middleware_cannot_inspect";
 /// Failure reason for a chain that selects v1 and HTTP session hook stages for the
 /// same HTTP message.
@@ -80,8 +82,8 @@ pub const MIDDLEWARE_HOOK_VERSIONS_MIXED: &str = "middleware_hook_versions_mixed
 /// is safe to return to the sandbox and to record.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HttpFailureCode {
-    /// The stage ended its stream with `FAILED_PRECONDITION`, or the message
-    /// head cannot be shown to middleware.
+    /// The stage returned `cannot_inspect`, or the message head cannot be
+    /// shown to middleware.
     CannotInspect,
     /// A stage missed its binding timeout, the chain deadline, or the
     /// BUFFERED whole-body deadline.
@@ -386,18 +388,169 @@ impl BodyModeOffer {
     }
 }
 
-/// What a pipeline evaluates: the preflight subject and body eligibility.
+/// What a pipeline evaluates: the preflight and body eligibility.
 pub trait StageHead: Sync {
     /// Sandbox and request identity shown to every stage.
     fn context(&self) -> &RequestContext;
 
-    /// Preflight subject shown to a stage, given the head after earlier
-    /// stages' preflight mutations.
-    fn preflight_subject(&self, headers: &[HttpHeader]) -> http_preflight::Subject;
+    /// Preflight shown to a stage, given the head after earlier stages'
+    /// preflight mutations and the fields every preflight carries.
+    fn preflight(&self, headers: &[HttpHeader], fields: PreflightFields) -> StagePreflight;
 
     /// Body modes `entry` may select: those the message is eligible for
-    /// within the entry's payload limit.
-    fn body_modes(&self, entry: &DescribedChainEntry) -> BodyModeOffer;
+    /// within the entry's payload limit. `declared_body_bytes` is the
+    /// declared length of the body the stage receives, when known.
+    fn body_modes(
+        &self,
+        entry: &DescribedChainEntry,
+        declared_body_bytes: Option<u64>,
+    ) -> BodyModeOffer;
+}
+
+/// Preflight fields both RPCs carry.
+pub struct PreflightFields {
+    pub context: RequestContext,
+    pub middleware_name: String,
+    pub config: prost_types::Struct,
+    pub permitted_body_modes: Vec<i32>,
+    pub unavailable_body_modes: Vec<HttpBodyModeUnavailable>,
+    pub limits: HttpBodyLimits,
+    pub declared_body_bytes: Option<u64>,
+}
+
+impl PreflightFields {
+    /// An `EvaluateHttpRequestSession` preflight at `PRE_CREDENTIALS`.
+    pub fn request(self, subject: http_request_session_preflight::Subject) -> StagePreflight {
+        StagePreflight::Request(HttpRequestSessionPreflight {
+            subject: Some(subject),
+            phase: SupervisorMiddlewarePhase::PreCredentials as i32,
+            context: Some(self.context),
+            middleware_name: self.middleware_name,
+            config: Some(self.config),
+            permitted_body_modes: self.permitted_body_modes,
+            unavailable_body_modes: self.unavailable_body_modes,
+            limits: Some(self.limits),
+            declared_body_bytes: self.declared_body_bytes,
+        })
+    }
+
+    /// An `EvaluateHttpResponseSession` preflight at `PRE_RETURN`.
+    pub fn response(self, head: HttpResponsePreflightHead) -> StagePreflight {
+        StagePreflight::Response(HttpResponseSessionPreflight {
+            response: Some(head),
+            phase: SupervisorMiddlewarePhase::PreReturn as i32,
+            context: Some(self.context),
+            middleware_name: self.middleware_name,
+            config: Some(self.config),
+            permitted_body_modes: self.permitted_body_modes,
+            unavailable_body_modes: self.unavailable_body_modes,
+            limits: Some(self.limits),
+            declared_body_bytes: self.declared_body_bytes,
+        })
+    }
+}
+
+/// The preflight that opens one stage exchange. It selects the RPC.
+pub enum StagePreflight {
+    Request(HttpRequestSessionPreflight),
+    Response(HttpResponseSessionPreflight),
+}
+
+/// One event after the preflight. Both RPCs carry the same body events.
+#[derive(Debug)]
+enum StageEvent {
+    Begin(HttpBegin),
+    BufferedBody(HttpBufferedBody),
+    InputChunk(HttpInputChunk),
+    InputEnd(HttpInputEnd),
+    SessionEnd(MiddlewareSessionEnd),
+}
+
+/// One stage result. Both RPCs carry the same results.
+#[derive(Debug)]
+pub(super) enum StageResult {
+    PreflightResult(HttpPreflightResult),
+    BufferedResult(HttpBufferedResult),
+    OutputStart(HttpOutputStart),
+    OutputChunk(HttpOutputChunk),
+    Finish(HttpFinish),
+    Reject(HttpReject),
+    CannotInspect,
+}
+
+/// Results of one stage exchange. `None` is an unset or unknown result.
+type StageResults =
+    Pin<Box<dyn futures::Stream<Item = Result<Option<StageResult>, tonic::Status>> + Send>>;
+
+/// Conversions between the stage events and results and one RPC's messages,
+/// which differ only in their preflight.
+macro_rules! session_messages {
+    ($event:ident, $result:ident) => {
+        impl From<StageEvent> for openshell_core::proto::$event::Event {
+            fn from(event: StageEvent) -> Self {
+                match event {
+                    StageEvent::Begin(begin) => Self::Begin(begin),
+                    StageEvent::BufferedBody(body) => Self::BufferedBody(body),
+                    StageEvent::InputChunk(chunk) => Self::InputChunk(chunk),
+                    StageEvent::InputEnd(end) => Self::InputEnd(end),
+                    StageEvent::SessionEnd(end) => Self::SessionEnd(end),
+                }
+            }
+        }
+
+        impl From<openshell_core::proto::$result::Result> for StageResult {
+            fn from(result: openshell_core::proto::$result::Result) -> Self {
+                use openshell_core::proto::$result::Result as Wire;
+                match result {
+                    Wire::PreflightResult(result) => Self::PreflightResult(result),
+                    Wire::BufferedResult(result) => Self::BufferedResult(result),
+                    Wire::OutputStart(start) => Self::OutputStart(start),
+                    Wire::OutputChunk(chunk) => Self::OutputChunk(chunk),
+                    Wire::Finish(finish) => Self::Finish(finish),
+                    Wire::Reject(reject) => Self::Reject(reject),
+                    Wire::CannotInspect(_) => Self::CannotInspect,
+                }
+            }
+        }
+    };
+}
+
+session_messages!(http_request_session_event, http_request_session_result);
+session_messages!(http_response_session_event, http_response_session_result);
+
+/// Event sender of one open stage exchange, typed by its RPC.
+#[derive(Clone)]
+enum EventSender {
+    Request(mpsc::Sender<HttpRequestSessionEvent>),
+    Response(mpsc::Sender<HttpResponseSessionEvent>),
+}
+
+impl EventSender {
+    /// Send one event. Fails when the stage stopped reading events.
+    async fn send(&self, event: StageEvent) -> Result<(), ()> {
+        match self {
+            Self::Request(sender) => sender
+                .send(HttpRequestSessionEvent {
+                    event: Some(event.into()),
+                })
+                .await
+                .map_err(drop),
+            Self::Response(sender) => sender
+                .send(HttpResponseSessionEvent {
+                    event: Some(event.into()),
+                })
+                .await
+                .map_err(drop),
+        }
+    }
+}
+
+/// Map one RPC's result stream onto stage results.
+fn stage_results<R: 'static>(
+    results: Pin<Box<dyn futures::Stream<Item = Result<R, tonic::Status>> + Send>>,
+    result: fn(R) -> Option<StageResult>,
+) -> StageResults {
+    Box::pin(results.map(move |item| item.map(result)))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -415,8 +568,8 @@ pub struct Stage {
 
 /// Event sender and result stream of one open stage exchange.
 pub(super) struct StageStream {
-    sender: Option<mpsc::Sender<HttpEvent>>,
-    results: HttpResultStream,
+    sender: Option<EventSender>,
+    results: StageResults,
     ended: bool,
 }
 
@@ -460,8 +613,8 @@ impl Drop for StageStream {
 /// are read while the `SessionEnd` waits for queue space: a stage blocked on
 /// a full result queue stops reading its events.
 async fn end_exchange(
-    sender: mpsc::Sender<HttpEvent>,
-    results: &mut HttpResultStream,
+    sender: EventSender,
+    results: &mut StageResults,
     reason: MiddlewareSessionEndReason,
 ) {
     let mut drained = false;
@@ -490,13 +643,11 @@ async fn end_exchange(
     .await;
 }
 
-fn session_end(reason: MiddlewareSessionEndReason) -> HttpEvent {
-    HttpEvent {
-        event: Some(http_event::Event::SessionEnd(MiddlewareSessionEnd {
-            reason: reason as i32,
-            protocol_error: None,
-        })),
-    }
+fn session_end(reason: MiddlewareSessionEndReason) -> StageEvent {
+    StageEvent::SessionEnd(MiddlewareSessionEnd {
+        reason: reason as i32,
+        protocol_error: None,
+    })
 }
 
 /// Outcome of preflight across a chain.
@@ -514,43 +665,58 @@ pub struct Preflight {
     pub diagnostics: HttpStageDiagnostics,
 }
 
-/// Open one stage exchange: send the preflight and read its first result
-/// before `deadline`.
+/// First result of a stage exchange, as its result stream yields it.
+pub(super) type FirstResult = Option<Result<Option<StageResult>, tonic::Status>>;
+
+/// Open one stage exchange on the RPC its preflight selects: send the
+/// preflight and read its first result before `deadline`.
 pub(super) async fn open_stage(
     entry: &DescribedChainEntry,
-    event: HttpEvent,
+    preflight: StagePreflight,
     deadline: Instant,
     timeout_reason: &str,
-) -> Result<(StageStream, Option<Result<HttpResult, tonic::Status>>), HttpMiddlewareFailure> {
+) -> Result<(StageStream, FirstResult), HttpMiddlewareFailure> {
     let Some(service) = entry.service.as_ref() else {
         return Err(entry_failure(entry, "binding_not_described"));
     };
-    let is_response = matches!(
-        &event.event,
-        Some(http_event::Event::Preflight(HttpPreflight {
-            subject: Some(http_preflight::Subject::Response(_)),
-            ..
-        }))
-    );
-    let (sender, receiver) = mpsc::channel(STAGE_QUEUE_MESSAGES);
+    let closed = || tonic::Status::unavailable("middleware stage stream closed");
     let opened = tokio::time::timeout_at(deadline, async {
-        sender
-            .send(event)
-            .await
-            .map_err(|_| tonic::Status::unavailable("middleware stage stream closed"))?;
-        // A response preflight uses EvaluateHttpResponseSession; a request or an
-        // uninspectable connection uses EvaluateHttpRequestSession.
-        let mut results = if is_response {
-            service.service.open_http_response_session(receiver).await?
-        } else {
-            service.service.open_http_request_session(receiver).await?
+        let (sender, mut results) = match preflight {
+            StagePreflight::Request(preflight) => {
+                let (sender, receiver) = mpsc::channel(STAGE_QUEUE_MESSAGES);
+                sender
+                    .send(HttpRequestSessionEvent {
+                        event: Some(http_request_session_event::Event::Preflight(preflight)),
+                    })
+                    .await
+                    .map_err(|_| closed())?;
+                let results = service.service.open_http_request_session(receiver).await?;
+                (
+                    EventSender::Request(sender),
+                    stage_results(results, |result| result.result.map(StageResult::from)),
+                )
+            }
+            StagePreflight::Response(preflight) => {
+                let (sender, receiver) = mpsc::channel(STAGE_QUEUE_MESSAGES);
+                sender
+                    .send(HttpResponseSessionEvent {
+                        event: Some(http_response_session_event::Event::Preflight(preflight)),
+                    })
+                    .await
+                    .map_err(|_| closed())?;
+                let results = service.service.open_http_response_session(receiver).await?;
+                (
+                    EventSender::Response(sender),
+                    stage_results(results, |result| result.result.map(StageResult::from)),
+                )
+            }
         };
         let first = results.next().await;
-        Ok::<_, tonic::Status>((results, first))
+        Ok::<_, tonic::Status>((sender, results, first))
     })
     .await;
     match opened {
-        Ok(Ok((results, first))) => Ok((
+        Ok(Ok((sender, results, first))) => Ok((
             StageStream {
                 sender: Some(sender),
                 results,
@@ -577,7 +743,7 @@ pub(super) fn preflight_deadline(
     }
 }
 
-/// Build the preflight event for `entry`.
+/// Build the preflight for `entry`.
 pub(super) fn preflight_event(
     entry: &DescribedChainEntry,
     head: &impl StageHead,
@@ -585,20 +751,20 @@ pub(super) fn preflight_event(
     offer: BodyModeOffer,
     timeouts: PipelineTimeouts,
     declared_body_bytes: Option<u64>,
-) -> HttpEvent {
+) -> StagePreflight {
     let permitted = offer.permitted;
-    HttpEvent {
-        event: Some(http_event::Event::Preflight(HttpPreflight {
-            subject: Some(head.preflight_subject(headers)),
-            context: Some(head.context().clone()),
+    head.preflight(
+        headers,
+        PreflightFields {
+            context: head.context().clone(),
             middleware_name: entry.entry.implementation.clone(),
-            config: Some(entry.entry.config.clone()),
+            config: entry.entry.config.clone(),
             permitted_body_modes: permitted.iter().map(|mode| *mode as i32).collect(),
             unavailable_body_modes: offer.unavailable,
-            limits: Some(body_limits(entry, &permitted, timeouts)),
+            limits: body_limits(entry, &permitted, timeouts),
             declared_body_bytes,
-        })),
-    }
+        },
+    )
 }
 
 /// Run preflight for `entries` in chain order, each stage within its binding
@@ -637,17 +803,17 @@ pub async fn preflight(
                 .fail(entry_failure(entry, MIDDLEWARE_HOOK_VERSIONS_MIXED))
                 .await;
         }
-        let offer = head.body_modes(entry);
+        // A stage that inspects the body may replace it, so later stages
+        // learn no declared length.
+        let declared = state
+            .stages
+            .is_empty()
+            .then_some(declared_input_bytes)
+            .flatten();
+        let offer = head.body_modes(entry, declared);
         let permitted = offer.permitted.clone();
         let buffered_limit = entry.max_payload_bytes();
-        let event = preflight_event(
-            entry,
-            head,
-            &state.headers,
-            offer,
-            spec.timeouts,
-            declared_input_bytes,
-        );
+        let event = preflight_event(entry, head, &state.headers, offer, spec.timeouts, declared);
         let (deadline, timeout_reason) = preflight_deadline(entry, chain_deadline);
         let (mut stream, first) = match open_stage(entry, event, deadline, timeout_reason).await {
             Ok(opened) => opened,
@@ -661,7 +827,7 @@ pub async fn preflight(
             }
         };
         match result {
-            http_result::Result::PreflightResult(result) => {
+            StageResult::PreflightResult(result) => {
                 let diagnostics = match validate_diagnostics(entry, result.diagnostics.as_ref()) {
                     Ok(diagnostics) => diagnostics,
                     Err(failure) => {
@@ -736,7 +902,7 @@ pub async fn preflight(
                     mode,
                 });
             }
-            http_result::Result::Reject(reject) => {
+            StageResult::Reject(reject) => {
                 let failure = rejection(entry, reject.diagnostics.as_ref());
                 stream.end(failure.end_reason).await;
                 return state.fail(failure).await;
@@ -1500,7 +1666,7 @@ async fn drive_stage(
 async fn send_until(
     entry: &DescribedChainEntry,
     stream: &mut StageStream,
-    event: HttpEvent,
+    event: StageEvent,
     deadline: Option<Instant>,
     timeout_reason: &str,
 ) -> Result<(), HttpMiddlewareFailure> {
@@ -1526,14 +1692,14 @@ async fn send_until(
 
 /// The stage stopped reading events. A rejection or RPC status it ended with
 /// explains why better than the closed stream does.
-fn closed_stream_failure(
-    entry: &DescribedChainEntry,
-    next: Option<Result<HttpResult, tonic::Status>>,
-) -> HttpMiddlewareFailure {
+fn closed_stream_failure(entry: &DescribedChainEntry, next: FirstResult) -> HttpMiddlewareFailure {
     match next {
-        Some(Ok(HttpResult {
-            result: Some(http_result::Result::Reject(reject)),
-        })) => rejection(entry, reject.diagnostics.as_ref()),
+        Some(Ok(Some(StageResult::Reject(reject)))) => {
+            rejection(entry, reject.diagnostics.as_ref())
+        }
+        Some(Ok(Some(StageResult::CannotInspect))) => {
+            entry_failure(entry, MIDDLEWARE_CANNOT_INSPECT)
+        }
         Some(Err(status)) => status_failure(entry, &status),
         _ => entry_failure(entry, "middleware_stream_closed"),
     }
@@ -1571,11 +1737,9 @@ async fn drive_buffered(
     send_until(
         entry,
         stream,
-        HttpEvent {
-            event: Some(http_event::Event::Begin(HttpBegin {
-                headers: begin_head.clone(),
-            })),
-        },
+        StageEvent::Begin(HttpBegin {
+            headers: begin_head.clone(),
+        }),
         Some(body_deadline),
         "middleware_body_timeout",
     )
@@ -1612,12 +1776,10 @@ async fn drive_buffered(
         (body_deadline, "middleware_body_timeout")
     };
     let input_bytes = body.len();
-    let event = HttpEvent {
-        event: Some(http_event::Event::BufferedBody(HttpBufferedBody {
-            data: body.clone(),
-            trailers: trailers.clone(),
-        })),
-    };
+    let event = StageEvent::BufferedBody(HttpBufferedBody {
+        data: body.clone(),
+        trailers: trailers.clone(),
+    });
     let exchange = async {
         send_until(
             entry,
@@ -1633,8 +1795,8 @@ async fn drive_buffered(
         .await
         .map_err(|_| entry_failure(entry, timeout_reason))??;
     let result = match classify_result(entry, next)? {
-        http_result::Result::BufferedResult(result) => result,
-        http_result::Result::Reject(reject) => {
+        StageResult::BufferedResult(result) => result,
+        StageResult::Reject(reject) => {
             return Err(rejection(entry, reject.diagnostics.as_ref()).into());
         }
         _ => return Err(entry_failure(entry, "buffered_result_expected").into()),
@@ -1755,8 +1917,8 @@ enum StallError {
 /// `idle`. Time the stage's output spends held back downstream does not
 /// count, and the timer restarts when that backpressure ends.
 async fn send_stalled(
-    sender: &mpsc::Sender<HttpEvent>,
-    event: HttpEvent,
+    sender: &EventSender,
+    event: StageEvent,
     idle: Duration,
     output_held: &mut watch::Receiver<bool>,
 ) -> Result<(), StallError> {
@@ -1768,7 +1930,7 @@ async fn send_stalled(
         let held = watching && *output_held.borrow_and_update();
         tokio::select! {
             biased;
-            sent = &mut pending => return sent.map_err(|_| StallError::Closed),
+            sent = &mut pending => return sent.map_err(|()| StallError::Closed),
             changed = output_held.changed(), if watching => {
                 if changed.is_err() {
                     watching = false;
@@ -1797,11 +1959,9 @@ async fn drive_stream(
     send_until(
         entry,
         stream,
-        HttpEvent {
-            event: Some(http_event::Event::Begin(HttpBegin {
-                headers: begin_head.clone(),
-            })),
-        },
+        StageEvent::Begin(HttpBegin {
+            headers: begin_head.clone(),
+        }),
         Some(Instant::now() + idle),
         "middleware_stall_timeout",
     )
@@ -1822,11 +1982,11 @@ async fn drive_stream(
             let event = match input.recv().await {
                 Some(Frame::Chunk(data)) => {
                     input_bytes = input_bytes.saturating_add(data.len());
-                    http_event::Event::InputChunk(HttpInputChunk { data })
+                    StageEvent::InputChunk(HttpInputChunk { data })
                 }
                 Some(Frame::End(trailers)) => {
                     input_end.send_replace(Some(trailers.clone()));
-                    http_event::Event::InputEnd(HttpInputEnd { trailers })
+                    StageEvent::InputEnd(HttpInputEnd { trailers })
                 }
                 Some(Frame::Start { .. }) => {
                     return Err(InputStop::Failed(
@@ -1835,15 +1995,8 @@ async fn drive_stream(
                 }
                 None => return Err(InputStop::Failed(StageError::LinkClosed)),
             };
-            let end = matches!(event, http_event::Event::InputEnd(_));
-            match send_stalled(
-                &sender,
-                HttpEvent { event: Some(event) },
-                idle,
-                &mut output_held,
-            )
-            .await
-            {
+            let end = matches!(event, StageEvent::InputEnd(_));
+            match send_stalled(&sender, event, idle, &mut output_held).await {
                 Ok(()) => {}
                 Err(StallError::Closed) => {
                     // The output pump now reads the stage's terminal result
@@ -1884,7 +2037,7 @@ async fn drive_stream(
                 }
             };
             match classify_result(entry, next)? {
-                http_result::Result::OutputStart(start) if !started => {
+                StageResult::OutputStart(start) if !started => {
                     headers::apply(
                         shared.spec.head_authority,
                         &begin_head,
@@ -1907,7 +2060,7 @@ async fn drive_stream(
                     .await?;
                     held.send_replace(false);
                 }
-                http_result::Result::OutputChunk(chunk) if started => {
+                StageResult::OutputChunk(chunk) if started => {
                     if chunk.data.is_empty() || chunk.data.len() > chunk_limit {
                         return Err(entry_failure(entry, "stream_output_chunk_invalid").into());
                     }
@@ -1919,7 +2072,7 @@ async fn drive_stream(
                     send_body(output, &chunk.data, output_limit).await?;
                     held.send_replace(false);
                 }
-                http_result::Result::Finish(finish) if started => {
+                StageResult::Finish(finish) if started => {
                     let Some(trailers) = input_ended.borrow().clone() else {
                         return Err(entry_failure(entry, "stream_finish_before_input_end").into());
                     };
@@ -1938,7 +2091,7 @@ async fn drive_stream(
                     send_frame(output, Frame::End(trailers)).await?;
                     return Ok::<_, StageError>((diagnostics, output_bytes));
                 }
-                http_result::Result::Reject(reject) => {
+                StageResult::Reject(reject) => {
                     return Err(rejection(entry, reject.diagnostics.as_ref()).into());
                 }
                 _ => return Err(entry_failure(entry, "stream_result_order_invalid").into()),
@@ -1980,16 +2133,18 @@ async fn drive_stream(
     Ok(done)
 }
 
-/// Unwrap one stage result. An unset or unknown result fails the exchange.
+/// Unwrap one stage result. An unset or unknown result fails the exchange,
+/// and so does `cannot_inspect`, wherever the stage returns it.
 pub(super) fn classify_result(
     entry: &DescribedChainEntry,
-    next: Option<Result<HttpResult, tonic::Status>>,
-) -> Result<http_result::Result, HttpMiddlewareFailure> {
+    next: FirstResult,
+) -> Result<StageResult, HttpMiddlewareFailure> {
     match next {
-        Some(Ok(HttpResult {
-            result: Some(result),
-        })) => Ok(result),
-        Some(Ok(HttpResult { result: None })) => Err(entry_failure(entry, "result_unknown")),
+        Some(Ok(Some(StageResult::CannotInspect))) => {
+            Err(entry_failure(entry, MIDDLEWARE_CANNOT_INSPECT))
+        }
+        Some(Ok(Some(result))) => Ok(result),
+        Some(Ok(None)) => Err(entry_failure(entry, "result_unknown")),
         Some(Err(status)) => Err(status_failure(entry, &status)),
         None => Err(entry_failure(entry, "middleware_result_stream_closed")),
     }
@@ -2000,9 +2155,6 @@ pub(super) fn classify_result(
 fn status_failure(entry: &DescribedChainEntry, status: &tonic::Status) -> HttpMiddlewareFailure {
     match status.code() {
         tonic::Code::DeadlineExceeded => entry_failure(entry, "middleware_timeout"),
-        // The stage says it cannot inspect this message. The reason never
-        // carries the service's status text.
-        tonic::Code::FailedPrecondition => entry_failure(entry, MIDDLEWARE_CANNOT_INSPECT),
         // The service does not implement the HTTP session hook RPC its binding
         // selected.
         tonic::Code::Unimplemented => entry_failure(entry, "middleware_unimplemented"),
@@ -2070,7 +2222,6 @@ fn body_limits(
     } else {
         stage_chunk_limit(entry) as u64
     };
-    let queue_messages = STAGE_QUEUE_MESSAGES as u64;
     HttpBodyLimits {
         max_chunk_bytes: chunk,
         max_buffered_body_bytes: if permitted.contains(&HttpBodyMode::Buffered) {
@@ -2078,10 +2229,6 @@ fn body_limits(
         } else {
             0
         },
-        max_input_queue_bytes: chunk.saturating_mul(queue_messages),
-        max_input_queue_messages: queue_messages,
-        max_output_queue_bytes: chunk.saturating_mul(queue_messages),
-        max_output_queue_messages: queue_messages,
         idle_timeout: permitted
             .contains(&HttpBodyMode::Stream)
             .then(|| duration_to_proto(timeouts.stream_idle)),

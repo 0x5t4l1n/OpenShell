@@ -3,15 +3,15 @@
 
 use miette::{IntoDiagnostic, Result, WrapErr};
 use openshell_core::middleware::{
-    HttpRequestView, HttpResponseResultStream, HttpResultStream, SupervisorMiddlewareEndpoint,
-    WebSocketResponseStream,
+    HttpRequestSessionResultStream, HttpRequestView, HttpResponseResultStream,
+    HttpResponseSessionResultStream, SupervisorMiddlewareEndpoint, WebSocketResponseStream,
 };
 use openshell_core::proto::middleware::v1::http_response_pre_return_client::HttpResponsePreReturnClient;
 use openshell_core::proto::middleware::v1::supervisor_middleware_client::SupervisorMiddlewareClient;
 use openshell_core::proto::{
-    HttpEvent, HttpRequestEvaluation, HttpRequestResult, HttpResponseEvent,
-    MiddlewareDescribeRequest, MiddlewareManifest, ValidateConfigRequest, ValidateConfigResponse,
-    WebSocketSessionEvent,
+    HttpRequestEvaluation, HttpRequestResult, HttpRequestSessionEvent, HttpResponseEvent,
+    HttpResponseSessionEvent, MiddlewareDescribeRequest, MiddlewareManifest, ValidateConfigRequest,
+    ValidateConfigResponse, WebSocketSessionEvent,
 };
 use openshell_extension_core::{
     BearerTokenInterceptor, BearerTokenSlot, ExtensionChannelConfig, ExtensionServerTrust,
@@ -123,8 +123,8 @@ impl GrpcMiddlewareService {
     /// adapter.
     pub async fn open_http_request_session(
         &self,
-        receiver: tokio::sync::mpsc::Receiver<HttpEvent>,
-    ) -> std::result::Result<HttpResultStream, Status> {
+        receiver: tokio::sync::mpsc::Receiver<HttpRequestSessionEvent>,
+    ) -> std::result::Result<HttpRequestSessionResultStream, Status> {
         self.service.open_http_request_session(receiver).await
     }
 
@@ -132,8 +132,8 @@ impl GrpcMiddlewareService {
     /// adapter.
     pub async fn open_http_response_session(
         &self,
-        receiver: tokio::sync::mpsc::Receiver<HttpEvent>,
-    ) -> std::result::Result<HttpResultStream, Status> {
+        receiver: tokio::sync::mpsc::Receiver<HttpResponseSessionEvent>,
+    ) -> std::result::Result<HttpResponseSessionResultStream, Status> {
         self.service.open_http_response_session(receiver).await
     }
 }
@@ -239,8 +239,8 @@ impl SupervisorMiddlewareEndpoint for RemoteMiddlewareService {
 
     async fn open_http_request_session(
         &self,
-        receiver: tokio::sync::mpsc::Receiver<HttpEvent>,
-    ) -> std::result::Result<HttpResultStream, Status> {
+        receiver: tokio::sync::mpsc::Receiver<HttpRequestSessionEvent>,
+    ) -> std::result::Result<HttpRequestSessionResultStream, Status> {
         let mut client = self.client.clone();
         let responses = client
             .evaluate_http_request_session(Request::new(
@@ -253,8 +253,8 @@ impl SupervisorMiddlewareEndpoint for RemoteMiddlewareService {
 
     async fn open_http_response_session(
         &self,
-        receiver: tokio::sync::mpsc::Receiver<HttpEvent>,
-    ) -> std::result::Result<HttpResultStream, Status> {
+        receiver: tokio::sync::mpsc::Receiver<HttpResponseSessionEvent>,
+    ) -> std::result::Result<HttpResponseSessionResultStream, Status> {
         let mut client = self.client.clone();
         let responses = client
             .evaluate_http_response_session(Request::new(

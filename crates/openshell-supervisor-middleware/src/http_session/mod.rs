@@ -69,6 +69,20 @@ pub fn chain_http_hook_version(entries: &[DescribedChainEntry]) -> ChainHttpHook
     }
 }
 
+/// True when `headers` declare a content coding other than `identity`.
+/// Middleware would only see the encoded body.
+fn has_content_coding(headers: &[HttpHeader]) -> bool {
+    headers
+        .iter()
+        .filter(|header| header.name.eq_ignore_ascii_case("content-encoding"))
+        .any(|header| {
+            header
+                .value
+                .split(',')
+                .any(|coding| !coding.trim().eq_ignore_ascii_case("identity"))
+        })
+}
+
 /// Platform limits on the head shown to every stage.
 fn validate_head_input(
     context: &RequestContext,

@@ -103,7 +103,7 @@ At preflight, the guard selects its configured `body_mode`, BUFFERED by default,
 
 - A request whose path or query contains a configured term is rejected at preflight with reason code `content_match`, before its body is read or the upstream is contacted.
 - A message with an empty or absent body continues without inspection.
-- When OpenShell offers no body mode, such as for an encoded, partial, or `no-transform` response, the guard ends the exchange with `FAILED_PRECONDITION`. OpenShell reports `middleware_cannot_inspect` and fails closed.
+- When OpenShell offers no body mode, such as for an encoded request or response, or a partial or `no-transform` response, the guard returns `cannot_inspect`. OpenShell reports `middleware_cannot_inspect` and fails closed.
 - Connections OpenShell cannot inspect, such as `tls: skip` tunnels, are rejected with reason code `uninspectable_traffic` unless the config sets `uninspectable: allow`.
 
 Redact mode replaces matching spans. Deny mode rejects the message with reason code `content_match`. In STREAM mode, a response whose head has already reached the sandbox is aborted instead.

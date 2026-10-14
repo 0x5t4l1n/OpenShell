@@ -35,13 +35,15 @@ service SupervisorMiddleware {
   // reject such a service at Describe. One stream per request and middleware
   // stage, or per connection OpenShell cannot inspect. The first event is a
   // preflight whose subject is a request or uninspectable traffic.
-  rpc EvaluateHttpRequestSession(stream HttpEvent) returns (stream HttpResult);
+  rpc EvaluateHttpRequestSession(stream HttpRequestSessionEvent)
+      returns (stream HttpRequestSessionResult);
 
   // HTTP session hooks for responses, for the HTTP_RESPONSE bindings of a
   // service that requires the HTTP session hooks capability. One stream per
-  // response and middleware stage. The first event is a preflight whose
-  // subject is a response.
-  rpc EvaluateHttpResponseSession(stream HttpEvent) returns (stream HttpResult);
+  // response and middleware stage. The first event is a preflight of the
+  // response head.
+  rpc EvaluateHttpResponseSession(stream HttpResponseSessionEvent)
+      returns (stream HttpResponseSessionResult);
 
   // EvaluateWebSocketSession opens one ordered, phase-specific stream for a
   // single middleware stage and WebSocket upgrade attempt. The current
@@ -138,14 +140,14 @@ message ValidateConfigResponse {
   string reason = 2;
 }
 
-// HTTP session hooks. One ordered event in an EvaluateHttpRequestSession or
-// EvaluateHttpResponseSession stream. Preflight is always first. An inspect
-// result is followed by begin and exactly one body lifecycle: buffered_body
-// for BUFFERED, or input_chunk events ending with input_end for STREAM.
-// session_end is best effort and has no result.
-message HttpEvent {
+// HTTP session hooks. One ordered event in an EvaluateHttpRequestSession
+// stream. Preflight is always first. An inspect result is followed by begin
+// and exactly one body lifecycle: buffered_body for BUFFERED, or input_chunk
+// events ending with input_end for STREAM. session_end is best effort and has
+// no result.
+message HttpRequestSessionEvent {
   oneof event {
-    HttpPreflight preflight = 1;
+    HttpRequestSessionPreflight preflight = 1;
     HttpBegin begin = 2;
     HttpBufferedBody buffered_body = 3;
     HttpInputChunk input_chunk = 4;
@@ -154,21 +156,31 @@ message HttpEvent {
   }
 }
 
-// HTTP session hooks. One ordered result in an EvaluateHttpRequestSession or
-// EvaluateHttpResponseSession stream. Preflight requires preflight_result or
-// reject. BUFFERED ends with buffered_result or reject. STREAM sends
-// output_start before any output_chunk and ends with finish or reject. An
-// unset or unknown result fails the exchange closed.
+// HTTP session hooks. One ordered event in an EvaluateHttpResponseSession
+// stream, in the order HttpRequestSessionEvent describes.
+message HttpResponseSessionEvent {
+  oneof event {
+    HttpResponseSessionPreflight preflight = 1;
+    HttpBegin begin = 2;
+    HttpBufferedBody buffered_body = 3;
+    HttpInputChunk input_chunk = 4;
+    HttpInputEnd input_end = 5;
+    MiddlewareSessionEnd session_end = 6;
+  }
+}
+
+// HTTP session hooks. One ordered result in an EvaluateHttpRequestSession
+// stream. Preflight requires preflight_result, reject, or cannot_inspect.
+// BUFFERED ends with buffered_result, reject, or cannot_inspect. STREAM sends
+// output_start before any output_chunk, even for an empty output, and ends
+// with finish, reject, or cannot_inspect. An unset or unknown result fails the
+// exchange closed.
 //
 // A service may close its result stream right after the result that ends its
-// part in the exchange (continue_without_body, buffered_result, finish, or
-// reject), or keep it open until session_end. OpenShell accepts both.
-//
-// A stage that cannot inspect the message ends the stream with gRPC status
-// FAILED_PRECONDITION. OpenShell fails the exchange closed with the
-// platform-owned reason middleware_cannot_inspect and does not record the
-// status message. Reject denies the content itself.
-message HttpResult {
+// part in the exchange (continue_without_body, buffered_result, finish,
+// reject, or cannot_inspect), or keep it open until session_end. OpenShell
+// accepts both.
+message HttpRequestSessionResult {
   oneof result {
     HttpPreflightResult preflight_result = 1;
     HttpBufferedResult buffered_result = 2;
@@ -176,6 +188,21 @@ message HttpResult {
     HttpOutputChunk output_chunk = 4;
     HttpFinish finish = 5;
     HttpReject reject = 6;
+    HttpCannotInspect cannot_inspect = 7;
+  }
+}
+
+// HTTP session hooks. One ordered result in an EvaluateHttpResponseSession
+// stream, under the rules HttpRequestSessionResult describes.
+message HttpResponseSessionResult {
+  oneof result {
+    HttpPreflightResult preflight_result = 1;
+    HttpBufferedResult buffered_result = 2;
+    HttpOutputStart output_start = 3;
+    HttpOutputChunk output_chunk = 4;
+    HttpFinish finish = 5;
+    HttpReject reject = 6;
+    HttpCannotInspect cannot_inspect = 7;
   }
 }
 
@@ -183,14 +210,16 @@ message HttpResult {
 enum HttpBodyMode {
   HTTP_BODY_MODE_UNSPECIFIED = 0;
   // One complete body and one terminal result. OpenShell holds the body in
-  // memory, up to the selected max_body_bytes.
+  // memory, up to the selected max_body_bytes. A larger body, such as a
+  // chunked body without a declared length, fails the exchange; OpenShell
+  // does not fall back to STREAM.
   HTTP_BODY_MODE_BUFFERED = 1;
   // Independent ordered input and output streams. The stage returns every
   // output byte and owns any working storage. No total size or time limit.
   HTTP_BODY_MODE_STREAM = 2;
 }
 
-// Why OpenShell does not offer a body mode the binding supports.
+// Why OpenShell does not offer a body mode for a message.
 enum HttpBodyUnavailableReason {
   HTTP_BODY_UNAVAILABLE_REASON_UNSPECIFIED = 0;
   // The response has no body: the request method is HEAD, or the status is
@@ -201,7 +230,8 @@ enum HttpBodyUnavailableReason {
   HTTP_BODY_UNAVAILABLE_REASON_PARTIAL = 2;
   // Cache-Control no-transform forbids changing the response body.
   HTTP_BODY_UNAVAILABLE_REASON_NO_TRANSFORM = 3;
-  // The response body has a content coding other than identity.
+  // The request or response body has a content coding other than identity.
+  // Middleware would only see the encoded bytes.
   HTTP_BODY_UNAVAILABLE_REASON_ENCODED = 4;
   // The declared body length exceeds the stage's payload limit.
   HTTP_BODY_UNAVAILABLE_REASON_OVER_LIMIT = 5;
@@ -214,7 +244,7 @@ enum HttpBodyUnavailableReason {
   HTTP_BODY_UNAVAILABLE_REASON_TRUNCATION_UNDETECTABLE = 7;
 }
 
-// A body mode the binding supports that this preflight does not offer.
+// A body mode a preflight does not offer, and why.
 message HttpBodyModeUnavailable {
   HttpBodyMode mode = 1;
   HttpBodyUnavailableReason reason = 2;
@@ -249,36 +279,67 @@ message UninspectableTraffic {
   UninspectableTrafficReason reason = 4;
 }
 
-// HTTP session hook preflight for one stage: what is evaluated, the body modes
-// offered, and limits.
-message HttpPreflight {
+// HTTP session hook preflight for one request stage: what is evaluated, the
+// body modes offered, and limits.
+message HttpRequestSessionPreflight {
   oneof subject {
     // A request after network-policy admission and before credentials.
     HttpRequestPreflightHead request = 1;
-    // A final upstream response before it reaches the sandbox.
-    HttpResponsePreflightHead response = 2;
     // A connection OpenShell cannot inspect as HTTP.
-    UninspectableTraffic uninspectable = 3;
+    UninspectableTraffic uninspectable = 2;
   }
-  // Sandbox and request identity. Limited to 4 KiB encoded.
+  // Phase of the HTTP_REQUEST binding this stream serves: PRE_CREDENTIALS.
+  SupervisorMiddlewarePhase phase = 3;
+  // Sandbox, request, and originating process identity. Limited to 4 KiB
+  // encoded.
   RequestContext context = 4;
   // Built-in middleware name or operator-owned registration name.
   string middleware_name = 5;
   // Validated service configuration. Limited to 64 KiB encoded.
   google.protobuf.Struct config = 6;
-  // Body modes this message is eligible for. Empty permits only
-  // continue_without_body or reject. The stage selects one of them, or
-  // continues or rejects when none suits it.
+  // Body modes this request is eligible for. Empty permits only
+  // continue_without_body, reject, or cannot_inspect. The stage selects one
+  // of them, or continues or rejects when none suits it.
   repeated HttpBodyMode permitted_body_modes = 7;
   // One entry for each body mode that permitted_body_modes omits, with the
-  // rule that removed it. A stage can tell a bodyless response, which it
-  // may let continue, from a body it cannot inspect.
+  // rule that removed it. Empty when the binding's max_payload_bytes is 0,
+  // which offers no body mode.
   repeated HttpBodyModeUnavailable unavailable_body_modes = 8;
   HttpBodyLimits limits = 9;
-  // Declared length of the original message body, when known. An earlier
-  // stage may replace the body, so a stage enforces its limits on the body
-  // events it receives.
+  // Declared length of the body this stage receives, when known. Unset for a
+  // chunked body, and for every stage after one that inspects the body, which
+  // may replace it.
   optional uint64 declared_body_bytes = 10;
+}
+
+// HTTP session hook preflight for one response stage: what is evaluated, the
+// body modes offered, and limits.
+message HttpResponseSessionPreflight {
+  // A final upstream response before it reaches the sandbox.
+  HttpResponsePreflightHead response = 1;
+  // Phase of the HTTP_RESPONSE binding this stream serves: PRE_RETURN.
+  SupervisorMiddlewarePhase phase = 2;
+  // Sandbox, request, and originating process identity. Limited to 4 KiB
+  // encoded.
+  RequestContext context = 3;
+  // Built-in middleware name or operator-owned registration name.
+  string middleware_name = 4;
+  // Validated service configuration. Limited to 64 KiB encoded.
+  google.protobuf.Struct config = 5;
+  // Body modes this response is eligible for. Empty permits only
+  // continue_without_body, reject, or cannot_inspect. The stage selects one
+  // of them, or continues or rejects when none suits it.
+  repeated HttpBodyMode permitted_body_modes = 6;
+  // One entry for each body mode that permitted_body_modes omits, with the
+  // rule that removed it. A stage can tell a bodyless response, which it may
+  // let continue, from a body it cannot inspect. Empty when the binding's
+  // max_payload_bytes is 0, which offers no body mode.
+  repeated HttpBodyModeUnavailable unavailable_body_modes = 7;
+  HttpBodyLimits limits = 8;
+  // Declared length of the body this stage receives, when known. Unset for a
+  // chunked or close-delimited body, and for every stage after one that
+  // inspects the body, which may replace it.
+  optional uint64 declared_body_bytes = 9;
 }
 
 // Request head after network-policy admission and before credentials.
@@ -304,24 +365,20 @@ message HttpResponsePreflightHead {
 }
 
 // Limits for one stage exchange. max_buffered_body_bytes is 0 unless BUFFERED
-// is permitted, and the chunk and queue limits are 0 when no body mode is
-// permitted. STREAM has no total byte cap and no total deadline. BUFFERED has
-// 2 minutes to receive, process, and deliver one body, and each body exchange
-// is also bounded by the binding timeout.
+// is permitted, and max_chunk_bytes is 0 when no body mode is permitted.
+// STREAM has no total byte cap and no total deadline. BUFFERED has 2 minutes
+// to receive, process, and deliver one body, and each body exchange is also
+// bounded by the binding timeout.
 message HttpBodyLimits {
   // Largest input_chunk and output_chunk payload.
   uint64 max_chunk_bytes = 1;
   // Largest BUFFERED input and replacement.
   uint64 max_buffered_body_bytes = 2;
-  uint64 max_input_queue_bytes = 3;
-  uint64 max_input_queue_messages = 4;
-  uint64 max_output_queue_bytes = 5;
-  uint64 max_output_queue_messages = 6;
   // STREAM middleware-stall timeout. A STREAM stage fails when it does not
   // accept the next input within this duration, or returns nothing within
   // this duration after input_end. Time the sandbox or upstream takes to
   // produce input does not count. OpenShell uses 30 seconds.
-  google.protobuf.Duration idle_timeout = 7;
+  google.protobuf.Duration idle_timeout = 3;
 }
 
 // Preflight decision. To deny, return HttpReject instead.
@@ -425,7 +482,8 @@ message HttpOutputChunk {
   bytes data = 1;
 }
 
-// STREAM terminal success. Valid only after input_end was consumed.
+// STREAM terminal success. Valid only after output_start and after input_end
+// was consumed.
 message HttpFinish {
   repeated HeaderMutation trailer_mutations = 1;
   MiddlewareDiagnostics diagnostics = 2;
@@ -440,6 +498,13 @@ message HttpFinish {
 message HttpReject {
   MiddlewareDiagnostics diagnostics = 1;
 }
+
+// Terminal failure: the stage cannot inspect this message, such as a body in
+// a format it does not understand. Valid wherever reject is. Reject denies the
+// content; cannot_inspect is a stage failure, so OpenShell fails the exchange
+// closed and returns the platform-owned failure_code middleware_cannot_inspect
+// to the sandbox. For uninspectable traffic, OpenShell refuses the connection.
+message HttpCannotInspect {}
 
 message MiddlewareDiagnostics {
   // Service text, never copied to denied responses or security logs. Maximum

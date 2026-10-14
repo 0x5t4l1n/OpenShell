@@ -11,16 +11,26 @@ use tokio::sync::mpsc;
 use tonic::{Request, Response, Status};
 
 use crate::proto::{
-    HttpEvent, HttpHeader, HttpRequestEvaluation, HttpRequestResult, HttpRequestTarget,
-    HttpResponseEvent, HttpResponseEventResult, HttpResult, MiddlewareDescribeRequest,
+    HttpHeader, HttpRequestEvaluation, HttpRequestResult, HttpRequestSessionEvent,
+    HttpRequestSessionResult, HttpRequestTarget, HttpResponseEvent, HttpResponseEventResult,
+    HttpResponseSessionEvent, HttpResponseSessionResult, MiddlewareDescribeRequest,
     MiddlewareManifest, RequestContext, SupervisorMiddlewarePhase, ValidateConfigRequest,
     ValidateConfigResponse, WebSocketSessionEvent, WebSocketSessionEventResult,
 };
 
-/// Transport-neutral result stream for one HTTP session hook exchange
-/// (`EvaluateHttpRequestSession` or `EvaluateHttpResponseSession`).
-pub type HttpResultStream =
-    Pin<Box<dyn tokio_stream::Stream<Item = Result<HttpResult, Status>> + Send + 'static>>;
+/// Transport-neutral result stream for one `EvaluateHttpRequestSession`
+/// exchange.
+pub type HttpRequestSessionResultStream = Pin<
+    Box<dyn tokio_stream::Stream<Item = Result<HttpRequestSessionResult, Status>> + Send + 'static>,
+>;
+
+/// Transport-neutral result stream for one `EvaluateHttpResponseSession`
+/// exchange.
+pub type HttpResponseSessionResultStream = Pin<
+    Box<
+        dyn tokio_stream::Stream<Item = Result<HttpResponseSessionResult, Status>> + Send + 'static,
+    >,
+>;
 
 /// v1 HTTP hooks. Removed in 0.2.0.
 ///
@@ -76,8 +86,8 @@ pub trait SupervisorMiddlewareEndpoint: Send + Sync {
     /// Open one HTTP session hook request exchange (`EvaluateHttpRequestSession`).
     async fn open_http_request_session(
         &self,
-        _requests: mpsc::Receiver<HttpEvent>,
-    ) -> Result<HttpResultStream, Status> {
+        _requests: mpsc::Receiver<HttpRequestSessionEvent>,
+    ) -> Result<HttpRequestSessionResultStream, Status> {
         Err(Status::unimplemented(
             "middleware does not implement HTTP session hook requests",
         ))
@@ -86,8 +96,8 @@ pub trait SupervisorMiddlewareEndpoint: Send + Sync {
     /// Open one HTTP session hook response exchange (`EvaluateHttpResponseSession`).
     async fn open_http_response_session(
         &self,
-        _requests: mpsc::Receiver<HttpEvent>,
-    ) -> Result<HttpResultStream, Status> {
+        _requests: mpsc::Receiver<HttpResponseSessionEvent>,
+    ) -> Result<HttpResponseSessionResultStream, Status> {
         Err(Status::unimplemented(
             "middleware does not implement HTTP session hook responses",
         ))
@@ -313,8 +323,8 @@ pub trait InProcessMiddleware: Send + Sync {
     /// may keep the default unsupported response.
     async fn open_http_request_session(
         &self,
-        _requests: mpsc::Receiver<HttpEvent>,
-    ) -> std::result::Result<HttpResultStream, Status> {
+        _requests: mpsc::Receiver<HttpRequestSessionEvent>,
+    ) -> std::result::Result<HttpRequestSessionResultStream, Status> {
         Err(Status::unimplemented(
             "middleware does not implement HTTP session hook requests",
         ))
@@ -326,8 +336,8 @@ pub trait InProcessMiddleware: Send + Sync {
     /// may keep the default unsupported response.
     async fn open_http_response_session(
         &self,
-        _requests: mpsc::Receiver<HttpEvent>,
-    ) -> std::result::Result<HttpResultStream, Status> {
+        _requests: mpsc::Receiver<HttpResponseSessionEvent>,
+    ) -> std::result::Result<HttpResponseSessionResultStream, Status> {
         Err(Status::unimplemented(
             "middleware does not implement HTTP session hook responses",
         ))

@@ -9,7 +9,7 @@
 
 use openshell_core::proto::{
     HeaderMutation, HttpBodyMode, HttpBodyUnavailableReason, HttpHeader, HttpRequestPreflightHead,
-    HttpRequestTarget, MiddlewareSessionEndReason, RequestContext, http_preflight,
+    HttpRequestTarget, MiddlewareSessionEndReason, RequestContext, http_request_session_preflight,
 };
 use tokio::sync::mpsc;
 use tokio::time::Instant;
@@ -17,9 +17,9 @@ use tokio::time::Instant;
 use super::pipeline::{
     self, BodyModeOffer, HttpBodyInput, HttpBodyOutput, HttpDirection, HttpMiddlewareFailure,
     HttpPipelineFinish, HttpStageDiagnostics, MiddlewareFailureDetail, Pipeline, PipelineSpec,
-    PipelineTimeouts, StageHead,
+    PipelineTimeouts, PreflightFields, StageHead, StagePreflight,
 };
-use super::validate_head_input;
+use super::{has_content_coding, validate_head_input};
 use crate::headers::HeaderAuthority;
 use crate::{
     ChainRunner, DescribedChainEntry, MAX_MIDDLEWARE_CHAIN_TIMEOUT, MAX_MIDDLEWARE_PAYLOAD_BYTES,
@@ -127,24 +127,33 @@ impl StageHead for RequestHead<'_> {
         &self.input.context
     }
 
-    fn preflight_subject(&self, headers: &[HttpHeader]) -> http_preflight::Subject {
-        http_preflight::Subject::Request(HttpRequestPreflightHead {
-            target: Some(self.input.target.clone()),
-            headers: headers.to_vec(),
-        })
+    fn preflight(&self, headers: &[HttpHeader], fields: PreflightFields) -> StagePreflight {
+        fields.request(http_request_session_preflight::Subject::Request(
+            HttpRequestPreflightHead {
+                target: Some(self.input.target.clone()),
+                headers: headers.to_vec(),
+            },
+        ))
     }
 
-    fn body_modes(&self, entry: &DescribedChainEntry) -> BodyModeOffer {
+    fn body_modes(
+        &self,
+        entry: &DescribedChainEntry,
+        declared_body_bytes: Option<u64>,
+    ) -> BodyModeOffer {
         let limit = entry.max_payload_bytes();
         let mut offer = BodyModeOffer::default();
         if limit == 0 {
             return offer;
         }
-        if self
-            .input
-            .declared_body_length
-            .is_none_or(|length| length <= limit as u64)
-        {
+        // The original head decides: no stage sees an encoded body, so none
+        // can decode it for the next.
+        if has_content_coding(&self.input.headers) {
+            offer.withhold(HttpBodyMode::Buffered, HttpBodyUnavailableReason::Encoded);
+            offer.withhold(HttpBodyMode::Stream, HttpBodyUnavailableReason::Encoded);
+            return offer;
+        }
+        if declared_body_bytes.is_none_or(|length| length <= limit as u64) {
             offer.permit(HttpBodyMode::Buffered);
         } else {
             offer.withhold(HttpBodyMode::Buffered, HttpBodyUnavailableReason::OverLimit);

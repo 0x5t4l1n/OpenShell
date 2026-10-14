@@ -48,23 +48,24 @@ use openshell_core::extension_protocol::{
 };
 use openshell_core::proto::middleware::v1::supervisor_middleware_server::SupervisorMiddleware;
 use openshell_core::proto::{
-    Decision, Finding, HeaderMutation, HttpEvent, HttpHeader, HttpRequestEvaluation,
-    HttpRequestTarget, MiddlewareBinding, MiddlewareDescribeRequest, MiddlewareManifest,
-    NetworkMiddlewareConfig, RequestContext, SandboxPolicy, SupervisorMiddlewareOperation,
-    SupervisorMiddlewarePhase, SupervisorMiddlewareService, ValidateConfigRequest,
-    ValidateConfigResponse,
+    Decision, Finding, HeaderMutation, HttpHeader, HttpRequestEvaluation, HttpRequestSessionEvent,
+    HttpRequestTarget, HttpResponseSessionEvent, MiddlewareBinding, MiddlewareDescribeRequest,
+    MiddlewareManifest, NetworkMiddlewareConfig, RequestContext, SandboxPolicy,
+    SupervisorMiddlewareOperation, SupervisorMiddlewarePhase, SupervisorMiddlewareService,
+    ValidateConfigRequest, ValidateConfigResponse,
 };
 use tokio::sync::{OnceCell, OwnedSemaphorePermit, Semaphore};
 use tonic::{Request, Response as TonicResponse, Status as TonicStatus};
 
 pub use openshell_core::middleware::{
-    HttpRequestView, HttpResponseResultStream, HttpResultStream, InProcessMiddleware,
-    SupervisorMiddlewareEndpoint, WebSocketResponseStream,
+    HttpRequestSessionResultStream, HttpRequestView, HttpResponseResultStream,
+    HttpResponseSessionResultStream, InProcessMiddleware, SupervisorMiddlewareEndpoint,
+    WebSocketResponseStream,
 };
 pub type MiddlewareService = dyn SupervisorMiddleware<
         EvaluateWebSocketSessionStream = WebSocketResponseStream,
-        EvaluateHttpRequestSessionStream = HttpResultStream,
-        EvaluateHttpResponseSessionStream = HttpResultStream,
+        EvaluateHttpRequestSessionStream = HttpRequestSessionResultStream,
+        EvaluateHttpResponseSessionStream = HttpResponseSessionResultStream,
     >;
 
 struct GeneratedMiddlewareEndpoint {
@@ -223,15 +224,15 @@ impl InProcessMiddleware for EndpointInProcessAdapter {
 
     async fn open_http_request_session(
         &self,
-        requests: tokio::sync::mpsc::Receiver<HttpEvent>,
-    ) -> std::result::Result<HttpResultStream, tonic::Status> {
+        requests: tokio::sync::mpsc::Receiver<HttpRequestSessionEvent>,
+    ) -> std::result::Result<HttpRequestSessionResultStream, tonic::Status> {
         self.endpoint.open_http_request_session(requests).await
     }
 
     async fn open_http_response_session(
         &self,
-        requests: tokio::sync::mpsc::Receiver<HttpEvent>,
-    ) -> std::result::Result<HttpResultStream, tonic::Status> {
+        requests: tokio::sync::mpsc::Receiver<HttpResponseSessionEvent>,
+    ) -> std::result::Result<HttpResponseSessionResultStream, tonic::Status> {
         self.endpoint.open_http_response_session(requests).await
     }
 }
@@ -834,8 +835,8 @@ impl MiddlewareDispatch {
 
     async fn open_http_request_session(
         &self,
-        receiver: tokio::sync::mpsc::Receiver<HttpEvent>,
-    ) -> std::result::Result<HttpResultStream, tonic::Status> {
+        receiver: tokio::sync::mpsc::Receiver<HttpRequestSessionEvent>,
+    ) -> std::result::Result<HttpRequestSessionResultStream, tonic::Status> {
         match self {
             Self::InProcess(service) => service.open_http_request_session(receiver).await,
             Self::Grpc(service) => service.open_http_request_session(receiver).await,
@@ -844,8 +845,8 @@ impl MiddlewareDispatch {
 
     async fn open_http_response_session(
         &self,
-        receiver: tokio::sync::mpsc::Receiver<HttpEvent>,
-    ) -> std::result::Result<HttpResultStream, tonic::Status> {
+        receiver: tokio::sync::mpsc::Receiver<HttpResponseSessionEvent>,
+    ) -> std::result::Result<HttpResponseSessionResultStream, tonic::Status> {
         match self {
             Self::InProcess(service) => service.open_http_response_session(receiver).await,
             Self::Grpc(service) => service.open_http_response_session(receiver).await,
@@ -3212,21 +3213,21 @@ mod tests {
     impl SupervisorMiddleware for ScriptedService {
         type EvaluateWebSocketSessionStream = WebSocketResponseStream;
 
-        type EvaluateHttpRequestSessionStream = HttpResultStream;
+        type EvaluateHttpRequestSessionStream = HttpRequestSessionResultStream;
 
         async fn evaluate_http_request_session(
             &self,
-            _request: Request<tonic::Streaming<HttpEvent>>,
+            _request: Request<tonic::Streaming<HttpRequestSessionEvent>>,
         ) -> std::result::Result<TonicResponse<Self::EvaluateHttpRequestSessionStream>, TonicStatus>
         {
             Err(TonicStatus::unimplemented("v1 HTTP hook test service"))
         }
 
-        type EvaluateHttpResponseSessionStream = HttpResultStream;
+        type EvaluateHttpResponseSessionStream = HttpResponseSessionResultStream;
 
         async fn evaluate_http_response_session(
             &self,
-            _request: Request<tonic::Streaming<HttpEvent>>,
+            _request: Request<tonic::Streaming<HttpResponseSessionEvent>>,
         ) -> std::result::Result<TonicResponse<Self::EvaluateHttpResponseSessionStream>, TonicStatus>
         {
             Err(TonicStatus::unimplemented("v1 HTTP hook test service"))
@@ -3293,21 +3294,21 @@ mod tests {
     impl SupervisorMiddleware for SlowService {
         type EvaluateWebSocketSessionStream = WebSocketResponseStream;
 
-        type EvaluateHttpRequestSessionStream = HttpResultStream;
+        type EvaluateHttpRequestSessionStream = HttpRequestSessionResultStream;
 
         async fn evaluate_http_request_session(
             &self,
-            _request: Request<tonic::Streaming<HttpEvent>>,
+            _request: Request<tonic::Streaming<HttpRequestSessionEvent>>,
         ) -> std::result::Result<TonicResponse<Self::EvaluateHttpRequestSessionStream>, TonicStatus>
         {
             Err(TonicStatus::unimplemented("v1 HTTP hook test service"))
         }
 
-        type EvaluateHttpResponseSessionStream = HttpResultStream;
+        type EvaluateHttpResponseSessionStream = HttpResponseSessionResultStream;
 
         async fn evaluate_http_response_session(
             &self,
-            _request: Request<tonic::Streaming<HttpEvent>>,
+            _request: Request<tonic::Streaming<HttpResponseSessionEvent>>,
         ) -> std::result::Result<TonicResponse<Self::EvaluateHttpResponseSessionStream>, TonicStatus>
         {
             Err(TonicStatus::unimplemented("v1 HTTP hook test service"))
@@ -3378,21 +3379,21 @@ mod tests {
     impl SupervisorMiddleware for TwoStageService {
         type EvaluateWebSocketSessionStream = WebSocketResponseStream;
 
-        type EvaluateHttpRequestSessionStream = HttpResultStream;
+        type EvaluateHttpRequestSessionStream = HttpRequestSessionResultStream;
 
         async fn evaluate_http_request_session(
             &self,
-            _request: Request<tonic::Streaming<HttpEvent>>,
+            _request: Request<tonic::Streaming<HttpRequestSessionEvent>>,
         ) -> std::result::Result<TonicResponse<Self::EvaluateHttpRequestSessionStream>, TonicStatus>
         {
             Err(TonicStatus::unimplemented("v1 HTTP hook test service"))
         }
 
-        type EvaluateHttpResponseSessionStream = HttpResultStream;
+        type EvaluateHttpResponseSessionStream = HttpResponseSessionResultStream;
 
         async fn evaluate_http_response_session(
             &self,
-            _request: Request<tonic::Streaming<HttpEvent>>,
+            _request: Request<tonic::Streaming<HttpResponseSessionEvent>>,
         ) -> std::result::Result<TonicResponse<Self::EvaluateHttpResponseSessionStream>, TonicStatus>
         {
             Err(TonicStatus::unimplemented("v1 HTTP hook test service"))
@@ -3674,21 +3675,21 @@ mod tests {
     impl SupervisorMiddleware for RecordingService {
         type EvaluateWebSocketSessionStream = WebSocketResponseStream;
 
-        type EvaluateHttpRequestSessionStream = HttpResultStream;
+        type EvaluateHttpRequestSessionStream = HttpRequestSessionResultStream;
 
         async fn evaluate_http_request_session(
             &self,
-            _request: Request<tonic::Streaming<HttpEvent>>,
+            _request: Request<tonic::Streaming<HttpRequestSessionEvent>>,
         ) -> std::result::Result<TonicResponse<Self::EvaluateHttpRequestSessionStream>, TonicStatus>
         {
             Err(TonicStatus::unimplemented("v1 HTTP hook test service"))
         }
 
-        type EvaluateHttpResponseSessionStream = HttpResultStream;
+        type EvaluateHttpResponseSessionStream = HttpResponseSessionResultStream;
 
         async fn evaluate_http_response_session(
             &self,
-            _request: Request<tonic::Streaming<HttpEvent>>,
+            _request: Request<tonic::Streaming<HttpResponseSessionEvent>>,
         ) -> std::result::Result<TonicResponse<Self::EvaluateHttpResponseSessionStream>, TonicStatus>
         {
             Err(TonicStatus::unimplemented("v1 HTTP hook test service"))
@@ -3821,21 +3822,21 @@ mod tests {
     impl SupervisorMiddleware for HeaderChainService {
         type EvaluateWebSocketSessionStream = WebSocketResponseStream;
 
-        type EvaluateHttpRequestSessionStream = HttpResultStream;
+        type EvaluateHttpRequestSessionStream = HttpRequestSessionResultStream;
 
         async fn evaluate_http_request_session(
             &self,
-            _request: Request<tonic::Streaming<HttpEvent>>,
+            _request: Request<tonic::Streaming<HttpRequestSessionEvent>>,
         ) -> std::result::Result<TonicResponse<Self::EvaluateHttpRequestSessionStream>, TonicStatus>
         {
             Err(TonicStatus::unimplemented("v1 HTTP hook test service"))
         }
 
-        type EvaluateHttpResponseSessionStream = HttpResultStream;
+        type EvaluateHttpResponseSessionStream = HttpResponseSessionResultStream;
 
         async fn evaluate_http_response_session(
             &self,
-            _request: Request<tonic::Streaming<HttpEvent>>,
+            _request: Request<tonic::Streaming<HttpResponseSessionEvent>>,
         ) -> std::result::Result<TonicResponse<Self::EvaluateHttpResponseSessionStream>, TonicStatus>
         {
             Err(TonicStatus::unimplemented("v1 HTTP hook test service"))
@@ -5691,21 +5692,21 @@ mod tests {
     impl SupervisorMiddleware for OpenAiRedactionService {
         type EvaluateWebSocketSessionStream = WebSocketResponseStream;
 
-        type EvaluateHttpRequestSessionStream = HttpResultStream;
+        type EvaluateHttpRequestSessionStream = HttpRequestSessionResultStream;
 
         async fn evaluate_http_request_session(
             &self,
-            _request: Request<tonic::Streaming<HttpEvent>>,
+            _request: Request<tonic::Streaming<HttpRequestSessionEvent>>,
         ) -> std::result::Result<TonicResponse<Self::EvaluateHttpRequestSessionStream>, TonicStatus>
         {
             Err(TonicStatus::unimplemented("v1 HTTP hook test service"))
         }
 
-        type EvaluateHttpResponseSessionStream = HttpResultStream;
+        type EvaluateHttpResponseSessionStream = HttpResponseSessionResultStream;
 
         async fn evaluate_http_response_session(
             &self,
-            _request: Request<tonic::Streaming<HttpEvent>>,
+            _request: Request<tonic::Streaming<HttpResponseSessionEvent>>,
         ) -> std::result::Result<TonicResponse<Self::EvaluateHttpResponseSessionStream>, TonicStatus>
         {
             Err(TonicStatus::unimplemented("v1 HTTP hook test service"))

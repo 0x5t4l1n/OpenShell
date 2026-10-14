@@ -7,18 +7,23 @@
 //!
 //! The guard selects its configured body mode, BUFFERED by default, and falls
 //! back to the other mode when OpenShell offers only that one. A message
-//! without a body continues. A stage that cannot inspect a message, such as an
-//! encoded response, ends with `FAILED_PRECONDITION`, which OpenShell reports
+//! without a body continues. A message the guard cannot inspect, such as an
+//! encoded body, gets `cannot_inspect`, which OpenShell reports to the sandbox
 //! as `middleware_cannot_inspect` and fails closed. Uninspectable connections
 //! are rejected unless the config sets `uninspectable: allow`.
 
-use openshell_core::middleware::HttpResultStream;
+use std::pin::Pin;
+
+use openshell_core::middleware::{HttpRequestSessionResultStream, HttpResponseSessionResultStream};
 use openshell_core::proto::{
-    HttpBodyMode, HttpBodyUnavailableReason, HttpBufferedMode, HttpBufferedResult, HttpContinue,
-    HttpEvent, HttpFinish, HttpInspect, HttpOutputChunk, HttpOutputStart, HttpPreflight,
-    HttpPreflightResult, HttpReject, HttpResult, HttpStreamMode, HttpUnchanged,
-    MiddlewareDiagnostics, http_buffered_result, http_event, http_inspect, http_preflight,
-    http_preflight_result, http_result,
+    HttpBodyLimits, HttpBodyMode, HttpBodyModeUnavailable, HttpBodyUnavailableReason,
+    HttpBufferedBody, HttpBufferedMode, HttpBufferedResult, HttpCannotInspect, HttpContinue,
+    HttpFinish, HttpInputChunk, HttpInspect, HttpOutputChunk, HttpOutputStart, HttpPreflightResult,
+    HttpReject, HttpRequestPreflightHead, HttpRequestSessionEvent, HttpRequestSessionResult,
+    HttpResponseSessionEvent, HttpResponseSessionResult, HttpStreamMode, HttpUnchanged,
+    MiddlewareDiagnostics, http_buffered_result, http_inspect, http_preflight_result,
+    http_request_session_event, http_request_session_preflight, http_request_session_result,
+    http_response_session_event, http_response_session_result,
 };
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
@@ -29,28 +34,52 @@ use crate::guard::{
     BodyMode, GuardConfig, GuardOutcome, MAX_PAYLOAD_BYTES, Mode, StreamScanner, inspect, outcome,
 };
 
-/// Run one HTTP session hook exchange. Both RPCs share this handler: the
-/// preflight subject says whether it is a request, a response, or traffic
-/// OpenShell cannot inspect.
-pub(crate) fn stage_stream<S>(mut events: S) -> HttpResultStream
+/// Run one `EvaluateHttpRequestSession` exchange.
+pub(crate) fn request_stream<S>(events: S) -> HttpRequestSessionResultStream
 where
-    S: Stream<Item = Result<HttpEvent, Status>> + Send + Unpin + 'static,
+    S: Stream<Item = Result<HttpRequestSessionEvent, Status>> + Send + Unpin + 'static,
+{
+    stage_stream(events, request_event, |reply| HttpRequestSessionResult {
+        result: Some(reply.into()),
+    })
+}
+
+/// Run one `EvaluateHttpResponseSession` exchange.
+pub(crate) fn response_stream<S>(events: S) -> HttpResponseSessionResultStream
+where
+    S: Stream<Item = Result<HttpResponseSessionEvent, Status>> + Send + Unpin + 'static,
+{
+    stage_stream(events, response_event, |reply| HttpResponseSessionResult {
+        result: Some(reply.into()),
+    })
+}
+
+/// Run one exchange of either RPC. The RPCs carry the same body events and
+/// results, and differ only in their preflight.
+fn stage_stream<S, E, R>(
+    mut events: S,
+    event: fn(E) -> Option<Event>,
+    result: fn(Reply) -> R,
+) -> Pin<Box<dyn Stream<Item = Result<R, Status>> + Send>>
+where
+    S: Stream<Item = Result<E, Status>> + Send + Unpin + 'static,
+    E: Send + 'static,
+    R: Send + 'static,
 {
     let (sender, receiver) = mpsc::channel(4);
     tokio::spawn(async move {
         let mut stage = Stage::Preflight;
-        while let Some(event) = events.next().await {
-            let results = match event {
-                Ok(HttpEvent {
-                    event: Some(http_event::Event::SessionEnd(_)),
-                }) => break,
-                Ok(event) => stage.handle(event),
+        while let Some(next) = events.next().await {
+            let replies = match next.map(event) {
+                Ok(Some(Event::SessionEnd)) => break,
+                Ok(Some(event)) => stage.handle(event),
+                Ok(None) => Err(Status::invalid_argument("HTTP event is required")),
                 Err(error) => Err(error),
             };
-            match results {
-                Ok(results) => {
-                    for result in results {
-                        if sender.send(Ok(result)).await.is_err() {
+            match replies {
+                Ok(replies) => {
+                    for reply in replies {
+                        if sender.send(Ok(result(reply))).await.is_err() {
                             return;
                         }
                     }
@@ -65,6 +94,127 @@ where
     Box::pin(ReceiverStream::new(receiver))
 }
 
+/// One event of either RPC.
+#[derive(Debug)]
+enum Event {
+    Preflight(Box<Preflight>),
+    Begin,
+    BufferedBody(HttpBufferedBody),
+    InputChunk(HttpInputChunk),
+    InputEnd,
+    SessionEnd,
+}
+
+/// What the guard reads from a preflight of either RPC.
+#[derive(Debug, Default)]
+struct Preflight {
+    subject: Subject,
+    config: Option<prost_types::Struct>,
+    permitted_body_modes: Vec<i32>,
+    unavailable_body_modes: Vec<HttpBodyModeUnavailable>,
+    limits: Option<HttpBodyLimits>,
+    declared_body_bytes: Option<u64>,
+}
+
+#[derive(Debug, Default)]
+enum Subject {
+    #[default]
+    Missing,
+    Request(HttpRequestPreflightHead),
+    Response,
+    Uninspectable,
+}
+
+fn request_event(event: HttpRequestSessionEvent) -> Option<Event> {
+    use http_request_session_event::Event as Wire;
+    Some(match event.event? {
+        Wire::Preflight(preflight) => Event::Preflight(Box::new(Preflight {
+            subject: match preflight.subject {
+                Some(http_request_session_preflight::Subject::Request(head)) => {
+                    Subject::Request(head)
+                }
+                Some(http_request_session_preflight::Subject::Uninspectable(_)) => {
+                    Subject::Uninspectable
+                }
+                None => Subject::Missing,
+            },
+            config: preflight.config,
+            permitted_body_modes: preflight.permitted_body_modes,
+            unavailable_body_modes: preflight.unavailable_body_modes,
+            limits: preflight.limits,
+            declared_body_bytes: preflight.declared_body_bytes,
+        })),
+        Wire::Begin(_) => Event::Begin,
+        Wire::BufferedBody(body) => Event::BufferedBody(body),
+        Wire::InputChunk(chunk) => Event::InputChunk(chunk),
+        Wire::InputEnd(_) => Event::InputEnd,
+        Wire::SessionEnd(_) => Event::SessionEnd,
+    })
+}
+
+fn response_event(event: HttpResponseSessionEvent) -> Option<Event> {
+    use http_response_session_event::Event as Wire;
+    Some(match event.event? {
+        Wire::Preflight(preflight) => Event::Preflight(Box::new(Preflight {
+            subject: if preflight.response.is_some() {
+                Subject::Response
+            } else {
+                Subject::Missing
+            },
+            config: preflight.config,
+            permitted_body_modes: preflight.permitted_body_modes,
+            unavailable_body_modes: preflight.unavailable_body_modes,
+            limits: preflight.limits,
+            declared_body_bytes: preflight.declared_body_bytes,
+        })),
+        Wire::Begin(_) => Event::Begin,
+        Wire::BufferedBody(body) => Event::BufferedBody(body),
+        Wire::InputChunk(chunk) => Event::InputChunk(chunk),
+        Wire::InputEnd(_) => Event::InputEnd,
+        Wire::SessionEnd(_) => Event::SessionEnd,
+    })
+}
+
+/// One result of either RPC.
+#[derive(Debug)]
+enum Reply {
+    Preflight(HttpPreflightResult),
+    Buffered(HttpBufferedResult),
+    OutputStart(HttpOutputStart),
+    OutputChunk(HttpOutputChunk),
+    Finish(HttpFinish),
+    Reject(HttpReject),
+    CannotInspect,
+}
+
+impl From<Reply> for http_request_session_result::Result {
+    fn from(reply: Reply) -> Self {
+        match reply {
+            Reply::Preflight(result) => Self::PreflightResult(result),
+            Reply::Buffered(result) => Self::BufferedResult(result),
+            Reply::OutputStart(start) => Self::OutputStart(start),
+            Reply::OutputChunk(chunk) => Self::OutputChunk(chunk),
+            Reply::Finish(finish) => Self::Finish(finish),
+            Reply::Reject(reject) => Self::Reject(reject),
+            Reply::CannotInspect => Self::CannotInspect(HttpCannotInspect {}),
+        }
+    }
+}
+
+impl From<Reply> for http_response_session_result::Result {
+    fn from(reply: Reply) -> Self {
+        match reply {
+            Reply::Preflight(result) => Self::PreflightResult(result),
+            Reply::Buffered(result) => Self::BufferedResult(result),
+            Reply::OutputStart(start) => Self::OutputStart(start),
+            Reply::OutputChunk(chunk) => Self::OutputChunk(chunk),
+            Reply::Finish(finish) => Self::Finish(finish),
+            Reply::Reject(reject) => Self::Reject(reject),
+            Reply::CannotInspect => Self::CannotInspect(HttpCannotInspect {}),
+        }
+    }
+}
+
 enum Stage {
     Preflight,
     Begin(GuardConfig, Selected),
@@ -75,24 +225,21 @@ enum Stage {
 }
 
 impl Stage {
-    /// Handle one event other than `session_end` and return its results.
-    fn handle(&mut self, event: HttpEvent) -> Result<Vec<HttpResult>, Status> {
-        match (std::mem::replace(self, Self::Done), event.event) {
-            (Self::Preflight, Some(http_event::Event::Preflight(preflight))) => {
-                match preflight_decision(preflight)? {
-                    Decision::Continue => Ok(vec![result(http_result::Result::PreflightResult(
-                        HttpPreflightResult {
-                            decision: Some(http_preflight_result::Decision::ContinueWithoutBody(
-                                HttpContinue {},
-                            )),
-                            ..Default::default()
-                        },
-                    ))]),
-                    Decision::Reject(diagnostics) => {
-                        Ok(vec![result(http_result::Result::Reject(HttpReject {
-                            diagnostics: Some(diagnostics),
-                        }))])
-                    }
+    /// Handle one event other than `session_end` and return its replies.
+    fn handle(&mut self, event: Event) -> Result<Vec<Reply>, Status> {
+        match (std::mem::replace(self, Self::Done), event) {
+            (Self::Preflight, Event::Preflight(preflight)) => {
+                match preflight_decision(*preflight)? {
+                    Decision::Continue => Ok(vec![Reply::Preflight(HttpPreflightResult {
+                        decision: Some(http_preflight_result::Decision::ContinueWithoutBody(
+                            HttpContinue {},
+                        )),
+                        ..Default::default()
+                    })]),
+                    Decision::Reject(diagnostics) => Ok(vec![Reply::Reject(HttpReject {
+                        diagnostics: Some(diagnostics),
+                    })]),
+                    Decision::CannotInspect => Ok(vec![Reply::CannotInspect]),
                     Decision::Inspect(config, selected) => {
                         let mode = match selected {
                             Selected::Buffered(max_body_bytes) => {
@@ -101,64 +248,53 @@ impl Stage {
                             Selected::Stream(_) => http_inspect::Mode::Stream(HttpStreamMode {}),
                         };
                         *self = Self::Begin(config, selected);
-                        Ok(vec![result(http_result::Result::PreflightResult(
-                            HttpPreflightResult {
-                                decision: Some(http_preflight_result::Decision::Inspect(
-                                    HttpInspect { mode: Some(mode) },
-                                )),
-                                ..Default::default()
-                            },
-                        ))])
+                        Ok(vec![Reply::Preflight(HttpPreflightResult {
+                            decision: Some(http_preflight_result::Decision::Inspect(HttpInspect {
+                                mode: Some(mode),
+                            })),
+                            ..Default::default()
+                        })])
                     }
                 }
             }
-            (Self::Begin(config, Selected::Buffered(_)), Some(http_event::Event::Begin(_))) => {
+            (Self::Begin(config, Selected::Buffered(_)), Event::Begin) => {
                 *self = Self::Buffered(config);
                 Ok(Vec::new())
             }
-            (
-                Self::Begin(config, Selected::Stream(max_chunk_bytes)),
-                Some(http_event::Event::Begin(_)),
-            ) => {
+            (Self::Begin(config, Selected::Stream(max_chunk_bytes)), Event::Begin) => {
                 let scanner = StreamScanner::new(&config);
                 *self = Self::Stream(config, scanner, max_chunk_bytes);
-                Ok(vec![result(http_result::Result::OutputStart(
-                    HttpOutputStart::default(),
-                ))])
+                Ok(vec![Reply::OutputStart(HttpOutputStart::default())])
             }
-            (Self::Buffered(config), Some(http_event::Event::BufferedBody(body))) => {
+            (Self::Buffered(config), Event::BufferedBody(body)) => {
                 Ok(vec![buffered_result(inspect(&config, &body.data))])
             }
-            (
-                Self::Stream(config, mut scanner, max_chunk_bytes),
-                Some(http_event::Event::InputChunk(chunk)),
-            ) => match scanner.push(&chunk.data, config.mode == Mode::Deny) {
-                Ok(output) => {
-                    *self = Self::Stream(config, scanner, max_chunk_bytes);
-                    Ok(output_chunks(&output, max_chunk_bytes))
+            (Self::Stream(config, mut scanner, max_chunk_bytes), Event::InputChunk(chunk)) => {
+                match scanner.push(&chunk.data, config.mode == Mode::Deny) {
+                    Ok(output) => {
+                        *self = Self::Stream(config, scanner, max_chunk_bytes);
+                        Ok(output_chunks(&output, max_chunk_bytes))
+                    }
+                    Err(_) => Ok(vec![reject(&config, &scanner)]),
                 }
-                Err(_) => Ok(vec![reject(&config, &scanner)]),
-            },
-            (
-                Self::Stream(config, mut scanner, max_chunk_bytes),
-                Some(http_event::Event::InputEnd(_)),
-            ) => match scanner.finish(config.mode == Mode::Deny) {
-                Ok(output) => {
-                    let (match_count, matched_term_count) = scanner.counts();
-                    let diagnostics = (match_count > 0)
-                        .then(|| diagnostics(outcome(&config, match_count, matched_term_count)));
-                    let mut results = output_chunks(&output, max_chunk_bytes);
-                    results.push(result(http_result::Result::Finish(HttpFinish {
-                        trailer_mutations: Vec::new(),
-                        diagnostics,
-                    })));
-                    Ok(results)
+            }
+            (Self::Stream(config, mut scanner, max_chunk_bytes), Event::InputEnd) => {
+                match scanner.finish(config.mode == Mode::Deny) {
+                    Ok(output) => {
+                        let (match_count, matched_term_count) = scanner.counts();
+                        let diagnostics = (match_count > 0).then(|| {
+                            diagnostics(outcome(&config, match_count, matched_term_count))
+                        });
+                        let mut replies = output_chunks(&output, max_chunk_bytes);
+                        replies.push(Reply::Finish(HttpFinish {
+                            trailer_mutations: Vec::new(),
+                            diagnostics,
+                        }));
+                        Ok(replies)
+                    }
+                    Err(_) => Ok(vec![reject(&config, &scanner)]),
                 }
-                Err(_) => Ok(vec![reject(&config, &scanner)]),
-            },
-            (_, None) => Err(Status::invalid_argument("HTTP event is required")),
-            // Not FAILED_PRECONDITION, which OpenShell reads as "cannot
-            // inspect".
+            }
             _ => Err(Status::invalid_argument(
                 "invalid content guard HTTP lifecycle",
             )),
@@ -176,13 +312,14 @@ enum Selected {
 enum Decision {
     Continue,
     Reject(MiddlewareDiagnostics),
+    CannotInspect,
     Inspect(GuardConfig, Selected),
 }
 
-fn preflight_decision(preflight: HttpPreflight) -> Result<Decision, Status> {
+fn preflight_decision(preflight: Preflight) -> Result<Decision, Status> {
     let config = GuardConfig::parse(preflight.config.as_ref()).map_err(Status::invalid_argument)?;
     match &preflight.subject {
-        Some(http_preflight::Subject::Uninspectable(_)) => {
+        Subject::Uninspectable => {
             return Ok(if config.allow_uninspectable {
                 Decision::Continue
             } else {
@@ -196,7 +333,7 @@ fn preflight_decision(preflight: HttpPreflight) -> Result<Decision, Status> {
         // The request target cannot be redacted, so a configured term in the
         // path or query rejects the request before its body is read or the
         // upstream is contacted.
-        Some(http_preflight::Subject::Request(head)) => {
+        Subject::Request(head) => {
             let target = head.target.clone().unwrap_or_default();
             let found = inspect(&config, target.path.as_bytes());
             let found = if found.findings.is_empty() {
@@ -211,10 +348,11 @@ fn preflight_decision(preflight: HttpPreflight) -> Result<Decision, Status> {
                 return Ok(Decision::Reject(diagnostics));
             }
         }
-        Some(http_preflight::Subject::Response(_)) => {}
-        None => return Err(Status::invalid_argument("preflight subject is required")),
+        Subject::Response => {}
+        Subject::Missing => return Err(Status::invalid_argument("preflight subject is required")),
     }
-    // Nothing to guard in an empty body.
+    // Nothing to guard in an empty body. OpenShell declares a length only
+    // when no earlier stage may have replaced the body.
     if preflight.declared_body_bytes == Some(0) {
         return Ok(Decision::Continue);
     }
@@ -244,23 +382,15 @@ fn preflight_decision(preflight: HttpPreflight) -> Result<Decision, Status> {
         // A message without a body has nothing to guard. The guard never
         // passes a body it could not inspect.
         None if bodyless(&preflight) => Ok(Decision::Continue),
-        None => Err(Status::failed_precondition(
-            "content guard cannot inspect this message body",
-        )),
+        None => Ok(Decision::CannotInspect),
     }
 }
 
-fn bodyless(preflight: &HttpPreflight) -> bool {
+fn bodyless(preflight: &Preflight) -> bool {
     preflight
         .unavailable_body_modes
         .iter()
         .any(|unavailable| unavailable.reason == HttpBodyUnavailableReason::Bodyless as i32)
-}
-
-fn result(result: http_result::Result) -> HttpResult {
-    HttpResult {
-        result: Some(result),
-    }
 }
 
 fn diagnostics(outcome: GuardOutcome) -> MiddlewareDiagnostics {
@@ -272,11 +402,11 @@ fn diagnostics(outcome: GuardOutcome) -> MiddlewareDiagnostics {
     }
 }
 
-fn buffered_result(outcome: GuardOutcome) -> HttpResult {
+fn buffered_result(outcome: GuardOutcome) -> Reply {
     if outcome.denied {
-        return result(http_result::Result::Reject(HttpReject {
+        return Reply::Reject(HttpReject {
             diagnostics: Some(diagnostics(outcome)),
-        }));
+        });
     }
     let mut outcome = outcome;
     let body = outcome.replacement.take().map_or(
@@ -284,88 +414,85 @@ fn buffered_result(outcome: GuardOutcome) -> HttpResult {
         http_buffered_result::Body::Replacement,
     );
     let diagnostics = (!outcome.findings.is_empty()).then(|| diagnostics(outcome));
-    result(http_result::Result::BufferedResult(HttpBufferedResult {
+    Reply::Buffered(HttpBufferedResult {
         body: Some(body),
         diagnostics,
         ..Default::default()
-    }))
+    })
 }
 
 /// Output results for `data`, each within OpenShell's chunk limit: redacting
 /// a short term makes the output longer than the input.
-fn output_chunks(data: &[u8], max_chunk_bytes: usize) -> Vec<HttpResult> {
+fn output_chunks(data: &[u8], max_chunk_bytes: usize) -> Vec<Reply> {
     data.chunks(max_chunk_bytes)
         .map(|data| {
-            result(http_result::Result::OutputChunk(HttpOutputChunk {
+            Reply::OutputChunk(HttpOutputChunk {
                 data: data.to_vec(),
-            }))
+            })
         })
         .collect()
 }
 
-fn reject(config: &GuardConfig, scanner: &StreamScanner) -> HttpResult {
+fn reject(config: &GuardConfig, scanner: &StreamScanner) -> Reply {
     let (match_count, matched_term_count) = scanner.counts();
-    result(http_result::Result::Reject(HttpReject {
+    Reply::Reject(HttpReject {
         diagnostics: Some(diagnostics(outcome(
             config,
             match_count.max(1),
             matched_term_count.max(1),
         ))),
-    }))
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use openshell_core::proto::{
-        HttpBegin, HttpBodyLimits, HttpBodyModeUnavailable, HttpBufferedBody, HttpInputChunk,
-        HttpInputEnd, HttpRequestPreflightHead, HttpResponsePreflightHead, UninspectableTraffic,
+        HttpBegin, HttpRequestSessionPreflight, HttpResponsePreflightHead,
+        HttpResponseSessionPreflight,
     };
 
     use super::*;
     use crate::guard::test_support::config;
 
     fn preflight(
-        subject: http_preflight::Subject,
+        subject: Subject,
         mode: &str,
         extra: &[(&str, &str)],
         permitted: &[HttpBodyMode],
-    ) -> HttpEvent {
-        HttpEvent {
-            event: Some(http_event::Event::Preflight(HttpPreflight {
-                subject: Some(subject),
-                config: Some(config(mode, &["prototype-secret", "秘密"], extra)),
-                permitted_body_modes: permitted.iter().map(|mode| *mode as i32).collect(),
-                limits: Some(HttpBodyLimits {
-                    max_chunk_bytes: 64 * 1024,
-                    max_buffered_body_bytes: 1024 * 1024,
-                    ..Default::default()
-                }),
-                declared_body_bytes: Some(32),
+    ) -> Event {
+        Event::Preflight(Box::new(Preflight {
+            subject,
+            config: Some(config(mode, &["prototype-secret", "秘密"], extra)),
+            permitted_body_modes: permitted.iter().map(|mode| *mode as i32).collect(),
+            limits: Some(HttpBodyLimits {
+                max_chunk_bytes: 64 * 1024,
+                max_buffered_body_bytes: 1024 * 1024,
                 ..Default::default()
-            })),
-        }
+            }),
+            declared_body_bytes: Some(32),
+            ..Default::default()
+        }))
     }
 
-    fn request() -> http_preflight::Subject {
-        http_preflight::Subject::Request(HttpRequestPreflightHead::default())
+    fn request() -> Subject {
+        Subject::Request(HttpRequestPreflightHead::default())
     }
 
-    fn response() -> http_preflight::Subject {
-        http_preflight::Subject::Response(HttpResponsePreflightHead::default())
+    fn only(replies: Vec<Reply>) -> Reply {
+        assert_eq!(replies.len(), 1, "{replies:?}");
+        replies.into_iter().next().unwrap()
     }
 
-    fn event(event: http_event::Event) -> HttpEvent {
-        HttpEvent { event: Some(event) }
-    }
-
-    fn only(results: Vec<HttpResult>) -> http_result::Result {
-        assert_eq!(results.len(), 1, "{results:?}");
-        results.into_iter().next().unwrap().result.unwrap()
+    fn buffered_body(data: &[u8]) -> Event {
+        Event::BufferedBody(HttpBufferedBody {
+            data: data.to_vec(),
+            trailers: Vec::new(),
+        })
     }
 
     #[test]
     fn buffered_stage_passes_redacts_and_denies() {
-        for subject in [request(), response()] {
+        for subject in [request, || Subject::Response] {
             for (mode, input, expected) in [
                 ("redact", "clean", None),
                 (
@@ -378,17 +505,12 @@ mod tests {
                 let mut stage = Stage::Preflight;
                 let selected = only(
                     stage
-                        .handle(preflight(
-                            subject.clone(),
-                            mode,
-                            &[],
-                            &[HttpBodyMode::Buffered],
-                        ))
+                        .handle(preflight(subject(), mode, &[], &[HttpBodyMode::Buffered]))
                         .unwrap(),
                 );
                 assert!(matches!(
                     selected,
-                    http_result::Result::PreflightResult(HttpPreflightResult {
+                    Reply::Preflight(HttpPreflightResult {
                         decision: Some(http_preflight_result::Decision::Inspect(HttpInspect {
                             mode: Some(http_inspect::Mode::Buffered(HttpBufferedMode {
                                 max_body_bytes: MAX_PAYLOAD_BYTES
@@ -397,37 +519,25 @@ mod tests {
                         ..
                     })
                 ));
-                assert!(
-                    stage
-                        .handle(event(http_event::Event::Begin(HttpBegin::default())))
-                        .unwrap()
-                        .is_empty()
-                );
-                let body = only(
-                    stage
-                        .handle(event(http_event::Event::BufferedBody(HttpBufferedBody {
-                            data: input.as_bytes().to_vec(),
-                            trailers: Vec::new(),
-                        })))
-                        .unwrap(),
-                );
+                assert!(stage.handle(Event::Begin).unwrap().is_empty());
+                let body = only(stage.handle(buffered_body(input.as_bytes())).unwrap());
                 match (mode, expected, body) {
-                    ("deny", _, http_result::Result::Reject(reject)) => {
+                    ("deny", _, Reply::Reject(reject)) => {
                         let diagnostics = reject.diagnostics.unwrap();
                         assert_eq!(diagnostics.reason_code, "content_match");
                         assert!(!diagnostics.reason.contains("prototype-secret"));
                     }
-                    (_, Some(expected), http_result::Result::BufferedResult(result)) => assert_eq!(
+                    (_, Some(expected), Reply::Buffered(result)) => assert_eq!(
                         result.body,
                         Some(http_buffered_result::Body::Replacement(
                             expected.as_bytes().to_vec()
                         ))
                     ),
-                    (_, None, http_result::Result::BufferedResult(result)) => assert_eq!(
+                    (_, None, Reply::Buffered(result)) => assert_eq!(
                         result.body,
                         Some(http_buffered_result::Body::Unchanged(HttpUnchanged {}))
                     ),
-                    (_, _, result) => panic!("unexpected {mode} result: {result:?}"),
+                    (_, _, reply) => panic!("unexpected {mode} reply: {reply:?}"),
                 }
             }
         }
@@ -439,7 +549,7 @@ mod tests {
         let selected = only(
             stage
                 .handle(preflight(
-                    response(),
+                    Subject::Response,
                     "redact",
                     &[("body_mode", "stream")],
                     &[HttpBodyMode::Buffered, HttpBodyMode::Stream],
@@ -448,7 +558,7 @@ mod tests {
         );
         assert!(matches!(
             selected,
-            http_result::Result::PreflightResult(HttpPreflightResult {
+            Reply::Preflight(HttpPreflightResult {
                 decision: Some(http_preflight_result::Decision::Inspect(HttpInspect {
                     mode: Some(http_inspect::Mode::Stream(_)),
                 })),
@@ -456,33 +566,26 @@ mod tests {
             })
         ));
         assert!(matches!(
-            only(
-                stage
-                    .handle(event(http_event::Event::Begin(HttpBegin::default())))
-                    .unwrap()
-            ),
-            http_result::Result::OutputStart(_)
+            only(stage.handle(Event::Begin).unwrap()),
+            Reply::OutputStart(_)
         ));
         let mut output = Vec::new();
         for chunk in [&b"data: prototype-"[..], b"secret\n\n"] {
-            for result in stage
-                .handle(event(http_event::Event::InputChunk(HttpInputChunk {
+            for reply in stage
+                .handle(Event::InputChunk(HttpInputChunk {
                     data: chunk.to_vec(),
-                })))
+                }))
                 .unwrap()
             {
-                let Some(http_result::Result::OutputChunk(chunk)) = result.result else {
+                let Reply::OutputChunk(chunk) = reply else {
                     panic!("output chunk")
                 };
                 output.extend(chunk.data);
             }
         }
         assert_eq!(output, b"data: [REDACTED]\n\n");
-        let finished = stage
-            .handle(event(http_event::Event::InputEnd(HttpInputEnd::default())))
-            .unwrap();
-        let Some(http_result::Result::Finish(finish)) = finished.last().unwrap().result.clone()
-        else {
+        let finished = stage.handle(Event::InputEnd).unwrap();
+        let Some(Reply::Finish(finish)) = finished.into_iter().last() else {
             panic!("finish")
         };
         assert_eq!(finish.diagnostics.unwrap().findings[0].count, 1);
@@ -491,12 +594,12 @@ mod tests {
     #[test]
     fn stream_stage_splits_expanded_output_within_the_chunk_limit() {
         let mut selected = preflight(
-            response(),
+            Subject::Response,
             "redact",
             &[("body_mode", "stream")],
             &[HttpBodyMode::Stream],
         );
-        let Some(http_event::Event::Preflight(preflight_event)) = selected.event.as_mut() else {
+        let Event::Preflight(preflight_event) = &mut selected else {
             unreachable!()
         };
         preflight_event.limits = Some(HttpBodyLimits {
@@ -505,29 +608,23 @@ mod tests {
         });
         let mut stage = Stage::Preflight;
         stage.handle(selected).unwrap();
-        stage
-            .handle(event(http_event::Event::Begin(HttpBegin::default())))
-            .unwrap();
+        stage.handle(Event::Begin).unwrap();
         // Each 6-byte term becomes the 10-byte marker.
-        let mut results = stage
-            .handle(event(http_event::Event::InputChunk(HttpInputChunk {
+        let mut replies = stage
+            .handle(Event::InputChunk(HttpInputChunk {
                 data: "秘密".repeat(8).into_bytes(),
-            })))
+            }))
             .unwrap();
-        results.extend(
-            stage
-                .handle(event(http_event::Event::InputEnd(HttpInputEnd::default())))
-                .unwrap(),
-        );
+        replies.extend(stage.handle(Event::InputEnd).unwrap());
         let mut output = Vec::new();
-        for result in results {
-            match result.result {
-                Some(http_result::Result::OutputChunk(chunk)) => {
+        for reply in replies {
+            match reply {
+                Reply::OutputChunk(chunk) => {
                     assert!((1..=16).contains(&chunk.data.len()), "{chunk:?}");
                     output.extend(chunk.data);
                 }
-                Some(http_result::Result::Finish(_)) => {}
-                result => panic!("unexpected result: {result:?}"),
+                Reply::Finish(_) => {}
+                reply => panic!("unexpected reply: {reply:?}"),
             }
         }
         assert_eq!(output, "[REDACTED]".repeat(8).as_bytes());
@@ -535,8 +632,8 @@ mod tests {
 
     #[test]
     fn preflight_continues_bodyless_and_empty_messages() {
-        let mut bodyless = preflight(response(), "redact", &[], &[]);
-        let Some(http_event::Event::Preflight(preflight_event)) = bodyless.event.as_mut() else {
+        let mut bodyless = preflight(Subject::Response, "redact", &[], &[]);
+        let Event::Preflight(preflight_event) = &mut bodyless else {
             unreachable!()
         };
         preflight_event.unavailable_body_modes = vec![HttpBodyModeUnavailable {
@@ -544,14 +641,14 @@ mod tests {
             reason: HttpBodyUnavailableReason::Bodyless as i32,
         }];
         let mut empty = preflight(request(), "redact", &[], &[HttpBodyMode::Buffered]);
-        let Some(http_event::Event::Preflight(preflight_event)) = empty.event.as_mut() else {
+        let Event::Preflight(preflight_event) = &mut empty else {
             unreachable!()
         };
         preflight_event.declared_body_bytes = Some(0);
         for event in [bodyless, empty] {
             assert!(matches!(
                 only(Stage::Preflight.handle(event).unwrap()),
-                http_result::Result::PreflightResult(HttpPreflightResult {
+                Reply::Preflight(HttpPreflightResult {
                     decision: Some(http_preflight_result::Decision::ContinueWithoutBody(_)),
                     ..
                 })
@@ -561,18 +658,24 @@ mod tests {
 
     #[test]
     fn preflight_cannot_inspect_a_body_it_is_not_offered() {
-        let mut encoded = preflight(response(), "redact", &[], &[]);
-        let Some(http_event::Event::Preflight(preflight_event)) = encoded.event.as_mut() else {
-            unreachable!()
-        };
-        preflight_event.unavailable_body_modes = vec![HttpBodyModeUnavailable {
-            mode: HttpBodyMode::Buffered as i32,
-            reason: HttpBodyUnavailableReason::Encoded as i32,
-        }];
-        assert_eq!(
-            Stage::Preflight.handle(encoded).unwrap_err().code(),
-            tonic::Code::FailedPrecondition
-        );
+        // OpenShell offers no body mode for an encoded request or response.
+        for subject in [request, || Subject::Response] {
+            let mut encoded = preflight(subject(), "redact", &[], &[]);
+            let Event::Preflight(preflight_event) = &mut encoded else {
+                unreachable!()
+            };
+            preflight_event.unavailable_body_modes = [HttpBodyMode::Buffered, HttpBodyMode::Stream]
+                .into_iter()
+                .map(|mode| HttpBodyModeUnavailable {
+                    mode: mode as i32,
+                    reason: HttpBodyUnavailableReason::Encoded as i32,
+                })
+                .collect();
+            assert!(matches!(
+                only(Stage::Preflight.handle(encoded).unwrap()),
+                Reply::CannotInspect
+            ));
+        }
     }
 
     #[test]
@@ -581,7 +684,7 @@ mod tests {
             ("/items/prototype-secret", ""),
             ("/items", "q=prototype-secret"),
         ] {
-            let subject = http_preflight::Subject::Request(HttpRequestPreflightHead {
+            let subject = Subject::Request(HttpRequestPreflightHead {
                 target: Some(openshell_core::proto::HttpRequestTarget {
                     path: path.into(),
                     query: query.into(),
@@ -594,7 +697,7 @@ mod tests {
                     .handle(preflight(subject, "redact", &[], &[HttpBodyMode::Buffered]))
                     .unwrap(),
             );
-            let http_result::Result::Reject(reject) = rejected else {
+            let Reply::Reject(reject) = rejected else {
                 panic!("expected a rejection for {path}?{query}")
             };
             let diagnostics = reject.diagnostics.unwrap();
@@ -605,13 +708,13 @@ mod tests {
 
     #[test]
     fn uninspectable_traffic_is_denied_unless_allowed() {
-        let subject = || http_preflight::Subject::Uninspectable(UninspectableTraffic::default());
+        let subject = || Subject::Uninspectable;
         let denied = only(
             Stage::Preflight
                 .handle(preflight(subject(), "redact", &[], &[]))
                 .unwrap(),
         );
-        let http_result::Result::Reject(reject) = denied else {
+        let Reply::Reject(reject) = denied else {
             panic!("expected a rejection")
         };
         assert_eq!(
@@ -629,7 +732,7 @@ mod tests {
                     ))
                     .unwrap()
             ),
-            http_result::Result::PreflightResult(HttpPreflightResult {
+            Reply::Preflight(HttpPreflightResult {
                 decision: Some(http_preflight_result::Decision::ContinueWithoutBody(_)),
                 ..
             })
@@ -638,14 +741,11 @@ mod tests {
 
     #[test]
     fn stage_enforces_its_lifecycle() {
-        let body = || {
-            event(http_event::Event::BufferedBody(HttpBufferedBody {
-                data: b"early".to_vec(),
-                trailers: Vec::new(),
-            }))
-        };
         assert_eq!(
-            Stage::Preflight.handle(body()).unwrap_err().code(),
+            Stage::Preflight
+                .handle(buffered_body(b"early"))
+                .unwrap_err()
+                .code(),
             tonic::Code::InvalidArgument
         );
         let mut stage = Stage::Preflight;
@@ -658,8 +758,87 @@ mod tests {
             ))
             .unwrap();
         assert_eq!(
-            stage.handle(body()).unwrap_err().code(),
+            stage.handle(buffered_body(b"early")).unwrap_err().code(),
             tonic::Code::InvalidArgument
         );
+    }
+
+    /// Wire preflight fields shared by both RPCs, for a BUFFERED body.
+    fn buffered_offer() -> (
+        Vec<i32>,
+        Option<HttpBodyLimits>,
+        Option<prost_types::Struct>,
+    ) {
+        (
+            vec![HttpBodyMode::Buffered as i32],
+            Some(HttpBodyLimits {
+                max_chunk_bytes: 64 * 1024,
+                max_buffered_body_bytes: 1024,
+                ..Default::default()
+            }),
+            Some(config("redact", &["prototype-secret"], &[])),
+        )
+    }
+
+    #[tokio::test]
+    async fn both_rpcs_run_the_same_exchange() {
+        let body = || HttpBufferedBody {
+            data: b"a prototype-secret".to_vec(),
+            trailers: Vec::new(),
+        };
+        let (permitted, limits, config) = buffered_offer();
+        let request = request_stream(tokio_stream::iter(
+            [
+                http_request_session_event::Event::Preflight(HttpRequestSessionPreflight {
+                    subject: Some(http_request_session_preflight::Subject::Request(
+                        HttpRequestPreflightHead::default(),
+                    )),
+                    config: config.clone(),
+                    permitted_body_modes: permitted.clone(),
+                    limits,
+                    ..Default::default()
+                }),
+                http_request_session_event::Event::Begin(HttpBegin::default()),
+                http_request_session_event::Event::BufferedBody(body()),
+            ]
+            .map(|event| Ok(HttpRequestSessionEvent { event: Some(event) })),
+        ));
+        let request: Vec<_> = request
+            .map(|result| result.unwrap().result.unwrap())
+            .collect()
+            .await;
+        assert!(matches!(
+            request.as_slice(),
+            [
+                http_request_session_result::Result::PreflightResult(_),
+                http_request_session_result::Result::BufferedResult(_),
+            ]
+        ));
+
+        let response = response_stream(tokio_stream::iter(
+            [
+                http_response_session_event::Event::Preflight(HttpResponseSessionPreflight {
+                    response: Some(HttpResponsePreflightHead::default()),
+                    config,
+                    permitted_body_modes: permitted,
+                    limits,
+                    ..Default::default()
+                }),
+                http_response_session_event::Event::Begin(HttpBegin::default()),
+                http_response_session_event::Event::BufferedBody(body()),
+            ]
+            .map(|event| Ok(HttpResponseSessionEvent { event: Some(event) })),
+        ));
+        let response: Vec<_> = response
+            .map(|result| result.unwrap().result.unwrap())
+            .collect()
+            .await;
+        assert!(matches!(
+            response.as_slice(),
+            [
+                http_response_session_result::Result::PreflightResult(_),
+                http_response_session_result::Result::BufferedResult(_),
+            ]
+        ));
     }
 }
