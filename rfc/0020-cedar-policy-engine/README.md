@@ -105,8 +105,9 @@ This RFC does not restate Cedar; see:
 - SQL policy. OpenShell does not inspect SQL traffic for either format.
 - Syscall policy. Seccomp filtering is a fixed runtime control for both
   formats, not authored policy.
-- Changes to the Cedar language beyond delimited `like`, which the Cedar team
-  provides.
+- Changes to upstream Cedar. The language features OpenShell needs are
+  developed with the Cedar team in `ai-openshell/cedar`, OpenShell's Cedar in
+  its CNCF workspace, and proposed upstream separately.
 - Temporal or history-dependent policies. This RFC adopts Cedar; a
   Dogwood-based proposal for temporal policies would build on it later.
 - Changing the policy prover's YAML model. Extending analysis to Cedar
@@ -833,10 +834,9 @@ hosts and paths use `*` within a segment and `**` across. OpenShell could have
 matched globs itself and passed booleans into Cedar, but then those
 conditions would be opaque to Cedar's analysis. Delimited `like` was instead
 added to Cedar by the Cedar team, with parser, validator, evaluator,
-symbolic-compiler, and Lean specification support, and is being standardized
-as cedar-policy/rfcs#115. Until it is released, OpenShell depends on a pinned
-git revision of that work in `ai-openshell/cedar`, which is the main schedule
-risk below.
+symbolic-compiler, and Lean specification support, in `ai-openshell/cedar`,
+  and is proposed upstream as cedar-policy/rfcs#115. OpenShell depends on its
+  own Cedar by design, so this is not a schedule dependency on upstream.
 
 **Additive storage.** The three new `SandboxPolicy` fields
 (`cedar_policy_source`, `provider_credential_rules`, `endpoint_settings`) are
@@ -873,9 +873,8 @@ Remaining steps:
 
 - Move this draft to `rfc/0020-cedar-policy-engine/README.md`, set its
   state to `review`, and open the RFC pull request.
-- Move to a released `cedar-policy` once it includes delimited `like`, and
-  remove the `deny.toml` git exception. Merging earlier would mean dropping
-  glob support and the parity cases that use it.
+- Keep `ai-openshell/cedar` moving with the Cedar team: track delimited
+  `like` upstream (cedar-policy/rfcs#115) and bump the pin as features land.
 - Pass the first CI run of the `cedar` E2E matrix entry.
 - Rename the Rust input types of `openshell-policy-cedar` after the schema
   actions (`NetworkRequest` to a `NetworkConnect` request type, `L7Request`
@@ -905,12 +904,12 @@ cross-compile; and the first CI run.
 
 ## Risks
 
-- **Experimental Cedar dependency.** Delimited `like` is not in a Cedar
-  release. The Cedar team is standardizing it through
-  [cedar-policy/rfcs#115](https://github.com/cedar-policy/rfcs/pull/115), so
-  its syntax or semantics could still change, and the git pin on the public
-  `ai-openshell/cedar` repository needs a supply-chain exception until
-  release.
+- **OpenShell's own Cedar.** `ai-openshell/cedar` is a fork OpenShell
+  maintains and iterates on with the Cedar team, so features such as
+  delimited `like` can change shape as they are refined (upstream proposal:
+  [cedar-policy/rfcs#115](https://github.com/cedar-policy/rfcs/pull/115)),
+  and the git pin is a standing supply-chain exception the project owns
+  rather than a temporary one.
 - **Policies that read differently.** The Cedar forms of YAML's implicit
   behaviors (`HEAD` under `GET`, MCP streams, audit versus staged, binary
   globs through `context.binary_globs`) are explicit in the policy text, and
