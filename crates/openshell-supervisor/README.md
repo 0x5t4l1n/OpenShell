@@ -21,6 +21,7 @@ authenticated CONNECT listener settings. Shared networking starts the listener
 only after boundary attachment and confirmation; the supervisor owns policy
 evaluation, live credentials, and listener lifetime. These settings do not add
 a proxy hook to the isolation interface or the shared Sandbox Protocol descriptor.
+
 ## Application ingress
 
 The optional app listener terminates TLS separately from the gateway session. Operators enable it with `OPENSHELL_APP_LISTEN_ADDRESS`, `OPENSHELL_APP_SERVICE_DOMAIN`, `OPENSHELL_APP_TLS_CERT`, and `OPENSHELL_APP_TLS_KEY`; all four are required. The Kubernetes driver can supply these through `sandbox_runtime.app_listener` and a TLS Secret. Certificates reload on supervisor recreation.

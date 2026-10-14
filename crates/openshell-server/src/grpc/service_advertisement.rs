@@ -6,6 +6,7 @@
 //! fail closed after restart, ownership replacement, declaration changes, or expiry.
 
 use crate::ServerState;
+use crate::compute::MutationScope;
 use crate::persistence::{ObjectCursor, ObjectRecord, PersistenceError, WriteCondition};
 use crate::supervisor_owner::{OWNER_TTL, OwnerGuard, SupervisorOwnerIndex};
 use openshell_core::config::ServiceRoutingConfig;
@@ -54,7 +55,10 @@ async fn cleanup_record(state: &Arc<ServerState>, record: &ObjectRecord) -> Resu
         .map_err(|_| Status::internal("invalid stored service advertisement"))?;
     let _guard = state
         .compute
-        .sandbox_sync_guard()
+        .mutation_guard(MutationScope::sandbox(
+            &record.workspace,
+            &advertisement.sandbox_id,
+        ))
         .await
         .map_err(|_| Status::internal("service advertisement cleanup lock failed"))?;
     let current = state
@@ -216,11 +220,14 @@ pub async fn accept(
     owner: &OwnerGuard,
     report: SupervisorServiceAdvertisement,
 ) -> Result<(), Status> {
-    let _guard = state
+    let Some(_guard) = state
         .compute
-        .sandbox_sync_guard()
+        .sandbox_mutation_guard_by_id(&owner.sandbox_id)
         .await
-        .map_err(|_| Status::internal("service advertisement mutation lock failed"))?;
+        .map_err(|_| Status::internal("service advertisement mutation lock failed"))?
+    else {
+        return Err(Status::not_found("sandbox not found"));
+    };
     if !state
         .supervisor_sessions
         .is_endpoint_status_authority(&owner.sandbox_id, &owner.session_id)
