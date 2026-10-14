@@ -48,6 +48,10 @@ const CONFIG_BOOTSTRAP_BUILD_TIMEOUT: Duration = Duration::from_secs(45);
 /// How long an invalid image policy waits for an operator to store a gateway
 /// policy before the startup session is rejected.
 const STARTUP_POLICY_REPAIR_TIMEOUT: Duration = Duration::from_mins(5);
+/// How often a startup waiting for a policy repair checks again. Only
+/// sandbox changes on this gateway wake it, so this picks up a global policy
+/// or a change saved on another replica.
+const STARTUP_POLICY_REPAIR_RECHECK: Duration = Duration::from_secs(1);
 /// How long a session holds newer updates for a component while waiting for
 /// the supervisor to acknowledge the one it already has.
 const CONFIG_ACK_TIMEOUT: Duration = Duration::from_mins(1);
@@ -1346,7 +1350,8 @@ pub fn image_policy_admission(hello: &SupervisorHello) -> Result<ImagePolicyAdmi
 ///
 /// An invalid image policy cannot become the startup baseline, so the build
 /// waits for an operator to store a gateway policy, bounded by
-/// `STARTUP_POLICY_REPAIR_TIMEOUT`.
+/// `STARTUP_POLICY_REPAIR_TIMEOUT`. It checks again on every change to the
+/// sandbox and at least every `STARTUP_POLICY_REPAIR_RECHECK`.
 pub async fn build_session_bootstrap(
     state: &Arc<ServerState>,
     sandbox_id: &str,
@@ -1356,6 +1361,9 @@ pub async fn build_session_bootstrap(
     let mut repair_updates =
         waits_for_repair.then(|| state.sandbox_watch_bus.subscribe(sandbox_id));
     let repair_deadline = tokio::time::Instant::now() + STARTUP_POLICY_REPAIR_TIMEOUT;
+    // The last reason logged for waiting: no gateway policy yet (`None`) or a
+    // build error. Rechecks log only a new reason.
+    let mut logged_wait: Option<Option<tonic::Code>> = None;
     loop {
         let current_sandbox =
             crate::supervisor_session::require_persisted_sandbox(&state.store, sandbox_id).await?;
@@ -1374,17 +1382,21 @@ pub async fn build_session_bootstrap(
                     .increment(1);
                     return Ok(bootstrap);
                 }
-                warn!(
-                    sandbox_id = %sandbox_id,
-                    "invalid image policy rejected; waiting for a gateway policy repair"
-                );
+                if logged_wait.replace(None) != Some(None) {
+                    warn!(
+                        sandbox_id = %sandbox_id,
+                        "invalid image policy rejected; waiting for a gateway policy repair"
+                    );
+                }
             }
             Err(error) if waits_for_repair => {
-                warn!(
-                    sandbox_id = %sandbox_id,
-                    error_code = ?error.code(),
-                    "invalid image policy rejected; waiting for configuration repair"
-                );
+                if logged_wait.replace(Some(error.code())) != Some(Some(error.code())) {
+                    warn!(
+                        sandbox_id = %sandbox_id,
+                        error_code = ?error.code(),
+                        "invalid image policy rejected; waiting for configuration repair"
+                    );
+                }
             }
             Err(error) => {
                 counter!(
@@ -1401,19 +1413,21 @@ pub async fn build_session_bootstrap(
             }
         }
 
+        if tokio::time::Instant::now() >= repair_deadline {
+            return Err(Status::deadline_exceeded(
+                "image policy repair window expired",
+            ));
+        }
         let updates = repair_updates
             .as_mut()
             .expect("only an invalid image policy waits for repair");
-        match tokio::time::timeout_at(repair_deadline, updates.recv()).await {
-            Ok(Ok(()) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => {}
+        let recheck_at =
+            repair_deadline.min(tokio::time::Instant::now() + STARTUP_POLICY_REPAIR_RECHECK);
+        match tokio::time::timeout_at(recheck_at, updates.recv()).await {
+            Ok(Ok(()) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) | Err(_) => {}
             Ok(Err(tokio::sync::broadcast::error::RecvError::Closed)) => {
                 return Err(Status::aborted(
                     "sandbox configuration watch closed during startup repair",
-                ));
-            }
-            Err(_) => {
-                return Err(Status::deadline_exceeded(
-                    "image policy repair window expired",
                 ));
             }
         }
