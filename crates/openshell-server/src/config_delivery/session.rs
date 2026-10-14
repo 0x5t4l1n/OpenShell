@@ -2422,7 +2422,12 @@ mod tests {
 
         // A user mutation holding the sandbox lock must not hold up the
         // supervisor's acknowledgement.
-        let guard = state.compute.sandbox_sync_guard().await.unwrap();
+        let guard = crate::persistence::lock_order::branch(
+            state.compute.sandbox_mutation_guard_by_id(sandbox_id),
+        )
+        .await
+        .unwrap()
+        .expect("sandbox");
         tokio::time::timeout(
             Duration::from_secs(2),
             handle_config_update_result(&accepted_session(&state, sandbox_id, tx.clone()), &result),

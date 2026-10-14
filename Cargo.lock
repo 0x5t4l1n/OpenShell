@@ -4710,6 +4710,8 @@ version = "0.0.0"
 dependencies = [
  "openshell-otel",
  "opentelemetry-proto",
+ "rcgen",
+ "tempfile",
  "tokio",
  "tokio-stream",
  "tonic",
@@ -8209,6 +8211,7 @@ dependencies = [
  "axum",
  "base64 0.22.1",
  "bytes",
+ "flate2",
  "h2",
  "http 1.4.0",
  "http-body 1.0.1",
