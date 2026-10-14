@@ -5,6 +5,7 @@ state: review
 links:
   - https://github.com/NVIDIA/OpenShell/issues/4411
   - https://github.com/NVIDIA/OpenShell/issues/4474
+  - https://github.com/NVIDIA/OpenShell/pull/4564
 ---
 
 # RFC 0020 - Cedar as an Alternate Sandbox Policy Language
