@@ -1239,6 +1239,9 @@ runtime-selected profile.
 
 The MXC driver is Windows-only and opt-in. It links into the gateway and invokes Microsoft MXC through `wxc-exec.exe`. The driver starts `openshell-supervisor --role=isolation-backend` on the host and `openshell-windows-sandbox.exe` inside each ProcessContainer. The standard authenticated Sandbox Protocol and supervisor session provide lifecycle, exec, forwarding, provider refresh, and network policy.
 
+MXC does not support foreground attachment to the main process. Use `--detach`
+when creating a command workload; foreground requests fail during preflight.
+
 The dedicated `openshell-windows-sandbox.exe` uses a Windows boundary library for process operations and forwarding. It replaces the generic sandbox binary in the Windows runtime pair; the supervisor remains a separate host process, not part of the compute driver. No separate supervisor-relay executable is required. Set `wxc_exec_path` to an absolute path; configuration preflight rejects an omitted or relative path. Existing MXC configurations that explicitly select `openshell-sandbox.exe` must update `sandbox_binary_path` to the Windows executable.
 
 The Windows sandbox initiates its authenticated control connection to a generation-scoped loopback listener in the host isolation backend. This follows the Windows relay's connection direction without changing host firewall rules. TLS identity verification and supervisor bearer authentication remain required.

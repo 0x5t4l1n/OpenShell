@@ -8804,7 +8804,7 @@ mod tests {
         });
 
         let error = runtime
-            .validate_sandbox_create_with_runtime_inputs(&sandbox, &runtime_inputs)
+            .validate_sandbox_create_with_runtime_inputs(&sandbox, &runtime_inputs, false)
             .await
             .expect_err("an unsupported driver must reject the effective UI policy");
 

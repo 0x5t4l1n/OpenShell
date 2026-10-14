@@ -291,6 +291,15 @@ impl MxcComputeBackend {
     }
 
     pub fn validate_sandbox_create(&self, sandbox: &DriverSandbox) -> Result<(), tonic::Status> {
+        if sandbox
+            .spec
+            .as_ref()
+            .is_some_and(|spec| spec.await_main_process_attachment)
+        {
+            return Err(tonic::Status::failed_precondition(
+                "MXC does not support foreground attachment to the main process. Create the sandbox with --detach.",
+            ));
+        }
         openshell_core::resource_admission::check_sandbox_driver_config(
             self.config.allow_driver_config,
             sandbox,
@@ -1362,6 +1371,24 @@ mod tests {
         assert!(backend.create_sandbox(&sandbox).await.is_err());
         assert!(backend.get_sandbox(&sandbox.id).await.is_none());
         assert!(!backend.config.state_dir.exists());
+    }
+
+    #[tokio::test]
+    async fn foreground_attachment_is_rejected_before_provisioning() {
+        let (backend, mut sandbox, _dir) = preflight_fixture();
+        sandbox.spec.as_mut().unwrap().command =
+            vec!["cmd.exe".into(), "/c".into(), "exit 0".into()];
+        sandbox.spec.as_mut().unwrap().await_main_process_attachment = true;
+        let error = backend.validate_sandbox_create(&sandbox).unwrap_err();
+        assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+        assert!(error.message().contains("--detach"));
+        let error = backend.create_sandbox(&sandbox).await.unwrap_err();
+        assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+        assert!(error.message().contains("foreground attachment"));
+        assert!(backend.get_sandbox(&sandbox.id).await.is_none());
+        assert!(!backend.config.state_dir.exists());
+        sandbox.spec.as_mut().unwrap().await_main_process_attachment = false;
+        assert!(backend.validate_sandbox_create(&sandbox).is_ok());
     }
 
     #[test]
