@@ -3758,7 +3758,9 @@ fn initial_provider_credentials(
         .copied()
         .filter(|expiry| *expiry > 0)
         .min();
-    if result.readiness_reason != ProviderReadinessReason::Unspecified {
+    // Withheld and expired credentials are already absent from the delivered
+    // environment, so the rest installs as it does for a polling startup.
+    if !provider_environment_is_installable(result.readiness_reason) {
         readiness.credentials_failed(identity, result.readiness_reason);
         return ProviderCredentialState::from_environment(
             result.provider_env_revision,
