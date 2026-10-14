@@ -1439,6 +1439,14 @@
       "created_at": "2026-10-12T18:26:06Z",
       "repoId": 1166129534,
       "pullRequestNo": 4438
+    },
+    {
+      "name": "trukhinyuri",
+      "id": 1245379,
+      "comment_id": 6172914083,
+      "created_at": "2026-10-14T16:17:04Z",
+      "repoId": 1166129534,
+      "pullRequestNo": 4531
     }
   ]
 }
