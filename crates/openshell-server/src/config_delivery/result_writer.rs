@@ -346,6 +346,8 @@ fn record_write(kind: &'static str, outcome: &'static str) {
 mod tests {
     use super::*;
 
+    include!("result_writer_regression_tests.rs");
+
     #[test]
     fn queue_keeps_first_seen_order_and_one_entry_per_sandbox() {
         let mut queue = Queue::default();

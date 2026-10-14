@@ -7402,3 +7402,9 @@ network_policies:
         );
     }
 }
+
+#[cfg(test)]
+mod config_push_regression_tests;
+
+#[cfg(test)]
+mod legacy_startup_regression_tests;

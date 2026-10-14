@@ -4571,6 +4571,15 @@ impl ComputeRuntime {
         Ok(())
     }
 
+    /// Deliver the driver's completion event in lifecycle regression tests.
+    #[cfg(test)]
+    pub(crate) async fn apply_watch_event_for_test(
+        &self,
+        event: WatchSandboxesEvent,
+    ) -> Result<(), String> {
+        self.apply_watch_event(event).await
+    }
+
     async fn apply_watch_event(&self, event: WatchSandboxesEvent) -> Result<(), String> {
         let (operation, sandbox_id) = match &event.payload {
             Some(watch_sandboxes_event::Payload::Sandbox(update)) => (

@@ -1598,6 +1598,8 @@ mod tests {
     use std::collections::HashMap;
     use tokio::sync::oneshot;
 
+    include!("session_regression_tests.rs");
+
     fn config_message_revision(message: &SupervisorConfigMessage) -> ConfigSnapshotRevision {
         ComponentSnapshot::from(message).revision()
     }
