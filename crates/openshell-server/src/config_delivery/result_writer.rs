@@ -15,6 +15,13 @@
 //! each one settles the status of its own policy revision, but a result that
 //! repeats the last one recorded for the sandbox is skipped: every sandbox
 //! configuration update reports its policy, even when only settings changed.
+//! A recorded result lasts as long as the push session that reported it, so
+//! deleted sandboxes and sessions that moved to another replica leave no
+//! entry behind.
+//!
+//! A failed write is retried after a delay. Other sandboxes' writes proceed
+//! meanwhile, and results queued for the same sandbox wait behind the retry,
+//! so they are still written in order.
 //!
 //! The session acknowledged these results before they were persisted, so it
 //! would suppress the unchanged snapshot on reconciliation. A write that
@@ -29,6 +36,8 @@ use std::time::Duration;
 
 use metrics::{counter, gauge};
 use openshell_core::proto::SandboxConfigurationAdmission;
+use tokio::sync::Notify;
+use tokio::time::Instant;
 use tracing::{debug, warn};
 
 use super::ConfigComponentKind;
@@ -68,21 +77,91 @@ struct PendingWrites {
     policy_results: Vec<QueuedPolicyResult>,
 }
 
+impl PendingWrites {
+    fn is_empty(&self) -> bool {
+        self.admission.is_none() && self.policy_results.is_empty()
+    }
+}
+
 #[derive(Debug, Default)]
 struct Queue {
     running: bool,
+    /// Sandboxes whose writes are ready, oldest first.
     order: VecDeque<String>,
+    /// Sandboxes waiting to retry a failed write. Every retry waits the same
+    /// delay, so deadlines stay in order.
+    retries: VecDeque<(Instant, String)>,
+    /// The sandbox being written. Results queued for it meanwhile wait until
+    /// the write finishes, behind anything it retries.
+    writing: Option<String>,
+    /// Writes for each sandbox in `order` or `retries`, or queued while it
+    /// is being written.
     pending: HashMap<String, PendingWrites>,
-    /// Last policy result written for each sandbox.
+    /// Last policy result written for each sandbox, kept while the session
+    /// that reported it stays registered.
     recorded: HashMap<String, PolicyResult>,
+}
+
+/// What the writer does next.
+#[derive(Debug)]
+enum Next {
+    Write(String, PendingWrites),
+    WaitUntil(Instant),
+    Idle,
 }
 
 impl Queue {
     fn entry(&mut self, sandbox_id: &str) -> &mut PendingWrites {
-        if !self.pending.contains_key(sandbox_id) {
+        if !self.pending.contains_key(sandbox_id) && self.writing.as_deref() != Some(sandbox_id) {
             self.order.push_back(sandbox_id.to_string());
         }
         self.pending.entry(sandbox_id.to_string()).or_default()
+    }
+
+    /// Take the next sandbox to write. Retries that are due go behind the
+    /// sandboxes already waiting.
+    fn next(&mut self, now: Instant) -> Next {
+        while self
+            .retries
+            .front()
+            .is_some_and(|(retry_at, _)| *retry_at <= now)
+        {
+            if let Some((_, sandbox_id)) = self.retries.pop_front() {
+                self.order.push_back(sandbox_id);
+            }
+        }
+        while let Some(sandbox_id) = self.order.pop_front() {
+            if let Some(pending) = self.pending.remove(&sandbox_id) {
+                self.writing = Some(sandbox_id.clone());
+                return Next::Write(sandbox_id, pending);
+            }
+        }
+        if let Some((retry_at, _)) = self.retries.front() {
+            return Next::WaitUntil(*retry_at);
+        }
+        self.running = false;
+        Next::Idle
+    }
+
+    /// Settle the write of `sandbox_id`. Failed writes retry at `retry_at`,
+    /// ahead of results queued meanwhile, and a newer admission replaces the
+    /// retried one.
+    fn finish(&mut self, sandbox_id: &str, retry: PendingWrites, retry_at: Instant) {
+        self.writing = None;
+        if retry.is_empty() {
+            if self.pending.contains_key(sandbox_id) {
+                self.order.push_back(sandbox_id.to_string());
+            }
+            return;
+        }
+        let entry = self.pending.entry(sandbox_id.to_string()).or_default();
+        if entry.admission.is_none() {
+            entry.admission = retry.admission;
+        }
+        let newer = std::mem::take(&mut entry.policy_results);
+        entry.policy_results = retry.policy_results;
+        entry.policy_results.extend(newer);
+        self.retries.push_back((retry_at, sandbox_id.to_string()));
     }
 
     /// Mark the writer running, returning whether the caller must start it.
@@ -117,11 +196,19 @@ impl Queue {
 #[derive(Debug, Default)]
 pub struct ResultWriter {
     queue: Mutex<Queue>,
+    /// Wakes the writer while it waits for a retry.
+    wake: Notify,
 }
 
 impl ResultWriter {
     fn queue(&self) -> std::sync::MutexGuard<'_, Queue> {
         self.queue.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Forget the policy result recorded for a sandbox whose push session
+    /// unregistered. A later session reports its results afresh.
+    pub(super) fn forget_recorded(&self, sandbox_id: &str) {
+        self.queue().recorded.remove(sandbox_id);
     }
 
     #[cfg(test)]
@@ -165,6 +252,8 @@ pub(super) fn queue_admission(
     };
     if start {
         tokio::spawn(run(Arc::clone(state)));
+    } else {
+        writer.wake.notify_one();
     }
 }
 
@@ -196,32 +285,34 @@ pub(super) fn queue_policy_result(
     };
     if start {
         tokio::spawn(run(Arc::clone(state)));
+    } else {
+        writer.wake.notify_one();
     }
 }
 
 async fn run(state: Arc<ServerState>) {
+    let writer = &state.config_delivery.results;
     loop {
         let next = {
-            let mut queue = state.config_delivery.results.queue();
-            let next = queue.order.pop_front().and_then(|sandbox_id| {
-                queue
-                    .pending
-                    .remove(&sandbox_id)
-                    .map(|pending| (sandbox_id, pending))
-            });
+            let mut queue = writer.queue();
+            let next = queue.next(Instant::now());
             queue.report_pending();
-            if next.is_none() {
-                queue.running = false;
-            }
             next
         };
-        let Some((sandbox_id, pending)) = next else {
-            return;
-        };
-        let retry = write(&state, &sandbox_id, pending).await;
-        if !retry.policy_results.is_empty() || retry.admission.is_some() {
-            tokio::time::sleep(RETRY_DELAY).await;
-            requeue(&state, &sandbox_id, retry);
+        match next {
+            Next::Write(sandbox_id, pending) => {
+                let retry = write(&state, &sandbox_id, pending).await;
+                writer
+                    .queue()
+                    .finish(&sandbox_id, retry, Instant::now() + RETRY_DELAY);
+            }
+            Next::WaitUntil(retry_at) => {
+                tokio::select! {
+                    () = tokio::time::sleep_until(retry_at) => {}
+                    () = writer.wake.notified() => {}
+                }
+            }
+            Next::Idle => return,
         }
     }
 }
@@ -246,12 +337,19 @@ async fn write(
         .await
         {
             Ok(()) => {
-                state
+                // Unregistering a session removes it before it forgets the
+                // recorded result, so checking under the queue lock keeps an
+                // ended session from leaving an entry behind.
+                let mut queue = state.config_delivery.results.queue();
+                if state
                     .config_delivery
-                    .results
-                    .queue()
-                    .recorded
-                    .insert(sandbox_id.to_string(), result.clone());
+                    .is_registered(sandbox_id, &queued.session_id)
+                {
+                    queue
+                        .recorded
+                        .insert(sandbox_id.to_string(), result.clone());
+                }
+                drop(queue);
                 record_write("policy_result", "written");
             }
             Err(error) if error.code() == tonic::Code::NotFound => {
@@ -307,20 +405,6 @@ async fn write(
         }
     }
     retry
-}
-
-/// Requeue failed writes behind anything queued since, keeping a newer
-/// admission over the retried one.
-fn requeue(state: &Arc<ServerState>, sandbox_id: &str, retry: PendingWrites) {
-    let mut queue = state.config_delivery.results.queue();
-    let entry = queue.entry(sandbox_id);
-    if entry.admission.is_none() {
-        entry.admission = retry.admission;
-    }
-    let newer = std::mem::take(&mut entry.policy_results);
-    entry.policy_results = retry.policy_results;
-    entry.policy_results.extend(newer);
-    // The writer task is still running, so it drains the requeued entry.
 }
 
 /// Both kinds of result come from a sandbox configuration update. A replaced
@@ -398,6 +482,55 @@ mod tests {
         });
         assert!(queue.is_duplicate_policy_result("a", &loaded(4)));
         assert!(!queue.is_duplicate_policy_result("a", &loaded(3)));
+    }
+
+    #[test]
+    fn results_queued_during_a_failed_write_wait_behind_its_retry() {
+        let queued = |version| QueuedPolicyResult {
+            session_id: "session-1".into(),
+            result: PolicyResult {
+                version,
+                loaded: true,
+                error: None,
+            },
+            attempts: 0,
+        };
+        let versions = |pending: &PendingWrites| {
+            pending
+                .policy_results
+                .iter()
+                .map(|queued| queued.result.version)
+                .collect::<Vec<_>>()
+        };
+        let now = Instant::now();
+        let mut queue = Queue::default();
+        queue.entry("a").policy_results.push(queued(1));
+        queue.entry("b").policy_results.push(queued(1));
+        let Next::Write(sandbox_id, mut pending) = queue.next(now) else {
+            panic!("a is ready");
+        };
+        assert_eq!(sandbox_id, "a");
+
+        // Version 2 arrives while version 1 is written, and version 1 fails.
+        queue.entry("a").policy_results.push(queued(2));
+        pending.policy_results[0].attempts = 1;
+        queue.finish("a", pending, now + RETRY_DELAY);
+
+        let Next::Write(sandbox_id, _) = queue.next(now) else {
+            panic!("b does not wait for a's retry");
+        };
+        assert_eq!(sandbox_id, "b");
+        queue.finish("b", PendingWrites::default(), now + RETRY_DELAY);
+        assert!(matches!(queue.next(now), Next::WaitUntil(at) if at == now + RETRY_DELAY));
+
+        let Next::Write(sandbox_id, pending) = queue.next(now + RETRY_DELAY) else {
+            panic!("a's retry is due");
+        };
+        assert_eq!(sandbox_id, "a");
+        assert_eq!(versions(&pending), [1, 2]);
+        queue.finish("a", PendingWrites::default(), now + RETRY_DELAY);
+        assert!(matches!(queue.next(now + RETRY_DELAY), Next::Idle));
+        assert!(!queue.running);
     }
 
     #[test]

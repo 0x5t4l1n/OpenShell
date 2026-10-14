@@ -146,11 +146,19 @@ BEGIN SELECT RAISE(ABORT, 'injected failure for one sandbox'); END;
 }
 
 #[tokio::test]
-async fn config_push_regression_sandbox_deletion_evicts_recorded_policy_result() {
+async fn config_push_regression_session_end_evicts_recorded_policy_result() {
     use openshell_core::proto::Sandbox;
 
     let sandbox_id = "sb-deleted-result";
     let state = regression_state_with_policy(sandbox_id).await;
+    let sandbox = state
+        .store
+        .get_message::<Sandbox>(sandbox_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let _session =
+        crate::config_delivery::register_test_apply_session(&state, &sandbox, "session-1");
     regression_queue_policy(&state, sandbox_id);
     assert!(state.config_delivery.results.queue().claim_start());
     run(Arc::clone(&state)).await;
@@ -163,37 +171,8 @@ async fn config_push_regression_sandbox_deletion_evicts_recorded_policy_result()
             .contains_key(sandbox_id)
     );
 
-    state
-        .compute
-        .delete_sandbox("default", sandbox_id)
-        .await
-        .expect("delete sandbox");
-    state
-        .compute
-        .apply_watch_event_for_test(openshell_core::proto::compute::v1::WatchSandboxesEvent {
-            payload: Some(
-                openshell_core::proto::compute::v1::watch_sandboxes_event::Payload::Deleted(
-                    openshell_core::proto::compute::v1::WatchSandboxesDeletedEvent {
-                        sandbox_id: sandbox_id.into(),
-                    },
-                ),
-            ),
-        })
-        .await
-        .expect("driver reports deletion complete");
-    tokio::time::timeout(Duration::from_secs(5), async {
-        while state
-            .store
-            .get_message::<Sandbox>(sandbox_id)
-            .await
-            .unwrap()
-            .is_some()
-        {
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
-    })
-    .await
-    .expect("sandbox deletion finishes");
+    // Deleting a sandbox ends its session on the replica that holds it.
+    crate::config_delivery::unregister_session(&state, sandbox_id, "session-1");
     assert!(
         !state
             .config_delivery
@@ -201,6 +180,25 @@ async fn config_push_regression_sandbox_deletion_evicts_recorded_policy_result()
             .queue()
             .recorded
             .contains_key(sandbox_id),
-        "successful sandbox deletion must remove its historical result from the deduplication cache"
+        "an ended session must remove its result from the deduplication cache"
+    );
+}
+
+#[tokio::test]
+async fn config_push_regression_result_of_an_ended_session_is_not_recorded() {
+    let sandbox_id = "sb-ended-session-result";
+    let state = regression_state_with_policy(sandbox_id).await;
+    // The result was queued by session-1, which unregistered before the
+    // write finished.
+    regression_queue_policy(&state, sandbox_id);
+    assert!(state.config_delivery.results.queue().claim_start());
+    run(Arc::clone(&state)).await;
+    assert!(
+        !state
+            .config_delivery
+            .results
+            .queue()
+            .recorded
+            .contains_key(sandbox_id)
     );
 }

@@ -256,6 +256,14 @@ impl ConfigDelivery {
         self.sessions().records.contains_key(sandbox_id)
     }
 
+    /// Whether `session_id` is the sandbox's registered push session.
+    fn is_registered(&self, sandbox_id: &str, session_id: &str) -> bool {
+        self.sessions()
+            .records
+            .get(sandbox_id)
+            .is_some_and(|record| record.session_id == session_id)
+    }
+
     /// Delivery is best effort beside the session lifecycle, so a poisoned
     /// lock must not turn session teardown into a panic.
     fn sessions(&self) -> MutexGuard<'_, Sessions> {
@@ -398,15 +406,22 @@ pub fn register_session(state: &Arc<ServerState>, registration: Registration) {
 }
 
 pub fn unregister_session(state: &ServerState, sandbox_id: &str, session_id: &str) {
-    let mut sessions = state.config_delivery.sessions();
-    if sessions
-        .records
-        .get(sandbox_id)
-        .is_some_and(|record| record.session_id == session_id)
-        && let Some(record) = sessions.records.remove(sandbox_id)
     {
-        record.close();
+        let mut sessions = state.config_delivery.sessions();
+        if sessions
+            .records
+            .get(sandbox_id)
+            .is_none_or(|record| record.session_id != session_id)
+        {
+            return;
+        }
+        if let Some(record) = sessions.records.remove(sandbox_id) {
+            record.close();
+        }
     }
+    // After releasing the sessions lock: the result writer takes it while
+    // holding its own queue lock.
+    state.config_delivery.results.forget_recorded(sandbox_id);
 }
 
 /// Builds and delivers a session's components.
