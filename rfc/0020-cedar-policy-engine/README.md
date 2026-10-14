@@ -257,7 +257,8 @@ baseline runtime paths when the policy can permit a network connection, and a
 live update can add paths but not remove them. File policies must be plain
 subtree permits: a file `forbid`, a condition other than `||`-joined
 `resource in` tests, or a principal constraint is rejected, because Landlock
-cannot express it.
+cannot express it, and a permit that lists only `WriteFile` is rejected, since
+a Landlock write grant includes read; list both actions.
 
 #### Step 2: the connection
 
@@ -307,7 +308,8 @@ the YAML glob means while Cedar still sees literal set membership.
 Naming the endpoint in the scope also makes `api.github.com` resolvable
 through policy DNS, as listing it in YAML does. A host that only appears in a
 `when` condition is eligible when the condition requires both `resource.host`
-(exact or delimited glob) and `resource.port`; any other form fails closed.
+(exact or delimited glob) and `resource.port`, or names the endpoint with
+`resource.host_port == "host:port"`; any other form fails closed.
 
 #### Step 3: per-request rules
 
@@ -602,7 +604,9 @@ host resolves, with the address condition assumed to hold, and again for each
 resolved address, all of which must pass. Write the
 address condition as top-level `when` conjuncts (`context has destination_ip`
 and an `||` of `isInRange` tests) so OpenShell can read the ranges exactly;
-other forms are rejected. Loopback, link-local, and unspecified addresses
+other forms are rejected. A `forbid` may read the address in any form: it is
+evaluated before resolution with the address absent, so its other conditions
+still apply, and again for each resolved address. Loopback, link-local, and unspecified addresses
 stay blocked regardless of policy, and a host matched by a glob may not
 resolve to a private address unless a permit names it exactly or restricts
 its addresses, as in YAML.
@@ -811,7 +815,10 @@ settings do not grant or deny anything; they configure how allowed traffic is
 handled. Keeping them out of the `.cedar` file keeps the Cedar text pure
 access control, which is what the analysis tools reason about, and lets the
 same `network_middlewares` format serve both policy languages. The cost is a
-second file for sandboxes that need them.
+second file for sandboxes that need them. `endpoint_settings` reuses the YAML
+`NetworkEndpoint` message, and its validation classifies every field of that
+message explicitly, so a field added to `NetworkEndpoint` later fails the build
+until it is classified rather than being accepted as a setting.
 
 **Providers supply credentials, never access.** On YAML sandboxes the gateway
 composes attached providers' rules into `network_policies`, so attaching a
@@ -965,9 +972,12 @@ cross-compile; and the first CI run.
 
 ## Open questions
 
-- Should `NetworkConnect` drop its always-empty `method`, `path`, and
-  `command` context fields? They exist for symmetry with `HttpRequest`, and a
-  permit that conditions on them silently never matches.
+- A gateway-wide YAML policy (`openshell policy set --global`) cannot be
+  applied to a running Cedar sandbox, because a sandbox never switches format.
+  Under `fail_closed` the Cedar sandbox is quarantined; under
+  `retain_last_valid` it keeps its own policy. Should the supervisor quarantine
+  regardless of the failure mode, since the operator asked for the global
+  policy to win, and should the gateway warn when Cedar sandboxes exist?
 - Should `@protocol` become an attribute of `NetworkEndpoint` instead of an
   annotation?
 - Can Cedar add a narrow "any member matches" form over sets? It would cover
