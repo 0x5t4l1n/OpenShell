@@ -1116,7 +1116,7 @@ async fn send_admission(
     admission: &SandboxConfigurationAdmission,
 ) -> AdmissionAck {
     if session
-        .tx
+        .control
         .send(GatewayMessage {
             payload: Some(gateway_message::Payload::ConfigurationAdmission(
                 admission.clone(),
@@ -1654,6 +1654,7 @@ mod tests {
             sandbox_id: sandbox_id.into(),
             session_id: "session-1".into(),
             instance_id: "instance-1".into(),
+            control: tx.clone(),
             tx,
             supports_session_redirect: false,
             expected_bootstrap: None,

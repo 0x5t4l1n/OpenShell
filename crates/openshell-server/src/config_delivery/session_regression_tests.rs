@@ -99,7 +99,7 @@ async fn config_push_regression_admission_precedes_the_next_configuration() {
 
     let sandbox_id = "sb-admission-order";
     let state = state_with_sandbox(sandbox_id).await;
-    let (session_tx, mut session_rx) = mpsc::channel(4);
+    let (session_tx, _session_rx) = mpsc::channel(4);
     let (control_tx, control_rx) = mpsc::channel(4);
     let slots = Arc::new(ConfigSlots::default());
     state.supervisor_sessions.register_with_mode(
@@ -146,7 +146,12 @@ async fn config_push_regression_admission_precedes_the_next_configuration() {
         config_revision: 1,
         ..Default::default()
     };
-    let session = accepted_session(&state, sandbox_id, session_tx);
+    // As on a real session, `tx` reaches the stream through a forwarder and
+    // `control` is the stream's own control channel.
+    let session = AcceptedSession {
+        control: control_tx,
+        ..accepted_session(&state, sandbox_id, session_tx)
+    };
     assert!(matches!(
         tokio::time::timeout(Duration::from_secs(2), send_admission(&session, &admission))
             .await
@@ -157,20 +162,9 @@ async fn config_push_regression_admission_precedes_the_next_configuration() {
         .supervisor_sessions
         .finalize_config_update(sandbox_id, "session-1", &completed, true);
 
-    // Hold the same intermediate forwarder used by a real session. A newer
-    // configuration must not escape while the older admission is in transit.
-    let first_poll = {
-        let next = outbound.next();
-        tokio::pin!(next);
-        futures::poll!(next)
-    };
-    let forwarded = session_rx.try_recv().expect("queued admission");
-    control_tx.send(forwarded).await.unwrap();
-    let first_message = match first_poll {
-        std::task::Poll::Ready(Some(Ok(message))) => message,
-        std::task::Poll::Pending => outbound.next().await.unwrap().unwrap(),
-        other @ std::task::Poll::Ready(_) => panic!("unexpected outbound result: {other:?}"),
-    };
+    // Finalizing released the newer configuration. It must not overtake
+    // the older admission on the public stream.
+    let first_message = outbound.next().await.unwrap().unwrap();
     assert_eq!(
         first_message.payload,
         Some(gateway_message::Payload::ConfigurationAdmission(admission)),

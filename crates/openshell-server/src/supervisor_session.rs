@@ -2445,6 +2445,7 @@ async fn accept_supervisor_session(setup: SessionSetup) -> Result<(), Status> {
         session_id: session_id.clone(),
         instance_id,
         tx: session_tx,
+        control: outbound_tx,
         supports_session_redirect,
         expected_bootstrap,
     };
@@ -2921,6 +2922,10 @@ pub(crate) struct AcceptedSession {
     pub(crate) session_id: String,
     pub(crate) instance_id: String,
     pub(crate) tx: mpsc::Sender<GatewayMessage>,
+    /// The outbound stream's control channel, which `tx` reaches through a
+    /// forwarding task. Configuration admissions skip that hop, so one
+    /// reaches the supervisor before any configuration released after it.
+    pub(crate) control: mpsc::Sender<GatewayMessage>,
     pub(crate) supports_session_redirect: bool,
     /// The bootstrap a streamed-apply supervisor must report. `None` for a
     /// supervisor that keeps polling.
@@ -3343,6 +3348,7 @@ mod tests {
             sandbox_id: "sb-no-peer".into(),
             session_id: "session-no-peer".into(),
             instance_id: String::new(),
+            control: tx.clone(),
             tx,
             supports_session_redirect: true,
             expected_bootstrap: None,
