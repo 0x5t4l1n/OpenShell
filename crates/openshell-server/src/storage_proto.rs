@@ -148,8 +148,9 @@ mod tests {
     // Operator credential export adds four public messages and no durable types.
     // ListProvidersRequest field 4 adds a public-only label selector. Older
     // requests decode an empty selector; durable schemas remain unchanged.
+    // The public inventory includes the label selector alongside MXC UI fields.
     const PUBLIC_RPC_SCHEMA_SHA256: &str =
-        "b6734ba353b4ffe81240309f7971ef48f6473e14ce2196412beabe1984b0548d";
+        "7871afc3d1ff603fdd15ed4211d539e435d27c3da443b8bee5a608aacc70738f";
     const DURABLE_SCHEMA_SHA256: &str =
         "74dcecdc7375511bd7638d044e13f5ae85eb8d4a5c221fbfeb14f6ce622d5f6e";
     const PUBLIC_DURABLE_OVERLAP_SHA256: &str =
