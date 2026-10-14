@@ -245,7 +245,8 @@ empty in poll mode, where `GetSandboxConfig` and
 | `openshell_supervisor_config_build_duration_seconds` | Histogram | `component`, `outcome` | Time to build one component, including store reads and credential resolution. |
 | `openshell_supervisor_config_queue_wait_seconds` | Summary | `lane` | Time from a session needing a rebuild to its build starting. |
 | `openshell_supervisor_config_dirty_sessions` | Gauge | None | Sessions with a rebuild pending. |
-| `openshell_supervisor_config_waiting_sessions` | Gauge | None | Sessions waiting for a build slot. |
+| `openshell_supervisor_config_waiting_sessions` | Gauge | `lane` | Sessions waiting for a build slot, under the lane they wait in. Waiting `fanout` sessions mean every unreserved slot is in use; waiting `sandbox` sessions mean every slot is. |
+| `openshell_supervisor_config_building_sessions` | Gauge | `lane` | Sessions holding a build slot while they build and deliver their configuration. |
 | `openshell_supervisor_config_deliveries_total` | Counter | `component`, `outcome` | What happened to each built snapshot. |
 | `openshell_supervisor_config_apply_results_total` | Counter | `component`, `outcome` | Apply results that supervisors reported. |
 | `openshell_supervisor_config_apply_duration_seconds` | Histogram | `component`, `outcome` | Time from queuing an update on the supervisor session to receiving its apply result. |

@@ -144,7 +144,7 @@ impl SessionRecord {
         }
         if marks.dirty.is_empty() {
             marks.dirty_since = Some(Instant::now());
-            marks.dirty_gauge = Some(GaugeGuard::acquire(DIRTY_SESSIONS));
+            marks.dirty_gauge = Some(GaugeGuard::acquire(gauge!(DIRTY_SESSIONS)));
         }
         marks.dirty = marks.dirty.union(components);
         let raised = marks.lane < Some(lane);
@@ -239,9 +239,18 @@ impl Permits {
     /// session closed. A sandbox edit that raises the lane while a fanout
     /// waits moves the session to the sandbox lane.
     pub(super) async fn acquire(&self, record: &SessionRecord) -> Option<OwnedSemaphorePermit> {
-        let _waiting = GaugeGuard::acquire(WAITING_SESSIONS);
+        let mut waiting: Option<(Lane, GaugeGuard)> = None;
         loop {
-            let acquired = match record.status() {
+            let status = record.status();
+            // The session counts under the lane it waits in, so a raised
+            // lane moves it to the sandbox count.
+            if let Status::Dirty(lane) = status
+                && waiting.as_ref().is_none_or(|(counted, _)| *counted != lane)
+            {
+                let gauge = gauge!(WAITING_SESSIONS, "lane" => lane.name());
+                waiting = Some((lane, GaugeGuard::acquire(gauge)));
+            }
+            let acquired = match status {
                 Status::Closed => return None,
                 Status::Dirty(Lane::Sandbox) => tokio::select! {
                     permit = Arc::clone(&self.shared).acquire_owned() => permit,
@@ -309,7 +318,9 @@ pub(super) async fn run(
         let Some(work) = record.take() else {
             continue;
         };
+        let building = GaugeGuard::acquire(gauge!(BUILDING_SESSIONS, "lane" => work.lane.name()));
         let (failed, providers) = deliver.deliver(&record, work).await;
+        drop(building);
         drop(permit);
         record.finish(providers);
         if failed.is_empty() {
@@ -349,14 +360,14 @@ fn jitter(interval: Duration) -> Duration {
 
 const DIRTY_SESSIONS: &str = "openshell_supervisor_config_dirty_sessions";
 const WAITING_SESSIONS: &str = "openshell_supervisor_config_waiting_sessions";
+const BUILDING_SESSIONS: &str = "openshell_supervisor_config_building_sessions";
 
 /// One unit of a gauge, released through the same handle when dropped.
 #[derive(Debug)]
 struct GaugeGuard(Gauge);
 
 impl GaugeGuard {
-    fn acquire(name: &'static str) -> Self {
-        let gauge = gauge!(name);
+    fn acquire(gauge: Gauge) -> Self {
         gauge.increment(1.0);
         Self(gauge)
     }
@@ -372,6 +383,7 @@ impl Drop for GaugeGuard {
 mod tests {
     use super::*;
     use crate::config_delivery::ConfigComponentKind;
+    use crate::gateway_metrics::MetricsCapture;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     /// Long enough that the reconcile timer never fires in a test that does
@@ -522,6 +534,35 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn waiting_sessions_count_under_the_lane_they_wait_in() {
+        const FANOUT: &str = r#"openshell_supervisor_config_waiting_sessions{lane="fanout"}"#;
+        const SANDBOX: &str = r#"openshell_supervisor_config_waiting_sessions{lane="sandbox"}"#;
+        let metrics = MetricsCapture::install();
+        let permits = Arc::new(Permits::new(2));
+        let _held = Arc::clone(&permits.shared).acquire_owned().await.unwrap();
+        let reserved = Arc::clone(&permits.reserve).acquire_owned().await.unwrap();
+        let session = record("sb", "ws", &[]);
+        session.mark(ConfigComponents::SANDBOX_CONFIG, Lane::Fanout);
+        let waiter = tokio::spawn({
+            let permits = Arc::clone(&permits);
+            let session = Arc::clone(&session);
+            async move { permits.acquire(&session).await.is_some() }
+        });
+        settle().await;
+        assert_eq!(metrics.value(FANOUT), Some(1));
+        assert_eq!(metrics.value(SANDBOX), None);
+
+        session.mark(ConfigComponents::SANDBOX_CONFIG, Lane::Sandbox);
+        settle().await;
+        assert_eq!(metrics.value(FANOUT), Some(0));
+        assert_eq!(metrics.value(SANDBOX), Some(1));
+
+        drop(reserved);
+        assert!(waiter.await.unwrap());
+        assert_eq!(metrics.value(SANDBOX), Some(0));
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn publications_during_a_build_coalesce_into_one_rebuild() {
         let permits = Permits::new(4);
         let gate = Arc::new(Semaphore::new(0));
@@ -561,6 +602,35 @@ mod tests {
                 },
             ]
         );
+
+        session.close();
+        task.await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn building_sessions_count_builds_in_progress_by_lane() {
+        const SANDBOX: &str = r#"openshell_supervisor_config_building_sessions{lane="sandbox"}"#;
+        let metrics = MetricsCapture::install();
+        let permits = Permits::new(4);
+        let gate = Arc::new(Semaphore::new(0));
+        let recorder = Arc::new(Recorder {
+            gate: Some(Arc::clone(&gate)),
+            ..Recorder::default()
+        });
+        let session = record("sb", "ws", &[]);
+        session.mark(ConfigComponents::SANDBOX_CONFIG, Lane::Sandbox);
+        let task = tokio::spawn({
+            let session = Arc::clone(&session);
+            let recorder = Arc::clone(&recorder);
+            async move { run(session, &permits, recorder.as_ref(), NO_RECONCILE).await }
+        });
+        settle().await;
+        assert_eq!(metrics.value(SANDBOX), Some(1));
+
+        gate.add_permits(1);
+        settle().await;
+        assert_eq!(recorder.delivered().len(), 1);
+        assert_eq!(metrics.value(SANDBOX), Some(0));
 
         session.close();
         task.await.unwrap();
