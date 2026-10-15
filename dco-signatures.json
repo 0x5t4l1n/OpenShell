@@ -1463,6 +1463,14 @@
       "created_at": "2026-10-14T23:24:33Z",
       "repoId": 1166129534,
       "pullRequestNo": 4575
+    },
+    {
+      "name": "kon-angelo",
+      "id": 68001306,
+      "comment_id": 6189112991,
+      "created_at": "2026-10-15T09:40:19Z",
+      "repoId": 1166129534,
+      "pullRequestNo": 4473
     }
   ]
 }
