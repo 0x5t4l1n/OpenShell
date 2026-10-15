@@ -4087,6 +4087,28 @@ pub(super) async fn handle_update_config(
     result
 }
 
+/// Persist a policy prepared by the authenticated supervisor during its
+/// startup handshake. Reuse the normal sandbox policy mutation path so the
+/// proposal receives the same authorization, diff, safety, and composition
+/// checks as a unary `UpdateConfig` request.
+pub async fn persist_supervisor_startup_policy(
+    state: &Arc<ServerState>,
+    principal: Principal,
+    sandbox: &Sandbox,
+    policy: ProtoSandboxPolicy,
+) -> Result<(), Status> {
+    let mut request = Request::new(UpdateConfigRequest {
+        sandbox: sandbox.object_name().to_string(),
+        policy: Some(policy),
+        workspace_scope: Some(openshell_core::proto::workspace_selector(
+            sandbox.object_workspace(),
+        )),
+        ..UpdateConfigRequest::default()
+    });
+    request.extensions_mut().insert(principal);
+    handle_update_config(state, request).await.map(|_| ())
+}
+
 async fn handle_update_config_inner(
     state: &Arc<ServerState>,
     request: Request<UpdateConfigRequest>,
@@ -8375,6 +8397,73 @@ mod tests {
                 trust_domain: Some("openshell".to_string()),
             }));
         request
+    }
+
+    #[tokio::test]
+    async fn streamed_admission_ends_preparation_before_runtime_readiness() {
+        use crate::compute::provisioning_deadline::new_preparation_record;
+        use openshell_core::proto::{
+            ConfigurationAdmissionState, SandboxConfigurationAdmission, SandboxPhase,
+        };
+        let state = test_server_state().await;
+        let sandbox_id = "sb-streamed-admission";
+        let mut sandbox = test_sandbox(
+            sandbox_id,
+            "streamed-admission",
+            openshell_policy::restrictive_default_policy(),
+            Vec::new(),
+        );
+        sandbox.set_phase(SandboxPhase::Provisioning.into());
+        sandbox.status.as_mut().unwrap().provisioning =
+            Some(new_preparation_record(current_time_ms(), 1800));
+        state.store.put_message(&sandbox).await.unwrap();
+        let instance_id = uuid::Uuid::new_v4().to_string();
+
+        // Push mode reports admission over the supervisor session instead of
+        // ReportSandboxConfiguration, then reports runtime readiness.
+        state
+            .compute
+            .supervisor_session_admission(
+                sandbox_id,
+                &instance_id,
+                &SandboxConfigurationAdmission {
+                    instance_id: instance_id.clone(),
+                    state: ConfigurationAdmissionState::Accepted.into(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        state
+            .compute
+            .supervisor_runtime_ready(sandbox_id, &instance_id)
+            .await
+            .unwrap();
+
+        let saved = state
+            .store
+            .get_message::<Sandbox>(sandbox_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let status = saved.status.as_ref().unwrap();
+        assert!(
+            status
+                .provisioning
+                .as_ref()
+                .unwrap()
+                .admission_start_time
+                .is_some()
+        );
+        assert_eq!(saved.phase(), i32::from(SandboxPhase::Ready));
+        assert!(
+            status
+                .conditions
+                .iter()
+                .any(|condition| condition.r#type == "Ready" && condition.status == "True"),
+            "{:?}",
+            status.conditions
+        );
     }
 
     #[tokio::test]

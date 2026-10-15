@@ -218,9 +218,9 @@ type OpenShellClient interface {
 	DeleteProvider(ctx context.Context, in *DeleteProviderRequest, opts ...grpc.CallOption) (*DeleteProviderResponse, error)
 	// Delete a custom provider type profile by id.
 	DeleteProviderProfile(ctx context.Context, in *DeleteProviderProfileRequest, opts ...grpc.CallOption) (*DeleteProviderProfileResponse, error)
-	// Get sandbox settings by id (called by users, and by supervisors at startup
-	// and in their poll loop). A supervisor whose session pushes configuration
-	// receives later updates over ConnectSupervisor and stops polling.
+	// Get sandbox settings by id (called by users, and by polling supervisors at
+	// startup and in their poll loop). Push supervisors receive the same
+	// configuration over ConnectSupervisor and do not call it.
 	GetSandboxConfig(ctx context.Context, in *sandboxv1.GetSandboxConfigRequest, opts ...grpc.CallOption) (*sandboxv1.GetSandboxConfigResponse, error)
 	// Get gateway-global settings (read-only runtime configuration; any
 	// authenticated user may read these without requiring Platform Admin).
@@ -1344,9 +1344,9 @@ type OpenShellServer interface {
 	DeleteProvider(context.Context, *DeleteProviderRequest) (*DeleteProviderResponse, error)
 	// Delete a custom provider type profile by id.
 	DeleteProviderProfile(context.Context, *DeleteProviderProfileRequest) (*DeleteProviderProfileResponse, error)
-	// Get sandbox settings by id (called by users, and by supervisors at startup
-	// and in their poll loop). A supervisor whose session pushes configuration
-	// receives later updates over ConnectSupervisor and stops polling.
+	// Get sandbox settings by id (called by users, and by polling supervisors at
+	// startup and in their poll loop). Push supervisors receive the same
+	// configuration over ConnectSupervisor and do not call it.
 	GetSandboxConfig(context.Context, *sandboxv1.GetSandboxConfigRequest) (*sandboxv1.GetSandboxConfigResponse, error)
 	// Get gateway-global settings (read-only runtime configuration; any
 	// authenticated user may read these without requiring Platform Admin).

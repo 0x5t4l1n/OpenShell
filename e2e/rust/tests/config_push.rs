@@ -4,9 +4,9 @@
 //! E2E tests for configuration delivered over the supervisor session.
 //!
 //! Runs only in the `e2e:rust:push` lane, where the gateway starts with
-//! `config_delivery_mode = "push"`. A supervisor logs when its session pushes
-//! configuration, so these tests fail if the lane silently falls back to
-//! polling.
+//! `config_delivery_mode = "push"`. Only a supervisor that receives its
+//! bootstrap over the session logs loading it, so these tests fail if the lane
+//! silently falls back to polling.
 
 #![cfg(feature = "e2e-config-push")]
 
@@ -89,8 +89,7 @@ async fn policy_version(sandbox: &str) -> u32 {
         .unwrap_or_else(|| panic!("no policy version in:\n{}", result.output))
 }
 
-/// Wait until the sandbox's supervisor reports that its session pushes
-/// configuration.
+/// Wait until the sandbox's supervisor reports loading a pushed bootstrap.
 async fn assert_push_session(sandbox: &str) {
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
     loop {
@@ -98,7 +97,7 @@ async fn assert_push_session(sandbox: &str) {
         if logs.success
             && logs
                 .output
-                .contains("gateway pushes configuration over the session")
+                .contains("Loading sandbox policy from supervisor bootstrap")
         {
             return;
         }

@@ -1,0 +1,115 @@
+// SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
+#[tokio::test]
+async fn config_push_regression_global_policy_repair_wakes_pending_startup() {
+    use openshell_core::proto::UpdateConfigRequest;
+    use openshell_core::proto::open_shell_server::OpenShell as _;
+
+    let sandbox_id = "sb-global-startup-repair";
+    let state = state_with_startup_policy(sandbox_id, None).await;
+    let connecting_state = Arc::clone(&state);
+    let mut connection = tokio::spawn(async move {
+        build_session_bootstrap(
+            &connecting_state,
+            sandbox_id,
+            &ImagePolicyAdmission::Invalid,
+        )
+        .await
+    });
+
+    // Wait for the actual rejection, not an arbitrary delay that could let
+    // the global write overtake the bootstrap's first database reads.
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !STARTUP_REPAIR_WAITS.lock().unwrap().contains(sandbox_id) {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("startup waits on the invalid image policy");
+
+    let repaired_policy = openshell_policy::restrictive_default_policy();
+    crate::grpc::OpenShellService::new(Arc::clone(&state))
+        .update_config(crate::grpc::test_support::authed_request(
+            UpdateConfigRequest {
+                global: true,
+                policy: Some(repaired_policy.clone()),
+                ..Default::default()
+            },
+        ))
+        .await
+        .expect("operator saves a valid global policy");
+
+    let repaired = tokio::time::timeout(Duration::from_secs(2), &mut connection).await;
+    if repaired.is_err() {
+        connection.abort();
+        let _ = connection.await;
+    }
+    let bootstrap = repaired
+        .expect("a global policy repair must wake startup without an unrelated sandbox update")
+        .expect("startup task")
+        .expect("valid repaired bootstrap");
+    assert_eq!(bootstrap.sandbox_config.policy, Some(repaired_policy));
+}
+
+#[tokio::test]
+async fn config_push_regression_admission_precedes_the_next_configuration() {
+    use openshell_core::proto::ConfigurationAdmissionState;
+
+    let sandbox_id = "sb-admission-order";
+    let state = state_with_sandbox(sandbox_id).await;
+    let (session_tx, mut outbound) =
+        register_apply_session_with_outbound(&state.supervisor_sessions, sandbox_id, "session-1");
+    assert_eq!(
+        state
+            .supervisor_sessions
+            .deliver_config(sandbox_id, "session-1", config(1)),
+        DeliveryDisposition::Queued
+    );
+    let first_update = sent_update(outbound.recv().await.unwrap());
+    assert_eq!(
+        state
+            .supervisor_sessions
+            .deliver_config(sandbox_id, "session-1", config(2)),
+        DeliveryDisposition::Coalesced
+    );
+    let completed = state
+        .supervisor_sessions
+        .complete_config_update(
+            sandbox_id,
+            "session-1",
+            &update_result(&first_update, ConfigApplyOutcome::Applied),
+        )
+        .unwrap();
+    let admission = SandboxConfigurationAdmission {
+        state: ConfigurationAdmissionState::Accepted.into(),
+        config_revision: 1,
+        ..Default::default()
+    };
+    let session = accepted_session(&state, sandbox_id, session_tx);
+    assert!(matches!(
+        tokio::time::timeout(Duration::from_secs(2), send_admission(&session, &admission))
+            .await
+            .expect("admission is queued"),
+        AdmissionAck::Acknowledged
+    ));
+    state
+        .supervisor_sessions
+        .finalize_config_update(sandbox_id, "session-1", &completed, true);
+
+    // Finalizing released the newer configuration. It must not overtake
+    // the older admission on the session's stream.
+    let first_message = outbound.recv().await.unwrap();
+    assert_eq!(
+        first_message.payload,
+        Some(gateway_message::Payload::ConfigurationAdmission(admission)),
+        "startup approval must precede a subsequent configuration update on the session stream"
+    );
+    let second_update = sent_update(
+        tokio::time::timeout(Duration::from_secs(2), outbound.recv())
+            .await
+            .expect("the next configuration follows admission")
+            .unwrap(),
+    );
+    assert_eq!(config_revision(&second_update), 2);
+}

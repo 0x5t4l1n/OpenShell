@@ -25,7 +25,9 @@ mod endpoint_status;
 mod mechanistic_mapper;
 mod provider_readiness;
 
-use config_runtime::{agent_proposals_enabled_from_settings, run_policy_poll_loop};
+use config_runtime::{
+    agent_proposals_enabled_from_settings, run_policy_poll_loop, startup_bootstrap_result,
+};
 use miette::{IntoDiagnostic, Result, WrapErr};
 use std::future::Future;
 use std::io::Write as _;
@@ -817,6 +819,70 @@ async fn run_sandbox_with_backend(
         ImagePolicyDiscovery::Missing
     };
 
+    let supervisor_instance_id = uuid::Uuid::new_v4().to_string();
+    let stream_image_discovery = openshell_core::proto::ImagePolicyDiscovery {
+        result: Some(match &image_discovery {
+            ImagePolicyDiscovery::Missing => {
+                openshell_core::proto::image_policy_discovery::Result::Missing(())
+            }
+            ImagePolicyDiscovery::Invalid => {
+                openshell_core::proto::image_policy_discovery::Result::Invalid(())
+            }
+            ImagePolicyDiscovery::Policy(policy) => {
+                openshell_core::proto::image_policy_discovery::Result::Policy(*policy.clone())
+            }
+        }),
+    };
+    let mut prepared_supervisor_session =
+        if let (Some(endpoint), Some(id)) = (&openshell_endpoint, &sandbox_id) {
+            Some(
+                openshell_supervisor_process::supervisor_session::prepare(
+                    endpoint.clone(),
+                    id.clone(),
+                    supervisor_instance_id.clone(),
+                    stream_image_discovery,
+                    |mut policy| {
+                        let enriched = enrich_proto_baseline_paths(&mut policy);
+                        Ok(proto_sync_payload_for_enriched_policy(&policy, enriched))
+                    },
+                )
+                .await
+                .map_err(|error| {
+                    miette::miette!("failed to establish supervisor bootstrap session: {error}")
+                })?,
+            )
+        } else {
+            None
+        };
+    let stream_bootstrap = prepared_supervisor_session.as_mut().and_then(
+        openshell_supervisor_process::supervisor_session::PreparedSupervisorSession::take_bootstrap,
+    );
+    let uses_stream_configuration = prepared_supervisor_session.as_ref().is_some_and(
+        openshell_supervisor_process::supervisor_session::PreparedSupervisorSession::uses_stream_configuration,
+    );
+    // A polling gateway has already accepted this session, but a legacy
+    // gateway marks the sandbox ready as soon as it accepts one, and
+    // SessionAccepted does not say which kind this is. Close the session and
+    // reconnect once the workload runs, as polling supervisors always have.
+    if !uses_stream_configuration {
+        prepared_supervisor_session = None;
+    }
+
+    let initial_stream_snapshot: Option<openshell_core::grpc_client::SettingsPollResult> =
+        match stream_bootstrap.as_ref() {
+            Some(bootstrap) => Some(
+                bootstrap
+                    .sandbox_config
+                    .clone()
+                    .ok_or_else(|| {
+                        miette::miette!(
+                            "supervisor bootstrap omitted required sandbox configuration"
+                        )
+                    })?
+                    .into(),
+            ),
+            None => None,
+        };
     let vm_policy_identity = selected_backend.vm_policy_identity();
 
     // Load policy and initialize OPA engine
@@ -841,6 +907,7 @@ async fn run_sandbox_with_backend(
         LocalPolicyIdentity::Required,
         vm_policy_identity,
         Some(image_discovery),
+        initial_stream_snapshot.clone(),
         &RemoteStartupGateway {
             endpoint: openshell_endpoint.clone().unwrap_or_default(),
         },
@@ -857,8 +924,24 @@ async fn run_sandbox_with_backend(
     let workspace = workdir;
 
     let provider_readiness = ProviderReadinessTracker::new();
-    let provider_credentials = if let Some(environment) = captured_provider_environment {
-        environment.install(&provider_readiness)
+    let (provider_credentials, provider_bootstrap_degraded) = if let Some(snapshot) =
+        stream_bootstrap
+            .as_ref()
+            .and_then(|bootstrap| bootstrap.provider_environment.clone())
+    {
+        // Polling startup fails the same way on an invalid provider response.
+        let result = openshell_core::grpc_client::ProviderEnvironmentResult::try_from(snapshot)
+            .wrap_err("supervisor bootstrap delivered an invalid provider environment")?;
+        let degraded = result.readiness_reason != ProviderReadinessReason::Unspecified;
+        let credentials = initial_provider_credentials(result, &provider_readiness);
+        (credentials, degraded)
+    } else if stream_bootstrap.is_some() {
+        (
+            ProviderCredentialState::from_child_env_snapshot(0, std::collections::HashMap::new()),
+            true,
+        )
+    } else if let Some(environment) = captured_provider_environment {
+        (environment.install(&provider_readiness), false)
     } else {
         // Fetch provider environment variables from the server.
         // This is done after loading the policy so the sandbox can still start
@@ -900,7 +983,7 @@ async fn run_sandbox_with_backend(
             None
         };
 
-        environment.map_or_else(
+        let credentials = environment.map_or_else(
             || {
                 ProviderCredentialState::from_environment(
                     0,
@@ -910,8 +993,23 @@ async fn run_sandbox_with_backend(
                 )
             },
             |result| initial_provider_credentials(result, &provider_readiness),
-        )
+        );
+        (credentials, false)
     };
+
+    // The bootstrap already initialized the runtime. Report what startup
+    // installed before the workload starts.
+    let mut prepared_bootstrap_result = stream_bootstrap
+        .as_ref()
+        .zip(initial_stream_snapshot.as_ref())
+        .map(|(bootstrap, snapshot)| {
+            startup_bootstrap_result(
+                bootstrap.update_id.clone(),
+                snapshot,
+                provider_bootstrap_degraded
+                    || middleware_registry_status != MiddlewareRegistryStatus::Synchronized,
+            )
+        });
 
     if credential_gating_unavailable(
         &loaded_policy_origin,
@@ -1025,11 +1123,9 @@ async fn run_sandbox_with_backend(
     // GetSandboxConfig and broadcasts it. Flush tasks and the policy.local
     // API read the current value so proposals target the correct workspace.
     let (workspace_tx, workspace_rx) = tokio::sync::watch::channel(String::new());
-    // The supervisor session hands pushed configuration to the poll loop and
-    // tells it when to stop polling.
     let (config_apply_tx, config_apply_rx) = tokio::sync::mpsc::channel(16);
     let mut config_apply_rx = Some(config_apply_rx);
-    let (config_push_updates, config_push_enabled) = tokio::sync::watch::channel(false);
+    let (config_push_updates, config_push_enabled) = tokio::sync::watch::channel(true);
 
     let remote_network_source = remote_boundary.0.network_mediation_source();
     let remote_host_gateway_ip = remote_boundary.0.host_gateway_ip();
@@ -1192,8 +1288,11 @@ async fn run_sandbox_with_backend(
         let poll_pid = entrypoint_pid.clone();
         let poll_provider_credentials = provider_credentials.clone();
         let poll_policy_local = networking.as_ref().map(|n| n.policy_local_ctx.clone());
-        let poll_endpoint_policy = loaded_policy_origin
-            .allows_gateway_policy_reload()
+        let initial_stream_configuration_admitted = initial_stream_snapshot
+            .as_ref()
+            .is_none_or(|snapshot| snapshot.configuration_admitted);
+        let poll_endpoint_policy = (loaded_policy_origin.allows_gateway_policy_reload()
+            && initial_stream_configuration_admitted)
             .then(|| retained_proto.clone())
             .flatten();
         let poll_interval_secs: u64 = std::env::var("OPENSHELL_POLICY_POLL_INTERVAL_SECS")
@@ -1225,6 +1324,7 @@ async fn run_sandbox_with_backend(
                 substrate_ready: transparent_tcp_substrate_ready,
             },
             config_apply_rx: config_apply_rx.take(),
+            initial_stream_snapshot,
             config_push_enabled: Some(config_push_enabled),
             endpoint_observation_tx,
             endpoint_status_rx,
@@ -1232,9 +1332,10 @@ async fn run_sandbox_with_backend(
             supervisor_session_id: supervisor_session_id.clone(),
         };
 
+        let wait_for_workload = !uses_stream_configuration;
         tokio::spawn(async move {
             let mut workload_started = workload_started_rx;
-            if workload_started.wait_for(|started| *started).await.is_err() {
+            if wait_for_workload && workload_started.wait_for(|started| *started).await.is_err() {
                 return;
             }
             if let Err(e) = Box::pin(run_policy_poll_loop(poll_ctx)).await {
@@ -1263,6 +1364,25 @@ async fn run_sandbox_with_backend(
     };
     tokio::pin!(proxy_exited);
 
+    // Report the stream-delivered bootstrap result while the boundary remains
+    // confirmed but held. Docker and other admission-aware drivers do not
+    // release the workload until the gateway accepts this result, so delaying
+    // the stream until after `start_agent` would deadlock activation.
+    let prestarted_supervisor_session = match prepared_supervisor_session.take() {
+        Some(prepared) => Some(
+            openshell_supervisor_process::delegated::start_prepared_supervisor_session(
+                prepared,
+                prepared_bootstrap_result.take(),
+                ssh_socket_path.as_deref(),
+                config_apply_tx.clone(),
+                Some(supervisor_session_updates.clone()),
+                config_push_updates,
+            )
+            .await?,
+        ),
+        None => None,
+    };
+
     let (confirmed, backend_name) = remote_ready;
     let exit_code = {
         let running = confirmed
@@ -1275,6 +1395,7 @@ async fn run_sandbox_with_backend(
         info!(backend = %backend_name, "Isolation boundary agent started");
         let agent = running.agent();
         let boundary_access = openshell_supervisor_process::delegated::start_boundary_access(
+            supervisor_instance_id,
             sandbox_id.as_deref(),
             openshell_endpoint.as_deref(),
             ssh_socket_path.as_deref(),
@@ -1286,8 +1407,8 @@ async fn run_sandbox_with_backend(
             running.loopback_connector(),
             agent.clone(),
             Some(supervisor_session_updates),
+            prestarted_supervisor_session,
             config_apply_tx,
-            config_push_updates,
             ssh_host_key,
         )
         .instrument(tracing::info_span!(parent: &startup, "supervisor.access.start"))
@@ -2264,6 +2385,7 @@ async fn load_policy(
         local_policy_identity,
         None,
         None,
+        None,
         &RemoteStartupGateway {
             endpoint: openshell_endpoint.unwrap_or_default(),
         },
@@ -2285,6 +2407,7 @@ async fn load_policy_with_gateway(
     local_policy_identity: LocalPolicyIdentity,
     vm_identity: Option<VmPolicyIdentity>,
     image_discovery: Option<ImagePolicyDiscovery>,
+    initial_snapshot: Option<openshell_core::grpc_client::SettingsPollResult>,
     gateway: &impl StartupGateway,
 ) -> Result<(
     SandboxPolicy,
@@ -2362,6 +2485,21 @@ async fn load_policy_with_gateway(
             false,
             None,
         ));
+    }
+
+    // Stream mode: the gateway enabled authoritative streamed configuration
+    // and already prepared and admitted this bootstrap for the session.
+    if let (Some(id), Some(endpoint), Some(snapshot)) =
+        (&sandbox_id, &openshell_endpoint, initial_snapshot)
+    {
+        return Box::pin(load_stream_bootstrap_policy(
+            id,
+            endpoint,
+            snapshot,
+            extension_credentials,
+            vm_identity,
+        ))
+        .await;
     }
 
     // gRPC mode: fetch typed proto policy, construct OPA engine from baked rules + proto data
@@ -2626,67 +2764,14 @@ async fn load_policy_with_gateway(
                 };
             let engine = Arc::new(engine);
 
-            // Install the in-process catalog before any external connection can
-            // fail. A newly started sandbox must always be able to resolve built-in
-            // bindings, even while operator-run services are unavailable.
-            install_builtin_middleware_registry(&engine).await?;
-
-            // Connect operator-registered middleware services. A connect/describe
-            // failure keeps the built-in registry active so each request's
-            // `on_error` policy governs matched traffic. The policy poll loop
-            // retries the install without waiting for a config change.
-            let middleware_services = snapshot.supervisor_middleware_services.clone();
-            let middleware_registry_status = if middleware_services.is_empty() {
-            MiddlewareRegistryStatus::Synchronized
-        } else if let Err(error) = grpc_retry("Middleware connect", || {
-            let middleware_services = middleware_services.clone();
-            let extension_credentials = extension_credentials.clone();
-            let extension_authentication_enabled = snapshot.extension_authentication_enabled;
-            async move {
-                let credentials = if extension_authentication_enabled {
-                    // Share the supervisor's store so the slots installed here
-                    // are the ones the policy poll loop later rotates in place.
-                    openshell_core::grpc_client::CachedOpenShellClient::connect_with_credentials(
-                        endpoint,
-                        extension_credentials,
-                    )
-                    .await?
-                    .refresh_extension_credentials(&middleware_services)
-                    .await?
-                } else {
-                    std::collections::HashMap::new()
-                };
-                connect_middleware_registry(
-                    &middleware_services,
-                    &MiddlewareAuthentication {
-                        credentials,
-                        enabled: extension_authentication_enabled,
-                    },
-                )
-                .await
-            }
-        })
-        .await
-        .and_then(|registry| engine.replace_middleware_registry(registry))
-        {
-            ocsf_emit!(
-                ConfigStateChangeBuilder::new(ocsf_ctx())
-                    .severity(SeverityId::Medium)
-                    .status(StatusId::Failure)
-                    .state(StateId::Other, "degraded")
-                    .unmapped(
-                        "supervisor_middleware_service_count",
-                        serde_json::json!(middleware_services.len())
-                    )
-                    .message(format!(
-                        "Supervisor middleware connect failed at startup; continuing with built-in middleware only, per-request on_error governs matched requests [error:{error}]"
-                    ))
-                    .build()
-            );
-            MiddlewareRegistryStatus::NeedsReconciliation
-        } else {
-            MiddlewareRegistryStatus::Synchronized
-        };
+            let middleware_registry_status = connect_startup_middleware(
+                &engine,
+                endpoint,
+                &snapshot.supervisor_middleware_services,
+                snapshot.extension_authentication_enabled,
+                extension_credentials,
+            )
+            .await?;
             let opa_engine = Some(engine);
 
             // The gateway compares the entire tuple again. A concurrent repair or
@@ -2746,6 +2831,180 @@ async fn load_policy_with_gateway(
          - --policy-rules and --policy-data (or OPENSHELL_POLICY_RULES and OPENSHELL_POLICY_DATA env vars)\n\
          - --sandbox-id, --sandbox, and --openshell-endpoint (or OPENSHELL_SANDBOX_ID, OPENSHELL_SANDBOX, and OPENSHELL_ENDPOINT env vars)"
     ))
+}
+
+/// Install the gateway-prepared bootstrap delivered on the supervisor stream.
+///
+/// The gateway prepared the startup policy against this image and admitted the
+/// generation before sending it, so this never writes policy back or retries
+/// admission. A rejected generation starts fail-closed and is reported through
+/// the bootstrap result.
+async fn load_stream_bootstrap_policy(
+    id: &str,
+    endpoint: &str,
+    snapshot: openshell_core::grpc_client::SettingsPollResult,
+    extension_credentials: &openshell_extension_core::ExtensionCredentialStore,
+    vm_identity: Option<VmPolicyIdentity>,
+) -> Result<(
+    SandboxPolicy,
+    Option<Arc<OpaEngine>>,
+    Option<openshell_core::proto::SandboxPolicy>,
+    MiddlewareRegistryStatus,
+    LoadedPolicyOrigin,
+    bool,
+    bool,
+    Option<CapturedProviderEnvironment>,
+)> {
+    info!(sandbox_id = %id, "Loading sandbox policy from supervisor bootstrap");
+    let mut proto_policy = snapshot
+        .policy
+        .clone()
+        .ok_or_else(|| miette::miette!("supervisor bootstrap omitted required sandbox policy"))?;
+
+    // The startup candidate already carried baseline paths for a sandbox
+    // policy. A global policy cannot be written back, so it keeps the added
+    // paths in this process only, matching polling startup.
+    let enriched = enrich_proto_baseline_paths(&mut proto_policy);
+    if proto_sync_payload_for_enriched_policy(&proto_policy, enriched).is_some()
+        && snapshot.policy_source == openshell_core::proto::PolicySource::Sandbox
+    {
+        return Err(miette::miette!(
+            "supervisor bootstrap policy omitted required baseline paths"
+        ));
+    }
+
+    let configuration_rejected = !snapshot.configuration_admitted;
+    let loaded_policy_revision = Some(LoadedPolicyRevision::from_snapshot(&snapshot));
+    if configuration_rejected {
+        ocsf_emit!(
+            ConfigStateChangeBuilder::new(ocsf_ctx())
+                .severity(SeverityId::High)
+                .status(StatusId::Failure)
+                .state(StateId::Other, "configuration_error")
+                .message(snapshot.configuration_error.clone())
+                .build()
+        );
+        proto_policy = openshell_policy::restrictive_default_policy();
+    } else if let Some(identity) = vm_identity {
+        identity
+            .validate(&proto_policy)
+            .wrap_err("supervisor bootstrap policy conflicts with the VM workload identity")?;
+    }
+
+    // The initial load uses pid=0 (no symlink resolution) because the
+    // container hasn't started yet. After the entrypoint spawns, the engine is
+    // rebuilt with the real PID for symlink resolution.
+    if !configuration_rejected {
+        info!("Creating OPA engine from proto policy data");
+    }
+    let has_last_valid_policy = !configuration_rejected;
+    let engine = Arc::new(
+        OpaEngine::from_proto(&proto_policy)
+            .wrap_err("failed to install required sandbox policy from supervisor bootstrap")?,
+    );
+
+    let extension_authentication_enabled =
+        snapshot.extension_authentication_enabled && !configuration_rejected;
+    let middleware_services: &[_] = if configuration_rejected {
+        &[]
+    } else {
+        &snapshot.supervisor_middleware_services
+    };
+    let middleware_registry_status = connect_startup_middleware(
+        &engine,
+        endpoint,
+        middleware_services,
+        extension_authentication_enabled,
+        extension_credentials,
+    )
+    .await?;
+
+    let policy = match SandboxPolicy::try_from(proto_policy.clone()) {
+        Ok(policy) => policy,
+        Err(e) => {
+            report_initial_policy_failure(endpoint, id, loaded_policy_revision.as_ref(), &e).await;
+            return Err(e);
+        }
+    };
+    Ok((
+        policy,
+        Some(engine),
+        Some(proto_policy),
+        middleware_registry_status,
+        LoadedPolicyOrigin::Gateway {
+            revision: loaded_policy_revision,
+            has_last_valid_policy,
+        },
+        !configuration_rejected && agent_proposals_enabled_from_settings(&snapshot.settings),
+        extension_authentication_enabled,
+        None,
+    ))
+}
+
+/// Install the startup middleware registry.
+///
+/// The in-process catalog is installed before any external connection can
+/// fail, so a newly started sandbox can always resolve built-in bindings. A
+/// failure to connect operator-registered services keeps that registry
+/// active, so each request's `on_error` policy governs matched traffic, and
+/// the runtime retries the install without waiting for a config change.
+async fn connect_startup_middleware(
+    engine: &OpaEngine,
+    endpoint: &str,
+    middleware_services: &[openshell_core::proto::SupervisorMiddlewareService],
+    extension_authentication_enabled: bool,
+    extension_credentials: &openshell_extension_core::ExtensionCredentialStore,
+) -> Result<MiddlewareRegistryStatus> {
+    install_builtin_middleware_registry(engine).await?;
+    if middleware_services.is_empty() {
+        return Ok(MiddlewareRegistryStatus::Synchronized);
+    }
+    let connected = grpc_retry("Middleware connect", || {
+        let extension_credentials = extension_credentials.clone();
+        async move {
+            let credentials = if extension_authentication_enabled {
+                // Share the supervisor's store so the slots installed here
+                // are the ones the policy poll loop later rotates in place.
+                openshell_core::grpc_client::CachedOpenShellClient::connect_with_credentials(
+                    endpoint,
+                    extension_credentials,
+                )
+                .await?
+                .refresh_extension_credentials(middleware_services)
+                .await?
+            } else {
+                std::collections::HashMap::new()
+            };
+            connect_middleware_registry(
+                middleware_services,
+                &MiddlewareAuthentication {
+                    credentials,
+                    enabled: extension_authentication_enabled,
+                },
+            )
+            .await
+        }
+    })
+    .await
+    .and_then(|registry| engine.replace_middleware_registry(registry));
+    let Err(error) = connected else {
+        return Ok(MiddlewareRegistryStatus::Synchronized);
+    };
+    ocsf_emit!(
+        ConfigStateChangeBuilder::new(ocsf_ctx())
+            .severity(SeverityId::Medium)
+            .status(StatusId::Failure)
+            .state(StateId::Other, "degraded")
+            .unmapped(
+                "supervisor_middleware_service_count",
+                serde_json::json!(middleware_services.len())
+            )
+            .message(format!(
+                "Supervisor middleware connect failed at startup; continuing with built-in middleware only, per-request on_error governs matched requests [error:{error}]"
+            ))
+            .build()
+    );
+    Ok(MiddlewareRegistryStatus::NeedsReconciliation)
 }
 
 /// Capture the policy from the workload filesystem, preserving invalid input
@@ -3452,7 +3711,9 @@ fn initial_provider_credentials(
         .copied()
         .filter(|expiry| *expiry > 0)
         .min();
-    if result.readiness_reason != ProviderReadinessReason::Unspecified {
+    // Withheld and expired credentials are already absent from the delivered
+    // environment, so the rest installs as it does for a polling startup.
+    if !provider_environment_is_installable(result.readiness_reason) {
         readiness.credentials_failed(identity, result.readiness_reason);
         return ProviderCredentialState::from_environment(
             result.provider_env_revision,
@@ -3769,8 +4030,12 @@ struct PolicyPollLoopContext {
     transparent_tcp: TransparentTcpReloadState,
     /// Payloads delivered over the supervisor session.
     config_apply_rx: Option<tokio::sync::mpsc::Receiver<ConfigApplyRequest>>,
-    /// Whether the current supervisor session pushes configuration. The
-    /// runtime polls while it is false.
+    /// Present when the session delivered a bootstrap. It already initialized
+    /// the runtime, so it seeds the applied trackers and the runtime applies
+    /// delivered updates instead of polling.
+    initial_stream_snapshot: Option<openshell_core::grpc_client::SettingsPollResult>,
+    /// Whether the current supervisor session delivers configuration
+    /// authoritatively. A stream-started runtime polls while it is false.
     config_push_enabled: Option<tokio::sync::watch::Receiver<bool>>,
     /// Producer shared with network enforcement and policy installation.
     endpoint_observation_tx: Option<openshell_core::endpoint_status::EndpointObservationSender>,
@@ -4719,6 +4984,7 @@ network_policies:
                     gid: 1001,
                 }),
                 Some(ImagePolicyDiscovery::Missing),
+                None,
                 &active_gateway,
             )
             .await
@@ -4856,6 +5122,7 @@ network_policies:
                     LocalPolicyIdentity::Required,
                     None,
                     Some(ImagePolicyDiscovery::Missing),
+                    None,
                     &gateway,
                 ),
             )
@@ -4933,6 +5200,7 @@ network_policies:
                     LocalPolicyIdentity::Required,
                     None,
                     Some(ImagePolicyDiscovery::Missing),
+                    None,
                     &gateway,
                 ),
             )
@@ -4979,6 +5247,7 @@ network_policies:
                 LocalPolicyIdentity::Required,
                 None,
                 Some(ImagePolicyDiscovery::Missing),
+                None,
                 &active_gateway,
             )
             .await
@@ -5313,6 +5582,7 @@ network_policies:
                 LocalPolicyIdentity::Required,
                 None,
                 Some(discovery),
+                None,
                 &startup_gateway,
             )
             .await
@@ -5462,6 +5732,7 @@ network_policies:
                 LocalPolicyIdentity::Required,
                 None,
                 Some(discovery),
+                None,
                 &gateway,
             ),
         )
@@ -5788,6 +6059,7 @@ network_policies:
                 LocalPolicyIdentity::Required,
                 None,
                 Some(ImagePolicyDiscovery::Missing),
+                None,
                 &gateway,
             ),
         )
@@ -5883,6 +6155,7 @@ network_policies:
                         LocalPolicyIdentity::Required,
                         None,
                         Some(discovery.clone()),
+                        None,
                         &gateway,
                     ),
                 )
@@ -7084,6 +7357,9 @@ network_policies:
         );
     }
 }
+
+#[cfg(test)]
+mod config_push_regression_tests;
 
 #[cfg(test)]
 mod legacy_startup_regression_tests;
