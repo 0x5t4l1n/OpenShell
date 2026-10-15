@@ -1511,9 +1511,7 @@ async fn replacement_reset_timeout_invalidates_superseded_evidence() {
             supports_provider_readiness: false,
             redirected: false,
             supports_session_redirect: false,
-            image_policy_discovery: None,
             supports_config_push: false,
-            workload_pending: false,
         })),
     };
     let error = gateway_client(Arc::clone(&state))
@@ -1587,9 +1585,7 @@ async fn replacement_reset_retry_does_not_hold_gateway_shutdown() {
             supports_provider_readiness: false,
             redirected: false,
             supports_session_redirect: false,
-            image_policy_discovery: None,
             supports_config_push: false,
-            workload_pending: false,
         })),
     };
     let error = gateway_client(Arc::clone(&state))

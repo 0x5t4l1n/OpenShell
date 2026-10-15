@@ -953,8 +953,8 @@ mod tests {
             .unwrap();
     }
 
-    /// Connect a streamed-apply supervisor. Without image policy discovery the
-    /// gateway skips startup preparation and accepts it with its bootstrap.
+    /// Connect a streamed-apply supervisor and answer the bootstrap it is
+    /// accepted with.
     async fn accepted_session(
         state: &Arc<ServerState>,
         sandbox_id: &str,
@@ -971,7 +971,7 @@ mod tests {
         String,
         Option<openshell_core::proto::ConfigUpdate>,
     ) {
-        let mut harness = reconnect_supervisor_stream(state, sandbox_id, StreamFeatures::Apply)
+        let mut harness = connect_supervisor_stream(state, sandbox_id, StreamFeatures::Apply)
             .await
             .unwrap();
         let first = tokio::time::timeout(Duration::from_secs(5), harness.inbound.message())
@@ -983,7 +983,7 @@ mod tests {
             panic!("expected SessionAccepted");
         };
         // Live updates wait for the bootstrap result, as from a real
-        // supervisor; the gateway answers it with the admission.
+        // supervisor.
         if let Some(bootstrap) = accepted.bootstrap.as_ref() {
             harness
                 .outbound
@@ -996,13 +996,6 @@ mod tests {
                 })
                 .await
                 .unwrap();
-            let admission = next_update(&mut harness, Duration::from_secs(5))
-                .await
-                .expect("configuration admission");
-            assert!(matches!(
-                admission.payload,
-                Some(gateway_message::Payload::ConfigurationAdmission(_))
-            ));
         }
         (harness, accepted.session_id, accepted.bootstrap)
     }
@@ -1333,8 +1326,6 @@ mod tests {
 
     #[tokio::test]
     async fn stalled_credentials_keep_the_live_session_serving_relays() {
-        use openshell_core::proto::{StartupConfigPrepared, SupervisorMessage, supervisor_message};
-
         let state = push_state().await;
         let credential_handles = state
             .credentials
@@ -1362,8 +1353,6 @@ mod tests {
             })
             .await
             .unwrap();
-        // A stored gateway policy leaves startup preparation nothing to persist,
-        // so no publication follows the first session.
         state
             .store
             .put_message(&Sandbox {
@@ -1383,27 +1372,6 @@ mod tests {
             .await
             .unwrap();
         let mut live = connect_supervisor_stream(&state, "sandbox", StreamFeatures::Apply)
-            .await
-            .unwrap();
-        let Some(gateway_message::Payload::StartupConfigCandidate(candidate)) =
-            next_update(&mut live, Duration::from_secs(5))
-                .await
-                .expect("startup candidate")
-                .payload
-        else {
-            panic!("expected StartupConfigCandidate");
-        };
-        live.outbound
-            .send(SupervisorMessage {
-                payload: Some(supervisor_message::Payload::StartupConfigPrepared(
-                    StartupConfigPrepared {
-                        candidate_id: candidate.candidate_id,
-                        result: Some(
-                            openshell_core::proto::startup_config_prepared::Result::Unchanged(()),
-                        ),
-                    },
-                )),
-            })
             .await
             .unwrap();
         let Some(gateway_message::Payload::SessionAccepted(accepted)) =

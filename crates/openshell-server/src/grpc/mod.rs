@@ -987,7 +987,7 @@ pub mod test_support {
     use openshell_core::proto::open_shell_client::OpenShellClient;
     use openshell_core::proto::open_shell_server::OpenShellServer;
     use openshell_core::proto::{
-        GatewayMessage, SandboxPolicy, SupervisorHello, SupervisorMessage, supervisor_message,
+        GatewayMessage, SupervisorHello, SupervisorMessage, supervisor_message,
     };
     use tokio::sync::mpsc;
     use tokio_stream::wrappers::{ReceiverStream, TcpListenerStream};
@@ -1020,12 +1020,8 @@ pub mod test_support {
     pub enum StreamFeatures {
         /// Predates streamed configuration and keeps polling.
         Legacy,
-        /// Applies and acknowledges streamed configuration, connecting before
-        /// its workload starts.
+        /// Applies and acknowledges streamed configuration.
         Apply,
-        /// Applies streamed configuration and reconnects after its workload
-        /// started.
-        ApplyAfterStart,
     }
 
     /// Serve `state` on loopback and open a supervisor stream whose hello
@@ -1036,65 +1032,23 @@ pub mod test_support {
         sandbox_id: &str,
         features: StreamFeatures,
     ) -> Result<SupervisorStreamHarness, tonic::Status> {
-        connect_supervisor_stream_with_image_policy(state, sandbox_id, features, None).await
+        connect_supervisor_stream_with_epoch(state, sandbox_id, features, 0).await
     }
 
-    pub async fn connect_supervisor_stream_with_image_policy(
-        state: &Arc<ServerState>,
-        sandbox_id: &str,
-        features: StreamFeatures,
-        image_policy: Option<SandboxPolicy>,
-    ) -> Result<SupervisorStreamHarness, tonic::Status> {
-        let result = image_policy.clone().map_or(
-            openshell_core::proto::image_policy_discovery::Result::Missing(()),
-            openshell_core::proto::image_policy_discovery::Result::Policy,
-        );
-        connect_supervisor_stream_with_image_policy_discovery(
-            state,
-            sandbox_id,
-            features,
-            openshell_core::proto::ImagePolicyDiscovery {
-                result: Some(result),
-            },
-        )
-        .await
-    }
-
-    pub async fn connect_supervisor_stream_with_image_policy_discovery(
-        state: &Arc<ServerState>,
-        sandbox_id: &str,
-        features: StreamFeatures,
-        image_policy_discovery: openshell_core::proto::ImagePolicyDiscovery,
-    ) -> Result<SupervisorStreamHarness, tonic::Status> {
-        connect_supervisor_stream_with_optional_image_policy_discovery(
-            state,
-            sandbox_id,
-            features,
-            Some(image_policy_discovery),
-            0,
-        )
-        .await
-    }
-
-    /// Model a stock supervisor reconnect, which omits the one-shot image
-    /// policy discovery after its initial session has been prepared and
-    /// advances its connection epoch.
+    /// Model a stock supervisor reconnect, which advances its connection
+    /// epoch.
     pub async fn reconnect_supervisor_stream(
         state: &Arc<ServerState>,
         sandbox_id: &str,
         features: StreamFeatures,
     ) -> Result<SupervisorStreamHarness, tonic::Status> {
-        connect_supervisor_stream_with_optional_image_policy_discovery(
-            state, sandbox_id, features, None, 1,
-        )
-        .await
+        connect_supervisor_stream_with_epoch(state, sandbox_id, features, 1).await
     }
 
-    async fn connect_supervisor_stream_with_optional_image_policy_discovery(
+    async fn connect_supervisor_stream_with_epoch(
         state: &Arc<ServerState>,
         sandbox_id: &str,
         features: StreamFeatures,
-        image_policy_discovery: Option<openshell_core::proto::ImagePolicyDiscovery>,
         connection_epoch: u64,
     ) -> Result<SupervisorStreamHarness, tonic::Status> {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1126,10 +1080,8 @@ pub mod test_support {
                 payload: Some(supervisor_message::Payload::Hello(SupervisorHello {
                     sandbox_id: sandbox_id.into(),
                     instance_id: "instance".into(),
-                    supports_config_push: features != StreamFeatures::Legacy,
-                    workload_pending: features == StreamFeatures::Apply,
+                    supports_config_push: features == StreamFeatures::Apply,
                     connection_epoch,
-                    image_policy_discovery,
                     supports_provider_readiness: false,
                     redirected: false,
                     supports_session_redirect: false,

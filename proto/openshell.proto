@@ -7,7 +7,6 @@ package openshell.v1;
 
 import "datamodel.proto";
 import "google/protobuf/duration.proto";
-import "google/protobuf/empty.proto";
 import "google/protobuf/struct.proto";
 import "google/protobuf/timestamp.proto";
 import "options.proto";
@@ -431,9 +430,9 @@ service OpenShell {
     };
   }
 
-  // Get sandbox settings by id (called by users, and by polling supervisors at
-  // startup and in their poll loop). Push supervisors receive the same
-  // configuration over ConnectSupervisor and do not call it.
+  // Get sandbox settings by id (called by users, and by supervisors at startup
+  // and in their poll loop). A supervisor whose session pushes configuration
+  // receives later updates over ConnectSupervisor and stops polling.
   rpc GetSandboxConfig(openshell.sandbox.v1.GetSandboxConfigRequest)
       returns (openshell.sandbox.v1.GetSandboxConfigResponse) {
     option (openshell.options.v1.authorization) = {
@@ -3105,14 +3104,8 @@ message SupervisorMessage {
     RelayOpenResult relay_open_result = 3;
     RelayClose relay_close = 4;
     ConfigUpdateResult config_update_result = 5;
-    StartupConfigPrepared startup_config_prepared = 6;
-    // Sent after accepted admission once the workload relay is usable.
-    SupervisorRuntimeReady runtime_ready = 7;
   }
 }
-
-// Confirms that the admitted workload and its gateway relay are usable.
-message SupervisorRuntimeReady {}
 
 // Envelope for gateway-to-supervisor messages on the ConnectSupervisor stream.
 message GatewayMessage {
@@ -3124,11 +3117,6 @@ message GatewayMessage {
     RelayClose relay_close = 5;
     SessionRedirect session_redirect = 6;
     ConfigUpdate config_update = 7;
-    StartupConfigCandidate startup_config_candidate = 8;
-    // Durable gateway acknowledgement of streamed configuration admission,
-    // sent until the session's workload runs. The supervisor must not launch
-    // the workload until this is ACCEPTED.
-    SandboxConfigurationAdmission configuration_admission = 9;
   }
 }
 
@@ -3151,53 +3139,11 @@ message SupervisorHello {
   // The supervisor understands SessionRedirect. Gateways never redirect a
   // supervisor that does not set this.
   bool supports_session_redirect = 6;
-  // Set while the supervisor's workload has not started yet. The gateway then
-  // waits for SupervisorRuntimeReady before treating the sandbox as ready;
-  // otherwise a polling session is ready as soon as it is accepted.
-  bool workload_pending = 7;
-  // Explicit result of inspecting the workload image policy, sent only on the
-  // first connection of a supervisor process. The gateway considers it when
-  // preparing the first authoritative bootstrap for this process.
-  ImagePolicyDiscovery image_policy_discovery = 8;
   // The supervisor can receive its configuration over this stream instead of
-  // polling for it: it prepares its startup policy here, applies the bootstrap
-  // ConfigUpdate before starting the workload, applies and acknowledges later
-  // ConfigUpdate payloads, and reports admission. Gateways push configuration
-  // only to supervisors that set this.
-  bool supports_config_push = 9;
-}
-
-message ImagePolicyDiscovery {
-  oneof result {
-    google.protobuf.Empty missing = 1;
-    google.protobuf.Empty invalid = 2;
-    openshell.sandbox.v1.SandboxPolicy policy = 3;
-  }
-}
-
-// Gateway-selected policy that the supervisor must prepare against the local
-// image before the session can be accepted. The candidate is not authoritative
-// runtime state; SessionAccepted carries the final gateway-owned bootstrap.
-message StartupConfigCandidate {
-  // Opaque identifier scoped to this ConnectSupervisor attempt.
-  string candidate_id = 1;
-  openshell.sandbox.v1.SandboxPolicy policy = 2;
-  string policy_hash = 3;
-  openshell.sandbox.v1.PolicySource policy_source = 4;
-  uint32 policy_version = 5;
-}
-
-// Supervisor preparation result for one StartupConfigCandidate.
-message StartupConfigPrepared {
-  string candidate_id = 1;
-  oneof result {
-    // The candidate needs no image-specific changes.
-    google.protobuf.Empty unchanged = 2;
-    // Complete prepared policy. The gateway validates its difference from the
-    // candidate and remains authoritative for persistence and composition.
-    openshell.sandbox.v1.SandboxPolicy prepared_policy = 3;
-    ConfigApplyFailure failure = 4;
-  }
+  // polling for it: it applies the bootstrap ConfigUpdate and later
+  // ConfigUpdate payloads, and answers each with its result and admission.
+  // Gateways push configuration only to supervisors that set this.
+  bool supports_config_push = 7;
 }
 
 // Gateway accepts the supervisor session.

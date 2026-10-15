@@ -141,9 +141,8 @@ mod tests {
     // false. Capability negotiation and delivered key lists are public-only;
     // the set of shared message and enum types remains unchanged. Delivered
     // provider snapshots carry the same flag per value and are never stored.
-    // SessionRedirect, SupervisorHello.redirected, and
-    // SupervisorHello.workload_pending are supervisor control traffic and are
-    // never stored.
+    // SessionRedirect and SupervisorHello.redirected are supervisor control
+    // traffic and are never stored.
     // Token-grant owner fields add gateway-derived metadata to endpoints and
     // profile credentials reachable from stored policies and provider profiles.
     // Legacy payloads decode empty owners; the gateway rebuilds their authority
@@ -152,7 +151,7 @@ mod tests {
     // ListProvidersRequest field 4 adds a public-only label selector. Older
     // requests decode an empty selector; durable schemas remain unchanged.
     const PUBLIC_RPC_SCHEMA_SHA256: &str =
-        "e9b28aa6ed35780d5a7ee149bea5cbb93afba99fac3362046fc1bf8c975f3857";
+        "b8cbf5162bdd4c65c01b3f38dec33df501b281faa46d4191397568b592bf9e09";
     const DURABLE_SCHEMA_SHA256: &str =
         "5281143e2825539af6148785c91f9df67f654eb74d215f57940af9314867a55f";
     const PUBLIC_DURABLE_OVERLAP_SHA256: &str =
@@ -639,7 +638,7 @@ mod tests {
                 overlap_hash.as_str(),
             ),
             (
-                (330, 28),
+                (325, 28),
                 (93, 21),
                 (81, 21),
                 PUBLIC_RPC_SCHEMA_SHA256,

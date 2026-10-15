@@ -23,18 +23,15 @@ use openshell_core::proto::{
     ProviderReadinessObservation, RelayFrame, RelayInit, RelayOpen, ReportEndpointStatusRequest,
     ReportEndpointStatusResponse, ReportMainProcessExitRequest, ReportMainProcessExitResponse,
     ReportProviderReadinessRequest, ReportProviderReadinessResponse, Sandbox, SandboxPhase,
-    SessionAccepted, SessionRedirect, SessionRejected, SshRelayTarget, SupervisorHello,
-    SupervisorMessage, gateway_message, open_shell_client, peer_relay_frame, relay_open,
-    supervisor_message,
+    SessionAccepted, SessionRedirect, SshRelayTarget, SupervisorHello, SupervisorMessage,
+    gateway_message, open_shell_client, peer_relay_frame, relay_open, supervisor_message,
 };
 use openshell_core::transport_errors::is_expected_transport_close_status;
 
 use crate::ServerState;
 use crate::auth::principal::Principal;
 use crate::config_delivery::MAX_SUPERVISOR_CONFIG_MESSAGE_BYTES;
-use crate::config_delivery::session::{
-    self as config_session, ConfigSessionState, ImagePolicyAdmission,
-};
+use crate::config_delivery::session::{self as config_session, ConfigSessionState};
 use crate::gateway_metrics::{
     self, GaugeSlot, PeerRpc, RelayCapacity, RelayKind, RelayRejection, RelayRoute,
     RoutedRequestTimer,
@@ -59,15 +56,12 @@ pub(crate) const SUPERVISOR_SESSION_SHUTDOWN_TIMEOUT: Duration = Duration::from_
 const _: () =
     assert!(SHUTDOWN_HANDOFF_GRACE.as_secs() * 2 <= SUPERVISOR_SESSION_SHUTDOWN_TIMEOUT.as_secs());
 
-/// How a supervisor session receives configuration, and when it is ready.
-#[derive(Clone, Debug)]
+/// How a supervisor session receives configuration.
+#[derive(Clone, Copy, Debug)]
 pub(crate) enum SessionMode {
-    /// The supervisor polls for configuration. It is ready on accept when its
-    /// workload is already running, as for supervisors that predate streamed
-    /// apply; otherwise after `SupervisorRuntimeReady`.
-    Poll { ready_on_accept: bool },
+    /// The supervisor polls for configuration.
+    Poll,
     /// Applies and acknowledges configuration streamed on the session.
-    /// Ready after `SupervisorRuntimeReady` with an accepted admission.
     Push,
 }
 
@@ -338,8 +332,6 @@ struct LiveSession {
     /// Installation evidence belongs to this connection and is never restored
     /// from persistence or inherited by a replacement supervisor session.
     provider_readiness: Option<ProviderReadinessEvidence>,
-    /// True only after the admitted workload and relay plane are usable.
-    runtime_ready: bool,
     #[allow(dead_code)]
     connected_at: Instant,
     /// This session's share of `openshell_server_supervisor_sessions`, released when the entry
@@ -454,18 +446,10 @@ impl SupervisorSessionRegistry {
         tx: mpsc::Sender<GatewayMessage>,
         shutdown: oneshot::Sender<()>,
     ) -> bool {
-        self.register_with_mode(
-            sandbox_id,
-            session_id,
-            tx,
-            shutdown,
-            SessionMode::Poll {
-                ready_on_accept: true,
-            },
-        )
+        self.register_with_mode(sandbox_id, session_id, tx, shutdown, SessionMode::Poll)
     }
 
-    /// Register a session with its configuration delivery and readiness mode.
+    /// Register a session with its configuration delivery mode.
     ///
     /// A push session acknowledges each update before the next one is
     /// released.
@@ -477,15 +461,9 @@ impl SupervisorSessionRegistry {
         shutdown: oneshot::Sender<()>,
         mode: SessionMode,
     ) -> bool {
-        let runtime_ready = matches!(
-            mode,
-            SessionMode::Poll {
-                ready_on_accept: true
-            }
-        );
         let config = match mode {
             SessionMode::Push => Some(ConfigSessionState::new(tx.clone())),
-            SessionMode::Poll { .. } => None,
+            SessionMode::Poll => None,
         };
         let mut sessions = self.sessions.lock().unwrap();
         let previous = sessions.remove(&sandbox_id);
@@ -501,7 +479,6 @@ impl SupervisorSessionRegistry {
                 endpoint_status_initialized: false,
                 endpoint_report_cursor: None,
                 provider_readiness: None,
-                runtime_ready,
                 connected_at: Instant::now(),
                 _gauge_slot: GaugeSlot::supervisor_session(),
             },
@@ -612,42 +589,8 @@ impl SupervisorSessionRegistry {
             .map(|s| s.tx.clone())
     }
 
-    #[cfg(test)]
-    pub(crate) fn mark_runtime_ready_for_test(&self, sandbox_id: &str, session_id: &str) -> bool {
-        self.mark_runtime_ready(sandbox_id, session_id)
-    }
-
     pub fn has_session(&self, sandbox_id: &str) -> bool {
         self.sessions.lock().unwrap().contains_key(sandbox_id)
-    }
-
-    pub fn is_runtime_ready(&self, sandbox_id: &str) -> bool {
-        self.sessions
-            .lock()
-            .unwrap()
-            .get(sandbox_id)
-            .is_some_and(|session| session.runtime_ready)
-    }
-
-    /// Whether this session already persisted its runtime readiness.
-    pub(crate) fn is_session_runtime_ready(&self, sandbox_id: &str, session_id: &str) -> bool {
-        self.sessions
-            .lock()
-            .unwrap()
-            .get(sandbox_id)
-            .is_some_and(|session| session.session_id == session_id && session.runtime_ready)
-    }
-
-    fn mark_runtime_ready(&self, sandbox_id: &str, session_id: &str) -> bool {
-        let mut sessions = self.sessions.lock().unwrap();
-        let Some(session) = sessions.get_mut(sandbox_id) else {
-            return false;
-        };
-        if session.session_id != session_id {
-            return false;
-        }
-        session.runtime_ready = true;
-        true
     }
 
     pub fn terminal_delivery_finalized(&self, sandbox_id: &str) -> bool {
@@ -2258,12 +2201,6 @@ async fn accept_supervisor_session(setup: SessionSetup) -> Result<(), Status> {
         session_lifetime,
     } = setup;
     let pushes_config = matches!(mode, SessionMode::Push);
-    let ready_on_accept = matches!(
-        mode,
-        SessionMode::Poll {
-            ready_on_accept: true
-        }
-    );
     // The registration seeds the session's provider environment cache.
     let bootstrap_provider_environment = bootstrap
         .as_ref()
@@ -2408,16 +2345,26 @@ async fn accept_supervisor_session(setup: SessionSetup) -> Result<(), Status> {
 
     // Do not expose SessionAccepted to the supervisor when the gateway could
     // not durably record the connection. Dropping the buffered response forces
-    // a reconnect, which gives the state transition a fresh chance. Other
-    // sessions become ready only after SupervisorRuntimeReady.
-    if ready_on_accept
-        && !mark_supervisor_initialized(&state, &sandbox_id, &session_id, &instance_id, false).await
+    // a reconnect, which gives the state transition a fresh chance instead of
+    // leaving a healthy-looking supervisor tied to a sandbox that never
+    // reaches Ready.
+    if let Err(err) = state
+        .compute
+        .supervisor_session_connected(&sandbox_id, &instance_id)
+        .await
     {
         abandon_session_setup(&state, &owner_index, &owner_guard, "lifecycle persistence").await;
+        warn!(
+            sandbox_id = %sandbox_id,
+            session_id = %session_id,
+            error = %err,
+            "supervisor session: failed to mark sandbox ready"
+        );
         return Err(Status::aborted(
             "failed to persist supervisor session state; reconnect",
         ));
     }
+    state.telemetry.sandbox_session_connected(&sandbox_id);
 
     if outbound_tx.send(accepted).await.is_err() {
         // Only evict ourselves — a faster reconnect may already have
@@ -2492,16 +2439,6 @@ async fn accept_supervisor_session(setup: SessionSetup) -> Result<(), Status> {
     Ok(())
 }
 
-async fn reject_startup_session(tx: &mpsc::Sender<GatewayMessage>, error: &Status) {
-    let _ = tx
-        .send(GatewayMessage {
-            payload: Some(gateway_message::Payload::SessionRejected(SessionRejected {
-                reason: error.message().chars().take(1024).collect(),
-            })),
-        })
-        .await;
-}
-
 pub async fn handle_connect_supervisor(
     state: &Arc<ServerState>,
     request: Request<tonic::Streaming<SupervisorMessage>>,
@@ -2535,23 +2472,10 @@ pub async fn handle_connect_supervisor(
     let pushes_config = state.config.config_delivery_mode
         == openshell_core::config::ConfigDeliveryMode::Push
         && hello.supports_config_push;
-    // The stock supervisor includes discovery only on its first connection.
-    // Reconnects from the same process omit it and proceed directly to the
-    // current authoritative bootstrap.
     let mode = if pushes_config {
         SessionMode::Push
     } else {
-        // Supervisors that predate config push never set workload_pending:
-        // they connect once their workload runs.
-        SessionMode::Poll {
-            ready_on_accept: !hello.workload_pending,
-        }
-    };
-    let prepares_startup_policy = pushes_config && hello.image_policy_discovery.is_some();
-    let image_policy_admission = if pushes_config {
-        config_session::image_policy_admission(&hello)?
-    } else {
-        ImagePolicyAdmission::Missing
+        SessionMode::Poll
     };
     // Captured before reading any bootstrap input, including the sandbox
     // record, so registration detects publications the bootstrap may miss.
@@ -2562,8 +2486,7 @@ pub async fn handle_connect_supervisor(
 
     // If the ring places this sandbox on a different live replica, send the
     // supervisor there instead of claiming ownership here. Decided before the
-    // session is tracked and before startup policy preparation, so a redirect
-    // never consumes a session slot or the supervisor's one-time preparer. An
+    // session is tracked so a redirect never consumes a session slot. An
     // established session is only relocated when this replica shuts down.
     if may_redirect(&hello, state.gateway_shutting_down.load(Ordering::Acquire))
         && let Some(redirect) = preferred_peer_redirect(state, &sandbox_id)
@@ -2612,10 +2535,7 @@ pub async fn handle_connect_supervisor(
             .unwrap_or_default(),
     });
     let bootstrap = if pushes_config {
-        Some(
-            config_session::build_session_bootstrap(state, &sandbox_id, &image_policy_admission)
-                .await?,
-        )
+        Some(config_session::build_session_bootstrap(state, &sandbox).await?)
     } else {
         None
     };
@@ -2626,74 +2546,24 @@ pub async fn handle_connect_supervisor(
         Box<dyn tokio_stream::Stream<Item = Result<GatewayMessage, Status>> + Send + 'static>,
     > = Box::pin(tokio_stream::StreamExt::map(ReceiverStream::new(rx), Ok));
 
-    if !prepares_startup_policy {
-        let setup = SessionSetup {
-            state: Arc::clone(state),
-            sandbox_id,
-            instance_id: hello.instance_id,
-            connection_epoch: hello.connection_epoch,
-            supports_session_redirect: hello.supports_session_redirect,
-            mode,
-            bootstrap,
-            provider_readiness,
-            config_push,
-            outbound_tx: tx,
-            inbound,
-            session_lifetime,
-        };
-        // Keep setup alive if the RPC caller disconnects after publication.
-        tokio::spawn(accept_supervisor_session(setup))
-            .await
-            .map_err(|error| {
-                Status::internal(format!("supervisor session setup failed: {error}"))
-            })??;
-        return Ok(Response::new(stream));
-    }
-
-    // The first connection of a streamed-apply supervisor prepares the
-    // gateway-selected policy against its image before the bootstrap is final.
-    let candidate = config_session::send_startup_candidate(
-        &tx,
-        bootstrap
-            .as_ref()
-            .map(|bootstrap| &bootstrap.sandbox_config),
-        image_policy_admission,
-    )
-    .await?;
-
-    let state = Arc::clone(state);
-    let tx_for_rejection = tx.clone();
-    tokio::spawn(async move {
-        let result = Box::pin(async {
-            let bootstrap = candidate
-                .finish(&state, principal, &sandbox, &mut inbound)
-                .await?;
-            Box::pin(accept_supervisor_session(SessionSetup {
-                state: Arc::clone(&state),
-                sandbox_id: sandbox_id.clone(),
-                instance_id: hello.instance_id,
-                connection_epoch: hello.connection_epoch,
-                supports_session_redirect: hello.supports_session_redirect,
-                mode,
-                bootstrap: Some(bootstrap),
-                provider_readiness,
-                config_push,
-                outbound_tx: tx,
-                inbound,
-                session_lifetime,
-            }))
-            .await
-        })
-        .await;
-        if let Err(error) = result {
-            warn!(
-                sandbox_id = %sandbox_id,
-                error_code = ?error.code(),
-                "supervisor startup policy preparation failed"
-            );
-            reject_startup_session(&tx_for_rejection, &error).await;
-        }
-    });
+    let setup = SessionSetup {
+        state: Arc::clone(state),
+        sandbox_id,
+        instance_id: hello.instance_id,
+        connection_epoch: hello.connection_epoch,
+        supports_session_redirect: hello.supports_session_redirect,
+        mode,
+        bootstrap,
+        provider_readiness,
+        config_push,
+        outbound_tx: tx,
+        inbound,
+        session_lifetime,
+    };
+    // Keep setup alive if the RPC caller disconnects after publication.
+    tokio::spawn(accept_supervisor_session(setup))
+        .await
+        .map_err(|error| Status::internal(format!("supervisor session setup failed: {error}")))??;
 
     Ok(Response::new(stream))
 }
@@ -3102,7 +2972,6 @@ async fn handle_supervisor_message(
         state,
         sandbox_id,
         session_id,
-        instance_id,
         ..
     } = session;
     match payload {
@@ -3148,39 +3017,6 @@ async fn handle_supervisor_message(
                 return false;
             }
         }
-        Some(supervisor_message::Payload::RuntimeReady(_)) => {
-            // A supervisor reports readiness again after each accepted
-            // admission, which the gateway sends until the session is ready.
-            // This session's readiness is already durable, so persisting it
-            // again would only take the sandbox lock.
-            if state
-                .supervisor_sessions
-                .is_session_runtime_ready(sandbox_id, session_id)
-            {
-                return true;
-            }
-            // A polling session has no streamed admission to require.
-            if !mark_supervisor_initialized(
-                state,
-                sandbox_id,
-                session_id,
-                instance_id,
-                session.pushes_config,
-            )
-            .await
-            {
-                // The supervisor reports readiness again only after its next
-                // admission, which an unchanged configuration never sends, and
-                // the provisioning deadline would reclaim the running workload.
-                // Close the session so the reconnect reports readiness again,
-                // as a failed ready-on-accept registration does.
-                warn!(
-                    sandbox_id,
-                    session_id, "failed to persist supervisor runtime readiness; closing session"
-                );
-                return false;
-            }
-        }
         _ => {
             warn!(
                 sandbox_id = %sandbox_id,
@@ -3190,49 +3026,6 @@ async fn handle_supervisor_message(
         }
     }
     true
-}
-
-async fn mark_supervisor_initialized(
-    state: &Arc<ServerState>,
-    sandbox_id: &str,
-    session_id: &str,
-    instance_id: &str,
-    require_activated_configuration: bool,
-) -> bool {
-    if !state
-        .supervisor_sessions
-        .is_current_session(sandbox_id, session_id)
-    {
-        return false;
-    }
-    let persisted = if require_activated_configuration {
-        state
-            .compute
-            .supervisor_runtime_ready(sandbox_id, instance_id)
-            .await
-    } else {
-        state
-            .compute
-            .supervisor_session_connected(sandbox_id, instance_id)
-            .await
-    };
-    if let Err(err) = persisted {
-        warn!(
-            sandbox_id,
-            session_id,
-            error = %err,
-            "supervisor session: failed to mark sandbox initialized"
-        );
-        false
-    } else if state
-        .supervisor_sessions
-        .mark_runtime_ready(sandbox_id, session_id)
-    {
-        state.telemetry.sandbox_session_connected(sandbox_id);
-        true
-    } else {
-        false
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -3317,11 +3110,6 @@ mod tests {
     ) -> OwnerGuard {
         let mut sandbox = sandbox_record(sandbox_id, sandbox_id);
         sandbox.set_phase(SandboxPhase::Ready as i32);
-        // Runtime readiness records the supervisor instance durably.
-        sandbox
-            .status
-            .get_or_insert_with(Default::default)
-            .main_process_instance_id = "old-instance".into();
         state.store.put_message(&sandbox).await.unwrap();
         let (tx, _rx) = mpsc::channel(1);
         state.supervisor_sessions.register(
