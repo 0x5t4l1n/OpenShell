@@ -48,6 +48,7 @@ let
           playbooks = [
             "ansible/playbooks/nextest.yaml"
             "ansible/playbooks/docker.yaml"
+            "ansible/playbooks/cdi.yaml"
           ];
         };
       }
