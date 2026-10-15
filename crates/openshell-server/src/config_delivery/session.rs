@@ -27,7 +27,6 @@ use tonic::Status;
 use tracing::{debug, warn};
 use uuid::Uuid;
 
-use super::result_writer::{self, PolicyResult};
 use super::{DeliveryDisposition, MAX_SUPERVISOR_CONFIG_MESSAGE_BYTES, SupervisorConfig};
 use crate::ServerState;
 use crate::auth::principal::Principal;
@@ -107,6 +106,13 @@ pub struct ConfigSessionState {
     pending: Option<SupervisorConfig>,
     /// The configuration the supervisor last applied.
     acknowledged: Option<ConfigFingerprint>,
+    /// The admission this session last persisted. A running workload's
+    /// admission is written again only when it changes, so a redelivered
+    /// configuration writes nothing.
+    persisted_admission: Option<SandboxConfigurationAdmission>,
+    /// A policy load result whose write failed. The supervisor reports a
+    /// load only once, so it is written again with the next result.
+    unrecorded_policy_load: Option<PolicyLoadResult>,
 }
 
 #[derive(Debug)]
@@ -146,6 +152,8 @@ impl ConfigSessionState {
             in_flight: None,
             pending: None,
             acknowledged: None,
+            persisted_admission: None,
+            unrecorded_policy_load: None,
         }
     }
 
@@ -230,10 +238,8 @@ impl ConfigSessionState {
         self.send(pending).ok()
     }
 
-    /// Forget the acknowledged configuration, so the next delivery is sent
-    /// even if unchanged.
-    fn reopen(&mut self) {
-        self.acknowledged = None;
+    fn admission_changed(&self, admission: &SandboxConfigurationAdmission) -> bool {
+        self.persisted_admission.as_ref() != Some(admission)
     }
 }
 
@@ -336,13 +342,52 @@ impl SupervisorSessionRegistry {
         }
     }
 
-    /// Let reconciliation redeliver an acknowledged configuration whose
-    /// result was never persisted, so the supervisor reports the result
-    /// again. The supervisor answers unchanged configuration as a duplicate.
-    pub(super) fn reopen_config(&self, sandbox_id: &str, session_id: &str) {
+    /// Whether persisting `admission` would change what this session last
+    /// persisted, or `None` once the session was replaced.
+    fn admission_changed(
+        &self,
+        sandbox_id: &str,
+        session_id: &str,
+        admission: &SandboxConfigurationAdmission,
+    ) -> Option<bool> {
+        self.with_config_session(sandbox_id, session_id, |session| {
+            session.is_none_or(|session| session.admission_changed(admission))
+        })
+    }
+
+    fn record_persisted_admission(
+        &self,
+        sandbox_id: &str,
+        session_id: &str,
+        admission: &SandboxConfigurationAdmission,
+    ) {
         self.with_config_session(sandbox_id, session_id, |session| {
             if let Some(session) = session {
-                session.reopen();
+                session.persisted_admission = Some(admission.clone());
+            }
+        });
+    }
+
+    fn take_unrecorded_policy_load(
+        &self,
+        sandbox_id: &str,
+        session_id: &str,
+    ) -> Option<PolicyLoadResult> {
+        self.with_config_session(sandbox_id, session_id, |session| {
+            session.and_then(|session| session.unrecorded_policy_load.take())
+        })
+        .flatten()
+    }
+
+    fn keep_unrecorded_policy_load(
+        &self,
+        sandbox_id: &str,
+        session_id: &str,
+        policy_load: PolicyLoadResult,
+    ) {
+        self.with_config_session(sandbox_id, session_id, |session| {
+            if let Some(session) = session {
+                session.unrecorded_policy_load = Some(policy_load);
             }
         });
     }
@@ -510,26 +555,46 @@ pub async fn handle_config_update_result(
             return !completed.bootstrap;
         }
     };
-    let recorded = match record_or_queue_policy_result(
-        state,
-        sandbox_id,
-        session_id,
-        result.policy_load.as_ref(),
-    )
-    .await
-    {
-        Ok(()) => true,
-        Err(error) => {
-            warn!(
-                sandbox_id,
-                session_id,
-                error = %error,
-                "failed to persist supervisor policy result"
-            );
-            false
+    // A load whose write failed earlier goes first, so a newer one that
+    // also fails is the one kept.
+    let mut recorded = true;
+    let policy_loads = registry
+        .take_unrecorded_policy_load(sandbox_id, session_id)
+        .into_iter()
+        .chain(result.policy_load.clone());
+    for policy_load in policy_loads {
+        match record_policy_load(state, sandbox_id, &policy_load).await {
+            Ok(()) => {}
+            // The revision is gone, so there is nothing left to record.
+            Err(error) if error.code() == tonic::Code::NotFound => {
+                debug!(
+                    sandbox_id,
+                    session_id,
+                    version = policy_load.version,
+                    "dropped policy result for a missing revision"
+                );
+            }
+            Err(error) => {
+                warn!(
+                    sandbox_id,
+                    session_id,
+                    error = %error,
+                    "failed to persist supervisor policy result"
+                );
+                registry.keep_unrecorded_policy_load(sandbox_id, session_id, policy_load);
+                recorded = false;
+            }
         }
+    }
+    // A running workload no longer waits for admission, so its supervisor
+    // gets no acknowledgement.
+    let admitted = if registry.is_session_runtime_ready(sandbox_id, session_id) {
+        persist_running_admission(session, &admission).await
+    } else {
+        persist_and_ack_admission(session, &admission).await != AdmissionAck::Failed
     };
-    let admitted = persist_and_ack_admission(session, &admission).await != AdmissionAck::Failed;
+    // An unpersisted result leaves the configuration unacknowledged, so
+    // reconciliation delivers it again and the supervisor reports it again.
     registry.finalize_config_update(sandbox_id, session_id, &completed, recorded && admitted);
     admitted || !completed.bootstrap
 }
@@ -555,37 +620,53 @@ fn record_apply_result(sandbox_id: &str, outcome: ConfigApplyOutcome, result: &C
     }
 }
 
-/// Record the sandbox policy load result an update reported. A running
-/// workload's result is queued for the result writer, so a fleet-wide
-/// fanout does not queue every session on the compute sandbox lock ahead of
-/// user mutations.
-async fn record_or_queue_policy_result(
+/// Record a sandbox policy load result. The supervisor reports one only
+/// when an update changed the sandbox policy, as polling does.
+async fn record_policy_load(
     state: &Arc<ServerState>,
     sandbox_id: &str,
-    session_id: &str,
-    policy_load: Option<&PolicyLoadResult>,
+    policy_load: &PolicyLoadResult,
 ) -> Result<(), Status> {
-    let Some(policy_load) = policy_load else {
-        return Ok(());
-    };
-    let policy = PolicyResult {
-        version: policy_load.version,
-        loaded: policy_load.loaded,
-        error: (!policy_load.loaded).then(|| policy_load.error.clone()),
-    };
-    if !state.supervisor_sessions.is_runtime_ready(sandbox_id) {
-        return crate::grpc::policy::record_policy_apply_result(
-            state,
-            sandbox_id,
-            policy.version,
-            policy.loaded,
-            policy.error.as_deref(),
-            "stream",
-        )
-        .await;
+    crate::grpc::policy::record_policy_apply_result(
+        state,
+        sandbox_id,
+        policy_load.version,
+        policy_load.loaded,
+        (!policy_load.loaded).then_some(policy_load.error.as_str()),
+        "stream",
+    )
+    .await
+}
+
+/// Persist a running workload's admission when it differs from the one this
+/// session last persisted.
+async fn persist_running_admission(
+    session: &AcceptedSession,
+    admission: &SandboxConfigurationAdmission,
+) -> bool {
+    let AcceptedSession {
+        state,
+        sandbox_id,
+        session_id,
+        instance_id,
+        ..
+    } = session;
+    let registry = &state.supervisor_sessions;
+    match registry.admission_changed(sandbox_id, session_id, admission) {
+        None => return false,
+        Some(false) => return true,
+        Some(true) => {}
     }
-    result_writer::queue_policy_result(state, sandbox_id, session_id, policy);
-    Ok(())
+    if let Err(error) = state
+        .compute
+        .supervisor_session_admission(sandbox_id, instance_id, admission)
+        .await
+    {
+        warn!(sandbox_id, session_id, error = %error, "failed to persist supervisor configuration admission");
+        return false;
+    }
+    registry.record_persisted_admission(sandbox_id, session_id, admission);
+    true
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -625,13 +706,6 @@ async fn persist_and_ack_admission(
             return AdmissionAck::Failed;
         }
     }
-    // A running workload's admission no longer gates startup. Acknowledge it
-    // now and let the result writer persist it, so a fanout does not queue
-    // every session on the compute sandbox lock ahead of user mutations.
-    if state.supervisor_sessions.is_runtime_ready(sandbox_id) {
-        result_writer::queue_admission(state, sandbox_id, session_id, instance_id, admission);
-        return send_admission(session, admission).await;
-    }
     // Accepted admission lets a pending workload start, so it must name the
     // current generation, as a polling startup report must. A running
     // workload already has a configuration, and later updates follow it.
@@ -664,6 +738,9 @@ async fn persist_and_ack_admission(
         warn!(sandbox_id, session_id, error = %error, "failed to persist supervisor configuration admission");
         return AdmissionAck::Failed;
     }
+    state
+        .supervisor_sessions
+        .record_persisted_admission(sandbox_id, session_id, admission);
     send_admission(session, admission).await
 }
 
@@ -1592,8 +1669,10 @@ mod tests {
                 retryable: true,
             }),
             admission: Some(admission),
+            // A duplicate changes no policy, so it reports no load.
             policy_load: (snapshot.policy_source == i32::from(PolicySource::Sandbox)
-                && snapshot.version > 0)
+                && snapshot.version > 0
+                && outcome != ConfigApplyOutcome::IgnoredDuplicate)
                 .then(|| PolicyLoadResult {
                     version: snapshot.version,
                     loaded: applied,
@@ -1649,18 +1728,24 @@ mod tests {
         (result, expected_configuration_admission(&snapshot))
     }
 
-    async fn wait_for_result_writer(state: &Arc<ServerState>) {
-        tokio::time::timeout(Duration::from_secs(5), async {
-            while !state.config_delivery.results.is_idle() {
-                tokio::time::sleep(Duration::from_millis(5)).await;
-            }
-        })
-        .await
-        .expect("result writer drains");
+    fn sandbox_admission(sandbox: &Sandbox) -> Option<&SandboxConfigurationAdmission> {
+        sandbox
+            .status
+            .as_ref()
+            .and_then(|status| status.configuration_admission.as_ref())
+    }
+
+    async fn stored_sandbox(state: &Arc<ServerState>, sandbox_id: &str) -> Sandbox {
+        state
+            .store
+            .get_message::<Sandbox>(sandbox_id)
+            .await
+            .unwrap()
+            .expect("sandbox")
     }
 
     #[tokio::test]
-    async fn running_workload_results_are_acknowledged_without_the_sandbox_lock() {
+    async fn running_workload_results_are_written_inline_without_an_acknowledgement() {
         use crate::policy_store::PolicyStoreExt as _;
 
         let sandbox_id = "sb-running-result";
@@ -1669,40 +1754,17 @@ mod tests {
         let (result, admission) =
             running_push_session_result(&state, sandbox_id, &tx, &mut rx).await;
 
-        // A user mutation holding the sandbox lock must not hold up the
-        // supervisor's acknowledgement.
-        let guard = crate::persistence::lock_order::branch(
-            state.compute.sandbox_mutation_guard_by_id(sandbox_id),
-        )
-        .await
-        .unwrap()
-        .expect("sandbox");
-        tokio::time::timeout(
-            Duration::from_secs(2),
-            handle_config_update_result(&accepted_session(&state, sandbox_id, tx.clone()), &result),
-        )
-        .await
-        .expect("result is acknowledged while the sandbox lock is held");
-        let Some(gateway_message::Payload::ConfigurationAdmission(sent)) =
-            rx.recv().await.expect("admission").payload
-        else {
-            panic!("expected configuration admission");
-        };
-        assert_eq!(sent, admission);
-        drop(guard);
+        assert!(
+            handle_config_update_result(&accepted_session(&state, sandbox_id, tx.clone()), &result)
+                .await
+        );
 
-        wait_for_result_writer(&state).await;
-        let sandbox = state
-            .store
-            .get_message::<Sandbox>(sandbox_id)
-            .await
-            .unwrap()
-            .expect("sandbox");
+        assert!(
+            rx.try_recv().is_err(),
+            "a running workload's supervisor needs no admission"
+        );
         assert_eq!(
-            sandbox
-                .status
-                .as_ref()
-                .and_then(|status| status.configuration_admission.as_ref()),
+            sandbox_admission(&stored_sandbox(&state, sandbox_id).await),
             Some(&admission)
         );
         let policy = state
@@ -1715,27 +1777,84 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn result_writer_skips_admissions_from_replaced_sessions() {
+    async fn running_workload_admission_is_written_when_it_changes() {
+        let sandbox_id = "sb-running-admission";
+        let state = push_state_with_sandbox(sandbox_id).await;
+        let (tx, mut rx) = mpsc::channel(4);
+        register_running_push_session(&state, sandbox_id, &tx);
+        let session = accepted_session(&state, sandbox_id, tx);
+        // No sandbox policy, so the admission is the only result to persist.
+        let snapshot = |config_revision| SandboxConfigSnapshot {
+            config_revision,
+            policy_source: PolicySource::Unspecified.into(),
+            ..sandbox_policy_snapshot()
+        };
+        let mut report = |config_revision, outcome| {
+            deliver_and_report(
+                &state,
+                sandbox_id,
+                &mut rx,
+                &snapshot(config_revision),
+                outcome,
+            )
+        };
+        let resource_version = |sandbox: &Sandbox| {
+            sandbox
+                .metadata
+                .as_ref()
+                .map(|metadata| metadata.resource_version)
+        };
+
+        let rejected = report(7, ConfigApplyOutcome::FailedRetainedLastKnownGood);
+        assert!(handle_config_update_result(&session, &rejected).await);
+        let stored = stored_sandbox(&state, sandbox_id).await;
+        assert_eq!(
+            sandbox_admission(&stored).map(|admission| admission.state),
+            Some(i32::from(
+                openshell_core::proto::ConfigurationAdmissionState::Rejected
+            ))
+        );
+
+        // The unacknowledged configuration is delivered again and rejected
+        // again, which leaves the stored admission alone.
+        let redelivered = report(7, ConfigApplyOutcome::FailedRetainedLastKnownGood);
+        assert!(handle_config_update_result(&session, &redelivered).await);
+        assert_eq!(
+            resource_version(&stored_sandbox(&state, sandbox_id).await),
+            resource_version(&stored)
+        );
+
+        let accepted = report(8, ConfigApplyOutcome::Applied);
+        assert!(handle_config_update_result(&session, &accepted).await);
+        let stored = stored_sandbox(&state, sandbox_id).await;
+        let admission = sandbox_admission(&stored).expect("admission");
+        assert_eq!(
+            admission.state,
+            i32::from(openshell_core::proto::ConfigurationAdmissionState::Accepted)
+        );
+        assert_eq!(admission.config_revision, 8);
+    }
+
+    #[tokio::test]
+    async fn replaced_session_result_persists_nothing() {
         let sandbox_id = "sb-replaced-result";
         let state = push_state_with_sandbox(sandbox_id).await;
         let (tx, mut rx) = mpsc::channel(4);
-        let (_, admission) = running_push_session_result(&state, sandbox_id, &tx, &mut rx).await;
+        let (result, _) = running_push_session_result(&state, sandbox_id, &tx, &mut rx).await;
+        let (replacement_tx, _replacement_rx) = mpsc::channel(4);
+        state.supervisor_sessions.register_with_mode(
+            sandbox_id.into(),
+            "session-2".into(),
+            replacement_tx,
+            make_shutdown(),
+            SessionMode::Push,
+        );
 
-        result_writer::queue_admission(&state, sandbox_id, "session-0", "instance-0", &admission);
-        wait_for_result_writer(&state).await;
-
-        let sandbox = state
-            .store
-            .get_message::<Sandbox>(sandbox_id)
-            .await
-            .unwrap()
-            .expect("sandbox");
         assert!(
-            sandbox
-                .status
-                .as_ref()
-                .and_then(|status| status.configuration_admission.as_ref())
-                .is_none(),
+            !handle_config_update_result(&accepted_session(&state, sandbox_id, tx), &result).await
+        );
+        assert!(
+            sandbox_admission(&stored_sandbox(&state, sandbox_id).await).is_none(),
             "an admission from a replaced session must not be persisted"
         );
     }
@@ -1777,7 +1896,6 @@ BEGIN SELECT RAISE(ABORT, 'database unavailable'); END;
             ConfigApplyOutcome::Applied,
         );
         handle_config_update_result(&session, &applied).await;
-        wait_for_result_writer(state).await;
         state.store.execute_for_test(RESTORE_RESULT_WRITES).await;
 
         // The supervisor already applied the configuration and reports a
@@ -1790,7 +1908,6 @@ BEGIN SELECT RAISE(ABORT, 'database unavailable'); END;
             ConfigApplyOutcome::IgnoredDuplicate,
         );
         handle_config_update_result(&session, &duplicate).await;
-        wait_for_result_writer(state).await;
     }
 
     #[tokio::test]
@@ -1875,15 +1992,14 @@ BEGIN SELECT RAISE(ABORT, 'database unavailable'); END;
             )
             .await
             .unwrap();
-        record_or_queue_policy_result(
+        record_policy_load(
             &state,
             "sb-policy-result",
-            "session-1",
-            Some(&PolicyLoadResult {
+            &PolicyLoadResult {
                 version: 3,
                 loaded: false,
                 error: "x".repeat(2_000),
-            }),
+            },
         )
         .await
         .unwrap();

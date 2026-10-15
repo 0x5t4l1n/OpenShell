@@ -3,7 +3,6 @@
 
 //! Build and deliver complete supervisor configuration.
 
-mod result_writer;
 pub mod session;
 mod task;
 
@@ -137,8 +136,6 @@ pub struct ConfigDelivery {
     /// notification arrived since that task last sent one.
     peer_notifies: Mutex<HashMap<PeerNotifyTarget, bool>>,
     peer_notify_permits: Arc<Semaphore>,
-    /// Admission and policy-result writes for running workloads.
-    results: result_writer::ResultWriter,
 }
 
 /// This replica's push sessions and the publications that looked for them.
@@ -174,7 +171,6 @@ impl ConfigDelivery {
             builds: Arc::new(Semaphore::new(builds)),
             peer_notifies: Mutex::new(HashMap::new()),
             peer_notify_permits: Arc::new(Semaphore::new(MAX_CONCURRENT_PEER_NOTIFIES)),
-            results: result_writer::ResultWriter::default(),
         }
     }
 
@@ -185,14 +181,6 @@ impl ConfigDelivery {
     #[cfg(test)]
     fn has_session(&self, sandbox_id: &str) -> bool {
         self.sessions().records.contains_key(sandbox_id)
-    }
-
-    /// Whether `session_id` is the sandbox's registered push session.
-    fn is_registered(&self, sandbox_id: &str, session_id: &str) -> bool {
-        self.sessions()
-            .records
-            .get(sandbox_id)
-            .is_some_and(|record| record.session_id == session_id)
     }
 
     /// Delivery is best effort beside the session lifecycle, so a poisoned
@@ -314,22 +302,17 @@ pub fn register_session(state: &Arc<ServerState>, registration: Registration) {
 }
 
 pub fn unregister_session(state: &ServerState, sandbox_id: &str, session_id: &str) {
+    let mut sessions = state.config_delivery.sessions();
+    if sessions
+        .records
+        .get(sandbox_id)
+        .is_none_or(|record| record.session_id != session_id)
     {
-        let mut sessions = state.config_delivery.sessions();
-        if sessions
-            .records
-            .get(sandbox_id)
-            .is_none_or(|record| record.session_id != session_id)
-        {
-            return;
-        }
-        if let Some(record) = sessions.records.remove(sandbox_id) {
-            record.close();
-        }
+        return;
     }
-    // After releasing the sessions lock: the result writer takes it while
-    // holding its own queue lock.
-    state.config_delivery.results.forget_recorded(sandbox_id);
+    if let Some(record) = sessions.records.remove(sandbox_id) {
+        record.close();
+    }
 }
 
 /// Builds and delivers a session's configuration.

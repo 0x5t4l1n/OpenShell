@@ -14012,8 +14012,9 @@ type GatewayMessage_StartupConfigCandidate struct {
 }
 
 type GatewayMessage_ConfigurationAdmission struct {
-	// Durable gateway acknowledgement of streamed configuration admission.
-	// The supervisor must not launch the workload until this is ACCEPTED.
+	// Durable gateway acknowledgement of streamed configuration admission,
+	// sent until the session's workload runs. The supervisor must not launch
+	// the workload until this is ACCEPTED.
 	ConfigurationAdmission *SandboxConfigurationAdmission `protobuf:"bytes,9,opt,name=configuration_admission,json=configurationAdmission,proto3,oneof"`
 }
 

@@ -3149,9 +3149,10 @@ async fn handle_supervisor_message(
             }
         }
         Some(supervisor_message::Payload::RuntimeReady(_)) => {
-            // A supervisor reports readiness again after every accepted
-            // admission. This session's readiness is already durable, so
-            // persisting it again would only take the sandbox lock.
+            // A supervisor reports readiness again after each accepted
+            // admission, which the gateway sends until the session is ready.
+            // This session's readiness is already durable, so persisting it
+            // again would only take the sandbox lock.
             if state
                 .supervisor_sessions
                 .is_session_runtime_ready(sandbox_id, session_id)

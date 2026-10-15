@@ -3125,8 +3125,9 @@ message GatewayMessage {
     SessionRedirect session_redirect = 6;
     ConfigUpdate config_update = 7;
     StartupConfigCandidate startup_config_candidate = 8;
-    // Durable gateway acknowledgement of streamed configuration admission.
-    // The supervisor must not launch the workload until this is ACCEPTED.
+    // Durable gateway acknowledgement of streamed configuration admission,
+    // sent until the session's workload runs. The supervisor must not launch
+    // the workload until this is ACCEPTED.
     SandboxConfigurationAdmission configuration_admission = 9;
   }
 }

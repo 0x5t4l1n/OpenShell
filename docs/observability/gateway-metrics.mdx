@@ -265,8 +265,6 @@ empty in poll mode, where `GetSandboxConfig` and
 | `openshell_supervisor_policy_apply_results_total` | Counter | `source`, `outcome` | Sandbox policy load results that supervisors reported. `source` is `polling` or `stream`, and `outcome` is `loaded` or `failed`. |
 | `openshell_supervisor_config_bootstrap_total` | Counter | `outcome` | Session bootstraps: `built` or `build_failed`. |
 | `openshell_supervisor_config_peer_notifications_total` | Counter | `outcome` | Notifications sent to the replica that owns a sandbox's session. |
-| `openshell_supervisor_config_result_writes_total` | Counter | `kind`, `outcome` | Admission and policy-result writes for running workloads, which a single background writer persists after the supervisor is acknowledged. |
-| `openshell_supervisor_config_result_writes_pending` | Gauge | None | Sandboxes with result writes waiting for the background writer. |
 
 The labels take these values:
 
@@ -285,13 +283,6 @@ The labels take these values:
   `ConfigApplyOutcome` name, such as `CONFIG_APPLY_OUTCOME_APPLIED`.
 - On peer notifications, `outcome` is `accepted`, `stale_owner`,
   `unsupported_peer`, `peer_error`, or `timeout`.
-- On result writes, `kind` is `admission` or `policy_result`, and `outcome`
-  is `written`, `coalesced` (a newer admission for the sandbox replaced a
-  queued one), `duplicate` (a policy result repeated the last one written or
-  queued for the sandbox), `stale_session` (the session ended before its
-  admission was written), `retried`, or `dropped` (retries ran out; the next
-  reconciliation redelivers the sandbox configuration so the supervisor
-  reports the result again).
 
 ## Gateway Interceptor Metrics
 
