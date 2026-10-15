@@ -5,8 +5,9 @@
 //!
 //! The first connection prepares the startup policy against the workload
 //! image. Every session then starts from a bootstrap update, and afterwards
-//! holds at most one unacknowledged update. Session lifecycle and relays stay
-//! in `supervisor_session`.
+//! holds at most one unanswered update. Updates share the session's ordered
+//! outbound channel with its other messages. Session lifecycle and relays
+//! stay in `supervisor_session`.
 
 use std::sync::Arc;
 #[cfg(test)]
@@ -27,9 +28,7 @@ use tracing::{debug, warn};
 use uuid::Uuid;
 
 use super::result_writer::{self, PolicyResult};
-use super::{
-    ConfigSlots, DeliveryDisposition, MAX_SUPERVISOR_CONFIG_MESSAGE_BYTES, SupervisorConfig,
-};
+use super::{DeliveryDisposition, MAX_SUPERVISOR_CONFIG_MESSAGE_BYTES, SupervisorConfig};
 use crate::ServerState;
 use crate::auth::principal::Principal;
 use crate::grpc::policy::{
@@ -49,9 +48,6 @@ const STARTUP_POLICY_REPAIR_TIMEOUT: Duration = Duration::from_mins(5);
 /// sandbox changes on this gateway wake it, so this picks up a global policy
 /// or a change saved on another replica.
 const STARTUP_POLICY_REPAIR_RECHECK: Duration = Duration::from_secs(1);
-/// How long a session holds newer configuration while waiting for the
-/// supervisor to acknowledge the update it already has.
-const CONFIG_ACK_TIMEOUT: Duration = Duration::from_mins(1);
 
 #[cfg(test)]
 static FAIL_NEXT_ADMISSION_PERSISTENCE_FOR_SANDBOX: std::sync::LazyLock<Mutex<Option<String>>> =
@@ -101,10 +97,11 @@ impl ConfigFingerprint {
 
 /// Delivery state of a session that applies and acknowledges streamed
 /// configuration. One update is in flight at a time, starting with the
-/// bootstrap.
+/// bootstrap, until the supervisor answers it or the session closes.
 #[derive(Debug)]
 pub struct ConfigSessionState {
-    slots: Arc<ConfigSlots>,
+    /// The session's ordered outbound channel.
+    tx: mpsc::Sender<GatewayMessage>,
     in_flight: Option<InFlightConfigUpdate>,
     /// Newest configuration built while an update was in flight.
     pending: Option<SupervisorConfig>,
@@ -117,8 +114,7 @@ struct InFlightConfigUpdate {
     update_id: String,
     fingerprint: ConfigFingerprint,
     admission: SandboxConfigurationAdmission,
-    /// The session's bootstrap. It stays in flight until its result arrives
-    /// or the session closes.
+    /// The session's bootstrap, whose result completes session setup.
     bootstrap: bool,
     sent_at: Instant,
 }
@@ -139,21 +135,14 @@ struct CompletedConfigUpdate {
 /// An update to queue on the session stream once the registry lock is
 /// released.
 struct Outgoing {
-    slots: Arc<ConfigSlots>,
+    tx: mpsc::Sender<GatewayMessage>,
     message: GatewayMessage,
 }
 
-impl Outgoing {
-    /// Returns true when an unsent update was replaced.
-    fn send(self) -> bool {
-        self.slots.replace(self.message)
-    }
-}
-
 impl ConfigSessionState {
-    pub fn new(slots: Arc<ConfigSlots>) -> Self {
+    pub fn new(tx: mpsc::Sender<GatewayMessage>) -> Self {
         Self {
-            slots,
+            tx,
             in_flight: None,
             pending: None,
             acknowledged: None,
@@ -167,16 +156,12 @@ impl ConfigSessionState {
             return Err(DeliveryDisposition::SuppressedUnchanged);
         }
         // Hold the configuration until the supervisor answers the update it
-        // already has, bounded so a lost result cannot stall the session.
-        if self
-            .in_flight
-            .as_ref()
-            .is_some_and(|update| update.bootstrap || update.sent_at.elapsed() < CONFIG_ACK_TIMEOUT)
-        {
+        // already has. The supervisor answers every update in order, so an
+        // answer that never comes means the session is gone.
+        if self.in_flight.is_some() {
             self.pending = Some(config);
             return Err(DeliveryDisposition::Coalesced);
         }
-        self.pending = None;
         self.send(config)
     }
 
@@ -190,7 +175,7 @@ impl ConfigSessionState {
         }
         self.in_flight = Some(in_flight);
         Ok(Outgoing {
-            slots: Arc::clone(&self.slots),
+            tx: self.tx.clone(),
             message,
         })
     }
@@ -205,10 +190,11 @@ impl ConfigSessionState {
                 "configuration result does not match the in-flight update",
             ));
         }
+        // An outcome this gateway does not know did not take effect here.
         let outcome = ConfigApplyOutcome::try_from(result.outcome)
             .ok()
             .filter(|outcome| *outcome != ConfigApplyOutcome::Unspecified)
-            .ok_or_else(|| Status::invalid_argument("configuration result outcome is required"))?;
+            .unwrap_or(ConfigApplyOutcome::Unsupported);
         Ok(CompletedConfigUpdate {
             update_id: in_flight.update_id.clone(),
             fingerprint: in_flight.fingerprint.clone(),
@@ -270,12 +256,30 @@ impl SupervisorSessionRegistry {
             None => DeliveryDisposition::NoActiveSession,
             Some(Err(disposition)) => disposition,
             Some(Ok(outgoing)) => {
-                if outgoing.send() {
-                    DeliveryDisposition::Replaced
-                } else {
+                if self.send_or_close(sandbox_id, session_id, outgoing) {
                     DeliveryDisposition::Queued
+                } else {
+                    DeliveryDisposition::StreamClosed
                 }
             }
+        }
+    }
+
+    /// Queue `outgoing` on the session's stream. A stream too full to take
+    /// it has stopped draining, so the session closes and its supervisor
+    /// reconnects with a fresh bootstrap. A closed stream is already ending.
+    fn send_or_close(&self, sandbox_id: &str, session_id: &str, outgoing: Outgoing) -> bool {
+        match outgoing.tx.try_send(outgoing.message) {
+            Ok(()) => true,
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                warn!(
+                    sandbox_id,
+                    session_id, "supervisor session stopped draining configuration; closing it"
+                );
+                self.close_if_current(sandbox_id, session_id);
+                false
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => false,
         }
     }
 
@@ -328,7 +332,7 @@ impl SupervisorSessionRegistry {
             })
             .flatten()
         {
-            outgoing.send();
+            self.send_or_close(sandbox_id, session_id, outgoing);
         }
     }
 
@@ -455,8 +459,9 @@ fn validate_configuration_admission(
 
 /// Record the result of the update in flight, including the bootstrap.
 /// Nothing is persisted for an invalid result. Returns false when the
-/// session must close: a bootstrap whose result is invalid or whose
-/// admission could not be persisted.
+/// session must close: a result that answers no update in flight, or a
+/// bootstrap whose result is invalid or whose admission could not be
+/// persisted.
 pub async fn handle_config_update_result(
     session: &AcceptedSession,
     result: &ConfigUpdateResult,
@@ -471,13 +476,15 @@ pub async fn handle_config_update_result(
     let completed = match registry.complete_config_update(sandbox_id, session_id, result) {
         Ok(completed) => completed,
         Err(error) => {
-            debug!(
+            // The supervisor answers each update once, in order, so this
+            // session and its supervisor disagree; a reconnect resets both.
+            warn!(
                 sandbox_id,
                 session_id,
                 error = %error,
-                "ignored unmatched supervisor configuration result"
+                "supervisor configuration result answers no update in flight; closing the session"
             );
-            return true;
+            return false;
         }
     };
     histogram!(
@@ -665,7 +672,7 @@ async fn send_admission(
     admission: &SandboxConfigurationAdmission,
 ) -> AdmissionAck {
     if session
-        .control
+        .tx
         .send(GatewayMessage {
             payload: Some(gateway_message::Payload::ConfigurationAdmission(
                 admission.clone(),
@@ -1011,7 +1018,6 @@ pub fn applied_result(update: &ConfigUpdate) -> ConfigUpdateResult {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config_delivery::SessionOutbound;
     use crate::grpc::test_support::StreamFeatures;
     use crate::supervisor_session::SessionMode;
     use openshell_core::proto::{
@@ -1068,7 +1074,6 @@ mod tests {
             sandbox_id: sandbox_id.into(),
             session_id: "session-1".into(),
             instance_id: "instance-1".into(),
-            control: tx.clone(),
             tx,
             supports_session_redirect: false,
             pushes_config: true,
@@ -1122,21 +1127,32 @@ mod tests {
         assert_eq!(decoded, result);
     }
 
+    /// Register a streamed-apply session and return its outbound channel.
     fn register_apply_session_with_outbound(
         registry: &SupervisorSessionRegistry,
         sandbox_id: &str,
         session_id: &str,
-    ) -> (mpsc::Sender<GatewayMessage>, SessionOutbound) {
-        let (tx, rx) = mpsc::channel(4);
-        let slots = Arc::new(ConfigSlots::default());
+    ) -> (mpsc::Sender<GatewayMessage>, mpsc::Receiver<GatewayMessage>) {
+        let (tx, rx) = mpsc::channel(16);
         registry.register_with_mode(
             sandbox_id.into(),
             session_id.into(),
             tx.clone(),
             make_shutdown(),
-            SessionMode::Push(Arc::clone(&slots)),
+            SessionMode::Push,
         );
-        (tx, SessionOutbound::new(rx, slots))
+        (tx, rx)
+    }
+
+    /// The next configuration update queued on a session's channel, skipping
+    /// any admission sent ahead of it.
+    fn take_update(outbound: &mut mpsc::Receiver<GatewayMessage>) -> Option<ConfigUpdate> {
+        while let Ok(message) = outbound.try_recv() {
+            if let Some(gateway_message::Payload::ConfigUpdate(update)) = message.payload {
+                return Some(update);
+            }
+        }
+        None
     }
 
     fn sent_update(message: GatewayMessage) -> ConfigUpdate {
@@ -1179,8 +1195,6 @@ mod tests {
 
     #[tokio::test]
     async fn config_delivery_holds_newer_configuration_until_acknowledged() {
-        use tokio_stream::StreamExt as _;
-
         let registry = SupervisorSessionRegistry::new();
         let (_tx, mut outbound) =
             register_apply_session_with_outbound(&registry, "sb-1", "session-1");
@@ -1195,7 +1209,7 @@ mod tests {
                 DeliveryDisposition::Coalesced
             );
         }
-        let first = sent_update(outbound.next().await.unwrap().unwrap());
+        let first = sent_update(outbound.recv().await.unwrap());
         assert_eq!(config_revision(&first), 1);
         assert!(first.provider_environment.is_some());
 
@@ -1209,7 +1223,7 @@ mod tests {
         registry.finalize_config_update("sb-1", "session-1", &completed, true);
 
         // The acknowledgement releases only the newest held configuration.
-        let next = sent_update(outbound.next().await.unwrap().unwrap());
+        let next = sent_update(outbound.recv().await.unwrap());
         assert_eq!(config_revision(&next), 3);
         assert_ne!(next.update_id, first.update_id);
         assert_eq!(
@@ -1221,8 +1235,6 @@ mod tests {
 
     #[tokio::test]
     async fn config_delivery_never_crosses_into_a_replacement_session() {
-        use tokio_stream::StreamExt as _;
-
         let registry = SupervisorSessionRegistry::new();
         let (_old_tx, _old_outbound) =
             register_apply_session_with_outbound(&registry, "sb-1", "old-session");
@@ -1237,7 +1249,7 @@ mod tests {
             registry.deliver_config("sb-1", "new-session", config(2)),
             DeliveryDisposition::Queued
         );
-        let update = sent_update(new_outbound.next().await.unwrap().unwrap());
+        let update = sent_update(new_outbound.recv().await.unwrap());
         assert_eq!(config_revision(&update), 2);
     }
 
@@ -1254,8 +1266,6 @@ mod tests {
 
     #[tokio::test]
     async fn config_delivery_rejects_oversized_messages() {
-        use tokio_stream::StreamExt as _;
-
         let registry = SupervisorSessionRegistry::new();
         let (tx, mut outbound) =
             register_apply_session_with_outbound(&registry, "sb-1", "session-1");
@@ -1277,26 +1287,20 @@ mod tests {
         );
         drop(tx);
         registry.remove_if_current("sb-1", "session-1");
-        let _ = outbound.next().await;
-        assert!(outbound.next().await.is_none());
+        assert_eq!(
+            config_revision(&sent_update(outbound.recv().await.unwrap())),
+            2
+        );
+        assert!(outbound.recv().await.is_none());
     }
 
-    /// Register a streamed-apply session and return its configuration slots.
+    /// Register a streamed-apply session and return its outbound channel.
     fn register_apply_session(
         registry: &SupervisorSessionRegistry,
         sandbox_id: &str,
         session_id: &str,
-    ) -> Arc<ConfigSlots> {
-        let (tx, _rx) = mpsc::channel(1);
-        let slots = Arc::new(ConfigSlots::default());
-        registry.register_with_mode(
-            sandbox_id.into(),
-            session_id.into(),
-            tx,
-            make_shutdown(),
-            SessionMode::Push(Arc::clone(&slots)),
-        );
-        slots
+    ) -> mpsc::Receiver<GatewayMessage> {
+        register_apply_session_with_outbound(registry, sandbox_id, session_id).1
     }
 
     async fn push_state() -> Arc<ServerState> {
@@ -1338,7 +1342,7 @@ mod tests {
         sandbox_id: &str,
         session_id: &str,
         bootstrap: SupervisorConfig,
-    ) -> (Arc<ConfigSlots>, ConfigUpdate) {
+    ) -> (mpsc::Receiver<GatewayMessage>, ConfigUpdate) {
         let slots = register_apply_session(registry, sandbox_id, session_id);
         let (update, in_flight) = bootstrap_update(bootstrap);
         registry.begin_config_bootstrap(sandbox_id, session_id, in_flight);
@@ -1348,7 +1352,7 @@ mod tests {
     #[test]
     fn rebuild_racing_the_bootstrap_waits_and_is_dropped_when_unchanged() {
         let registry = SupervisorSessionRegistry::new();
-        let (slots, bootstrap) =
+        let (mut slots, bootstrap) =
             register_bootstrapped_session(&registry, "sb-1", "session-1", config(7));
 
         // The configuration the bootstrap carried is held, then dropped.
@@ -1363,14 +1367,14 @@ mod tests {
             &bootstrap,
             ConfigApplyOutcome::Applied,
         );
-        assert!(slots.take_for_test().is_none());
+        assert!(take_update(&mut slots).is_none());
         assert_eq!(
             registry.deliver_config("sb-1", "session-1", config(7)),
             DeliveryDisposition::SuppressedUnchanged
         );
 
         // Newer configuration held behind the bootstrap is sent once it lands.
-        let (slots, bootstrap) =
+        let (mut slots, bootstrap) =
             register_bootstrapped_session(&registry, "sb-1", "session-2", config(7));
         assert_eq!(
             registry.deliver_config("sb-1", "session-2", config(8)),
@@ -1383,30 +1387,42 @@ mod tests {
             &bootstrap,
             ConfigApplyOutcome::Applied,
         );
-        let released = sent_update(slots.take_for_test().expect("newer configuration is sent"));
+        let released = take_update(&mut slots).expect("newer configuration is sent");
         assert_eq!(config_revision(&released), 8);
     }
 
     #[test]
-    fn bootstrap_held_past_the_acknowledgement_timeout_keeps_newer_configuration() {
+    fn session_that_stops_draining_its_stream_is_closed() {
         let registry = SupervisorSessionRegistry::new();
-        let (_slots, _bootstrap) =
-            register_bootstrapped_session(&registry, "sb-1", "session-1", config(7));
-        registry.with_config_session("sb-1", "session-1", |session| {
-            let in_flight = session.unwrap().in_flight.as_mut().unwrap();
-            in_flight.sent_at -= CONFIG_ACK_TIMEOUT * 2;
-        });
+        let (tx, _rx) = mpsc::channel(1);
+        let (shutdown_tx, mut shutdown_rx) = oneshot::channel();
+        registry.register_with_mode(
+            "sb-1".into(),
+            "session-1".into(),
+            tx.clone(),
+            shutdown_tx,
+            SessionMode::Push,
+        );
+        tx.try_send(GatewayMessage::default()).unwrap();
+
         assert_eq!(
-            registry.deliver_config("sb-1", "session-1", config(8)),
-            DeliveryDisposition::Coalesced,
-            "only the bootstrap result can release the session"
+            registry.deliver_config("sb-1", "session-1", config(7)),
+            DeliveryDisposition::StreamClosed
+        );
+        assert!(
+            shutdown_rx.try_recv().is_ok(),
+            "the session's task is told to end"
+        );
+        assert!(
+            registry.is_current_session("sb-1", "session-1"),
+            "the task's cleanup removes the session and records the disconnect"
         );
     }
 
     #[test]
     fn bootstrap_result_acknowledges_only_an_applied_configuration() {
         let registry = SupervisorSessionRegistry::new();
-        let (slots, bootstrap) =
+        let (mut slots, bootstrap) =
             register_bootstrapped_session(&registry, "sb-1", "session-1", config(7));
         answer_bootstrap(
             &registry,
@@ -1420,9 +1436,9 @@ mod tests {
             DeliveryDisposition::Queued,
             "a failed bootstrap leaves its configuration eligible for repair"
         );
-        assert!(slots.take_for_test().is_some());
+        assert!(take_update(&mut slots).is_some());
 
-        let (slots, bootstrap) =
+        let (mut slots, bootstrap) =
             register_bootstrapped_session(&registry, "sb-1", "session-2", config(7));
         answer_bootstrap(
             &registry,
@@ -1435,19 +1451,19 @@ mod tests {
             registry.deliver_config("sb-1", "session-2", config(7)),
             DeliveryDisposition::SuppressedUnchanged
         );
-        assert!(slots.take_for_test().is_none());
+        assert!(take_update(&mut slots).is_none());
     }
 
     #[test]
     fn rejected_configuration_stays_eligible_for_reconciliation_until_applied() {
         let registry = SupervisorSessionRegistry::new();
-        let slots = register_apply_session(&registry, "sb-1", "session-1");
-        let report = |outcome| {
+        let mut slots = register_apply_session(&registry, "sb-1", "session-1");
+        let mut report = |outcome| {
             assert_eq!(
                 registry.deliver_config("sb-1", "session-1", config(7)),
                 DeliveryDisposition::Queued
             );
-            let update = sent_update(slots.take_for_test().expect("update"));
+            let update = take_update(&mut slots).expect("update");
             let completed = registry
                 .complete_config_update("sb-1", "session-1", &update_result(&update, outcome))
                 .unwrap();
@@ -1465,9 +1481,9 @@ mod tests {
     #[test]
     fn unmatched_result_leaves_the_update_in_flight() {
         let registry = SupervisorSessionRegistry::new();
-        let slots = register_apply_session(&registry, "sb-1", "session-1");
+        let mut slots = register_apply_session(&registry, "sb-1", "session-1");
         registry.deliver_config("sb-1", "session-1", config(7));
-        let update = sent_update(slots.take_for_test().expect("update"));
+        let update = take_update(&mut slots).expect("update");
         let mut stale = update_result(&update, ConfigApplyOutcome::Applied);
         stale.update_id = "other".into();
         assert!(
@@ -1475,16 +1491,31 @@ mod tests {
                 .complete_config_update("sb-1", "session-1", &stale)
                 .is_err()
         );
-        let mut unspecified = update_result(&update, ConfigApplyOutcome::Applied);
-        unspecified.outcome = ConfigApplyOutcome::Unspecified.into();
-        assert!(
-            registry
-                .complete_config_update("sb-1", "session-1", &unspecified)
-                .is_err()
-        );
         assert_eq!(
             registry.deliver_config("sb-1", "session-1", config(8)),
             DeliveryDisposition::Coalesced
+        );
+    }
+
+    #[test]
+    fn unknown_outcome_does_not_acknowledge_the_update() {
+        let registry = SupervisorSessionRegistry::new();
+        let mut slots = register_apply_session(&registry, "sb-1", "session-1");
+        for outcome in [ConfigApplyOutcome::Unspecified.into(), 1_000] {
+            registry.deliver_config("sb-1", "session-1", config(7));
+            let update = take_update(&mut slots).expect("update");
+            let mut result = update_result(&update, ConfigApplyOutcome::Applied);
+            result.outcome = outcome;
+            let completed = registry
+                .complete_config_update("sb-1", "session-1", &result)
+                .unwrap();
+            assert_eq!(completed.outcome, ConfigApplyOutcome::Unsupported);
+            registry.finalize_config_update("sb-1", "session-1", &completed, true);
+        }
+        assert_eq!(
+            registry.deliver_config("sb-1", "session-1", config(7)),
+            DeliveryDisposition::Queued,
+            "the configuration stays eligible for repair"
         );
     }
 
@@ -1519,27 +1550,26 @@ mod tests {
             .unwrap();
     }
 
-    /// Register `session-1` as the push session of a running workload.
+    /// Register `session-1`, streaming to `tx`, as the push session of a
+    /// running workload.
     fn register_running_push_session(
         state: &Arc<ServerState>,
         sandbox_id: &str,
         tx: &mpsc::Sender<GatewayMessage>,
-    ) -> Arc<ConfigSlots> {
+    ) {
         let (shutdown_tx, _shutdown_rx) = oneshot::channel();
-        let slots = Arc::new(ConfigSlots::default());
         state.supervisor_sessions.register_with_mode(
             sandbox_id.into(),
             "session-1".into(),
             tx.clone(),
             shutdown_tx,
-            SessionMode::Push(Arc::clone(&slots)),
+            SessionMode::Push,
         );
         assert!(
             state
                 .supervisor_sessions
                 .mark_runtime_ready_for_test(sandbox_id, "session-1")
         );
-        slots
     }
 
     /// What a supervisor reports for `update`: the admission its outcome
@@ -1581,7 +1611,7 @@ mod tests {
     fn deliver_and_report(
         state: &Arc<ServerState>,
         sandbox_id: &str,
-        slots: &ConfigSlots,
+        outbound: &mut mpsc::Receiver<GatewayMessage>,
         snapshot: &SandboxConfigSnapshot,
         outcome: ConfigApplyOutcome,
     ) -> ConfigUpdateResult {
@@ -1595,10 +1625,7 @@ mod tests {
                 .deliver_config(sandbox_id, "session-1", config),
             DeliveryDisposition::Queued
         );
-        reported_result(
-            &sent_update(slots.take_for_test().expect("update")),
-            outcome,
-        )
+        reported_result(&take_update(outbound).expect("update"), outcome)
     }
 
     /// Push a sandbox policy update to a running workload and return the
@@ -1607,14 +1634,15 @@ mod tests {
         state: &Arc<ServerState>,
         sandbox_id: &str,
         tx: &mpsc::Sender<GatewayMessage>,
+        outbound: &mut mpsc::Receiver<GatewayMessage>,
     ) -> (ConfigUpdateResult, SandboxConfigurationAdmission) {
         put_sandbox_policy_revision(state, sandbox_id).await;
-        let slots = register_running_push_session(state, sandbox_id, tx);
+        register_running_push_session(state, sandbox_id, tx);
         let snapshot = sandbox_policy_snapshot();
         let result = deliver_and_report(
             state,
             sandbox_id,
-            &slots,
+            outbound,
             &snapshot,
             ConfigApplyOutcome::Applied,
         );
@@ -1638,7 +1666,8 @@ mod tests {
         let sandbox_id = "sb-running-result";
         let state = push_state_with_sandbox(sandbox_id).await;
         let (tx, mut rx) = mpsc::channel(4);
-        let (result, admission) = running_push_session_result(&state, sandbox_id, &tx).await;
+        let (result, admission) =
+            running_push_session_result(&state, sandbox_id, &tx, &mut rx).await;
 
         // A user mutation holding the sandbox lock must not hold up the
         // supervisor's acknowledgement.
@@ -1689,8 +1718,8 @@ mod tests {
     async fn result_writer_skips_admissions_from_replaced_sessions() {
         let sandbox_id = "sb-replaced-result";
         let state = push_state_with_sandbox(sandbox_id).await;
-        let (tx, _rx) = mpsc::channel(4);
-        let (_, admission) = running_push_session_result(&state, sandbox_id, &tx).await;
+        let (tx, mut rx) = mpsc::channel(4);
+        let (_, admission) = running_push_session_result(&state, sandbox_id, &tx, &mut rx).await;
 
         result_writer::queue_admission(&state, sandbox_id, "session-0", "instance-0", &admission);
         wait_for_result_writer(&state).await;
@@ -1735,15 +1764,15 @@ BEGIN SELECT RAISE(ABORT, 'database unavailable'); END;
         snapshot: &SandboxConfigSnapshot,
         failing_writes: &'static str,
     ) {
-        let (tx, _rx) = mpsc::channel(4);
-        let slots = register_running_push_session(state, sandbox_id, &tx);
+        let (tx, mut rx) = mpsc::channel(4);
+        register_running_push_session(state, sandbox_id, &tx);
         let session = accepted_session(state, sandbox_id, tx);
 
         state.store.execute_for_test(failing_writes).await;
         let applied = deliver_and_report(
             state,
             sandbox_id,
-            &slots,
+            &mut rx,
             snapshot,
             ConfigApplyOutcome::Applied,
         );
@@ -1756,7 +1785,7 @@ BEGIN SELECT RAISE(ABORT, 'database unavailable'); END;
         let duplicate = deliver_and_report(
             state,
             sandbox_id,
-            &slots,
+            &mut rx,
             snapshot,
             ConfigApplyOutcome::IgnoredDuplicate,
         );
@@ -1905,15 +1934,14 @@ BEGIN SELECT RAISE(ABORT, 'database unavailable'); END;
     async fn failed_admission_persistence_does_not_suppress_unchanged_repair() {
         let sandbox_id = "sb-admission-persistence-retry";
         let state = push_state_with_sandbox(sandbox_id).await;
-        let (tx, _rx) = mpsc::channel(4);
+        let (tx, mut rx) = mpsc::channel(4);
         let (shutdown_tx, _shutdown_rx) = oneshot::channel();
-        let slots = Arc::new(ConfigSlots::default());
         state.supervisor_sessions.register_with_mode(
             sandbox_id.into(),
             "session-1".into(),
             tx.clone(),
             shutdown_tx,
-            SessionMode::Push(Arc::clone(&slots)),
+            SessionMode::Push,
         );
         let snapshot = SandboxConfigSnapshot {
             policy_source: PolicySource::Unspecified.into(),
@@ -1922,7 +1950,7 @@ BEGIN SELECT RAISE(ABORT, 'database unavailable'); END;
         let result = deliver_and_report(
             &state,
             sandbox_id,
-            &slots,
+            &mut rx,
             &snapshot,
             ConfigApplyOutcome::Applied,
         );
@@ -1943,10 +1971,7 @@ BEGIN SELECT RAISE(ABORT, 'database unavailable'); END;
             DeliveryDisposition::Queued,
             "a non-durable admission must leave the revision eligible for repair"
         );
-        assert!(matches!(
-            slots.take_for_test().expect("repair update").payload,
-            Some(gateway_message::Payload::ConfigUpdate(_))
-        ));
+        assert!(take_update(&mut rx).is_some(), "repair update");
     }
 
     #[tokio::test]
@@ -2061,26 +2086,13 @@ BEGIN SELECT RAISE(ABORT, 'database unavailable'); END;
         assert!(rejected.reason.contains("policy"));
     }
 
-    /// Register a streamed-apply session whose control channel stays open
+    /// Register a streamed-apply session whose outbound channel stays open
     /// for as long as the returned receiver lives.
     fn register_apply_session_in_state(
         state: &ServerState,
         sandbox_id: &str,
-    ) -> (
-        mpsc::Sender<GatewayMessage>,
-        mpsc::Receiver<GatewayMessage>,
-        Arc<ConfigSlots>,
-    ) {
-        let (tx, rx) = mpsc::channel(1);
-        let slots = Arc::new(ConfigSlots::default());
-        state.supervisor_sessions.register_with_mode(
-            sandbox_id.into(),
-            "session-1".into(),
-            tx.clone(),
-            make_shutdown(),
-            SessionMode::Push(Arc::clone(&slots)),
-        );
-        (tx, rx, slots)
+    ) -> (mpsc::Sender<GatewayMessage>, mpsc::Receiver<GatewayMessage>) {
+        register_apply_session_with_outbound(&state.supervisor_sessions, sandbox_id, "session-1")
     }
 
     fn admitted_config() -> SupervisorConfig {
@@ -2125,7 +2137,7 @@ BEGIN SELECT RAISE(ABORT, 'database unavailable'); END;
     #[tokio::test]
     async fn persisted_bootstrap_result_suppresses_unchanged_reconciliation() {
         let state = state_with_startup_policy("sb-bootstrap-ack", None).await;
-        let (tx, mut rx, slots) = register_apply_session_in_state(&state, "sb-bootstrap-ack");
+        let (tx, mut rx) = register_apply_session_in_state(&state, "sb-bootstrap-ack");
         let config = current_config(&state, "sb-bootstrap-ack").await;
         let bootstrap = begin_bootstrap(&state, "sb-bootstrap-ack", config.clone());
 
@@ -2146,7 +2158,7 @@ BEGIN SELECT RAISE(ABORT, 'database unavailable'); END;
                 .deliver_config("sb-bootstrap-ack", "session-1", config),
             DeliveryDisposition::SuppressedUnchanged
         );
-        assert!(slots.take_for_test().is_none());
+        assert!(rx.try_recv().is_err());
     }
 
     #[tokio::test]
@@ -2175,7 +2187,7 @@ BEGIN SELECT RAISE(ABORT, 'database unavailable'); END;
         };
         let policy = openshell_policy::restrictive_default_policy();
         put_policy(1, policy.clone()).await;
-        let (tx, mut rx, slots) = register_apply_session_in_state(&state, sandbox_id);
+        let (tx, mut rx) = register_apply_session_in_state(&state, sandbox_id);
         let session = accepted_session(&state, sandbox_id, tx);
         let bootstrap =
             begin_bootstrap(&state, sandbox_id, current_config(&state, sandbox_id).await);
@@ -2205,6 +2217,8 @@ BEGIN SELECT RAISE(ABORT, 'database unavailable'); END;
             handle_config_update_result(&session, &applied_result(&bootstrap)).await,
             "a superseded bootstrap keeps the session open"
         );
+        // The held configuration is released without an admission ahead of it.
+        let update = sent_update(rx.try_recv().expect("released newer configuration"));
         assert!(
             rx.try_recv().is_err(),
             "a superseded bootstrap must not unlock startup"
@@ -2222,9 +2236,7 @@ BEGIN SELECT RAISE(ABORT, 'database unavailable'); END;
             Some(true)
         );
 
-        // The held configuration is released, and its admission unlocks
-        // startup.
-        let update = sent_update(slots.take_for_test().expect("released newer configuration"));
+        // The released configuration's admission unlocks startup.
         assert!(handle_config_update_result(&session, &applied_result(&update)).await);
         let Some(gateway_message::Payload::ConfigurationAdmission(admitted)) = rx
             .try_recv()
@@ -2244,9 +2256,25 @@ BEGIN SELECT RAISE(ABORT, 'database unavailable'); END;
     }
 
     #[tokio::test]
+    async fn result_answering_no_update_in_flight_closes_the_session() {
+        let state = push_state_with_sandbox("sb-unmatched").await;
+        let (tx, _rx) = register_apply_session_in_state(&state, "sb-unmatched");
+        let result = ConfigUpdateResult {
+            update_id: "unknown".into(),
+            outcome: ConfigApplyOutcome::Applied.into(),
+            ..Default::default()
+        };
+
+        assert!(
+            !handle_config_update_result(&accepted_session(&state, "sb-unmatched", tx), &result)
+                .await
+        );
+    }
+
+    #[tokio::test]
     async fn invalid_bootstrap_admission_closes_the_session_without_acknowledging() {
         let state = push_state_with_sandbox("sb-bootstrap-invalid").await;
-        let (tx, _rx, slots) = register_apply_session_in_state(&state, "sb-bootstrap-invalid");
+        let (tx, mut rx) = register_apply_session_in_state(&state, "sb-bootstrap-invalid");
         let config = admitted_config();
         let bootstrap = begin_bootstrap(&state, "sb-bootstrap-invalid", config.clone());
         let mut result = applied_result(&bootstrap);
@@ -2267,7 +2295,7 @@ BEGIN SELECT RAISE(ABORT, 'database unavailable'); END;
                 .deliver_config("sb-bootstrap-invalid", "session-1", config),
             DeliveryDisposition::Queued
         );
-        assert!(slots.take_for_test().is_some());
+        assert!(take_update(&mut rx).is_some());
     }
 
     #[tokio::test]
@@ -2354,7 +2382,7 @@ BEGIN SELECT RAISE(ABORT, 'database unavailable'); END;
         ];
         for (index, changed) in changes.into_iter().enumerate() {
             let session_id = format!("session-{index}");
-            let (slots, bootstrap) = register_bootstrapped_session(
+            let (mut slots, bootstrap) = register_bootstrapped_session(
                 &registry,
                 "sb-1",
                 &session_id,
@@ -2375,7 +2403,7 @@ BEGIN SELECT RAISE(ABORT, 'database unavailable'); END;
                 registry.deliver_config("sb-1", &session_id, with(changed)),
                 DeliveryDisposition::Queued
             );
-            assert!(slots.take_for_test().is_some());
+            assert!(take_update(&mut slots).is_some());
         }
     }
 

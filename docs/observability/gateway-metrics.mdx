@@ -276,10 +276,11 @@ The labels take these values:
 - On builds, `outcome` is `ok`, `failed`, or `timeout`. A failed build retries
   with a per-session backoff from 1 to 30 seconds. Each session also rebuilds
   its configuration every 30 seconds to repair a missed change.
-- On deliveries, `outcome` is `queued`, `replaced` (a newer configuration
-  replaced an unsent one), `coalesced` (held until the supervisor acknowledges its
-  previous update), `unchanged`, `no_active_session`, `unsupported_session`,
-  `payload_too_large`, `owner_moved`, or `owner_lookup_failed`.
+- On deliveries, `outcome` is `queued`, `coalesced` (held until the
+  supervisor answers its previous update), `unchanged`, `no_active_session`,
+  `unsupported_session`, `payload_too_large`, `stream_closed` (the session's
+  stream stopped draining, so the session was closed for the supervisor to
+  reconnect), `owner_moved`, or `owner_lookup_failed`.
 - On `apply_results_total` and `apply_duration_seconds`, `outcome` is a
   `ConfigApplyOutcome` name, such as `CONFIG_APPLY_OUTCOME_APPLIED`.
 - On peer notifications, `outcome` is `accepted`, `stale_owner`,

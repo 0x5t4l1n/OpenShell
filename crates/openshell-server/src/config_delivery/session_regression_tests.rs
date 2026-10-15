@@ -55,28 +55,18 @@ async fn config_push_regression_global_policy_repair_wakes_pending_startup() {
 #[tokio::test]
 async fn config_push_regression_admission_precedes_the_next_configuration() {
     use openshell_core::proto::ConfigurationAdmissionState;
-    use tokio_stream::StreamExt as _;
 
     let sandbox_id = "sb-admission-order";
     let state = state_with_sandbox(sandbox_id).await;
-    let (session_tx, _session_rx) = mpsc::channel(4);
-    let (control_tx, control_rx) = mpsc::channel(4);
-    let slots = Arc::new(ConfigSlots::default());
-    state.supervisor_sessions.register_with_mode(
-        sandbox_id.into(),
-        "session-1".into(),
-        session_tx.clone(),
-        make_shutdown(),
-        SessionMode::Push(Arc::clone(&slots)),
-    );
-    let mut outbound = SessionOutbound::new(control_rx, slots);
+    let (session_tx, mut outbound) =
+        register_apply_session_with_outbound(&state.supervisor_sessions, sandbox_id, "session-1");
     assert_eq!(
         state
             .supervisor_sessions
             .deliver_config(sandbox_id, "session-1", config(1)),
         DeliveryDisposition::Queued
     );
-    let first_update = sent_update(outbound.next().await.unwrap().unwrap());
+    let first_update = sent_update(outbound.recv().await.unwrap());
     assert_eq!(
         state
             .supervisor_sessions
@@ -96,12 +86,7 @@ async fn config_push_regression_admission_precedes_the_next_configuration() {
         config_revision: 1,
         ..Default::default()
     };
-    // As on a real session, `tx` reaches the stream through a forwarder and
-    // `control` is the stream's own control channel.
-    let session = AcceptedSession {
-        control: control_tx,
-        ..accepted_session(&state, sandbox_id, session_tx)
-    };
+    let session = accepted_session(&state, sandbox_id, session_tx);
     assert!(matches!(
         tokio::time::timeout(Duration::from_secs(2), send_admission(&session, &admission))
             .await
@@ -113,18 +98,17 @@ async fn config_push_regression_admission_precedes_the_next_configuration() {
         .finalize_config_update(sandbox_id, "session-1", &completed, true);
 
     // Finalizing released the newer configuration. It must not overtake
-    // the older admission on the public stream.
-    let first_message = outbound.next().await.unwrap().unwrap();
+    // the older admission on the session's stream.
+    let first_message = outbound.recv().await.unwrap();
     assert_eq!(
         first_message.payload,
         Some(gateway_message::Payload::ConfigurationAdmission(admission)),
-        "startup approval must precede a subsequent configuration update on the public stream"
+        "startup approval must precede a subsequent configuration update on the session stream"
     );
     let second_update = sent_update(
-        tokio::time::timeout(Duration::from_secs(2), outbound.next())
+        tokio::time::timeout(Duration::from_secs(2), outbound.recv())
             .await
             .expect("the next configuration follows admission")
-            .unwrap()
             .unwrap(),
     );
     assert_eq!(config_revision(&second_update), 2);

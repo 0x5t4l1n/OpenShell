@@ -31,10 +31,10 @@ use openshell_core::transport_errors::is_expected_transport_close_status;
 
 use crate::ServerState;
 use crate::auth::principal::Principal;
+use crate::config_delivery::MAX_SUPERVISOR_CONFIG_MESSAGE_BYTES;
 use crate::config_delivery::session::{
     self as config_session, ConfigSessionState, ImagePolicyAdmission,
 };
-use crate::config_delivery::{ConfigSlots, MAX_SUPERVISOR_CONFIG_MESSAGE_BYTES, SessionOutbound};
 use crate::gateway_metrics::{
     self, GaugeSlot, PeerRpc, RelayCapacity, RelayKind, RelayRejection, RelayRoute,
     RoutedRequestTimer,
@@ -66,9 +66,9 @@ pub(crate) enum SessionMode {
     /// workload is already running, as for supervisors that predate streamed
     /// apply; otherwise after `SupervisorRuntimeReady`.
     Poll { ready_on_accept: bool },
-    /// Applies and acknowledges configuration streamed through these slots.
+    /// Applies and acknowledges configuration streamed on the session.
     /// Ready after `SupervisorRuntimeReady` with an accepted admission.
-    Push(Arc<ConfigSlots>),
+    Push,
 }
 
 /// Initial backoff between session-availability polls in `wait_for_session`.
@@ -320,7 +320,9 @@ struct LiveSession {
     /// outbound stream. Without this, a concurrent `open_relay` that grabbed
     /// the old session's `tx` just before supersede could still enqueue a
     /// `RelayOpen` onto the stale stream and sit until the relay timeout.
-    shutdown: oneshot::Sender<()>,
+    /// Taken when the gateway closes a session that stays registered until
+    /// its task cleans up.
+    shutdown: Option<oneshot::Sender<()>>,
     /// Set after the supervisor confirms that every expected foreground
     /// attachment has closed and terminal output delivery is complete.
     terminal_delivery_finalized: bool,
@@ -482,7 +484,7 @@ impl SupervisorSessionRegistry {
             }
         );
         let config = match mode {
-            SessionMode::Push(slots) => Some(ConfigSessionState::new(slots)),
+            SessionMode::Push => Some(ConfigSessionState::new(tx.clone())),
             SessionMode::Poll { .. } => None,
         };
         let mut sessions = self.sessions.lock().unwrap();
@@ -494,7 +496,7 @@ impl SupervisorSessionRegistry {
                 session_id,
                 tx,
                 config,
-                shutdown,
+                shutdown: Some(shutdown),
                 terminal_delivery_finalized: false,
                 endpoint_status_initialized: false,
                 endpoint_report_cursor: None,
@@ -507,7 +509,9 @@ impl SupervisorSessionRegistry {
         match previous {
             Some(prev) => {
                 // Best-effort — the old task may have already exited.
-                let _ = prev.shutdown.send(());
+                if let Some(shutdown) = prev.shutdown {
+                    let _ = shutdown.send(());
+                }
                 true
             }
             None => false,
@@ -526,10 +530,28 @@ impl SupervisorSessionRegistry {
     pub fn disconnect(&self, sandbox_id: &str) -> bool {
         let session = self.sessions.lock().unwrap().remove(sandbox_id);
         if let Some(session) = session {
-            let _ = session.shutdown.send(());
+            if let Some(shutdown) = session.shutdown {
+                let _ = shutdown.send(());
+            }
             true
         } else {
             false
+        }
+    }
+
+    /// End this exact session's task while leaving it registered, so the
+    /// task's own cleanup records the disconnect as for any other session
+    /// end.
+    pub(crate) fn close_if_current(&self, sandbox_id: &str, session_id: &str) {
+        let shutdown = self
+            .sessions
+            .lock()
+            .unwrap()
+            .get_mut(sandbox_id)
+            .filter(|session| session.session_id == session_id)
+            .and_then(|session| session.shutdown.take());
+        if let Some(shutdown) = shutdown {
+            let _ = shutdown.send(());
         }
     }
 
@@ -2235,7 +2257,7 @@ async fn accept_supervisor_session(setup: SessionSetup) -> Result<(), Status> {
         mut inbound,
         session_lifetime,
     } = setup;
-    let pushes_config = matches!(mode, SessionMode::Push(_));
+    let pushes_config = matches!(mode, SessionMode::Push);
     let ready_on_accept = matches!(
         mode,
         SessionMode::Poll {
@@ -2450,7 +2472,6 @@ async fn accept_supervisor_session(setup: SessionSetup) -> Result<(), Status> {
         session_id: session_id.clone(),
         instance_id,
         tx: session_tx,
-        control: outbound_tx,
         supports_session_redirect,
         pushes_config,
     };
@@ -2518,7 +2539,7 @@ pub async fn handle_connect_supervisor(
     // Reconnects from the same process omit it and proceed directly to the
     // current authoritative bootstrap.
     let mode = if pushes_config {
-        SessionMode::Push(Arc::new(ConfigSlots::default()))
+        SessionMode::Push
     } else {
         // Supervisors that predate config push never set workload_pending:
         // they connect once their workload runs.
@@ -2603,12 +2624,7 @@ pub async fn handle_connect_supervisor(
     let (tx, rx) = mpsc::channel::<GatewayMessage>(64);
     let stream: Pin<
         Box<dyn tokio_stream::Stream<Item = Result<GatewayMessage, Status>> + Send + 'static>,
-    > = match &mode {
-        SessionMode::Push(slots) => Box::pin(SessionOutbound::new(rx, Arc::clone(slots))),
-        SessionMode::Poll { .. } => {
-            Box::pin(tokio_stream::StreamExt::map(ReceiverStream::new(rx), Ok))
-        }
-    };
+    > = Box::pin(tokio_stream::StreamExt::map(ReceiverStream::new(rx), Ok));
 
     if !prepares_startup_policy {
         let setup = SessionSetup {
@@ -2926,11 +2942,9 @@ pub(crate) struct AcceptedSession {
     pub(crate) sandbox_id: String,
     pub(crate) session_id: String,
     pub(crate) instance_id: String,
+    /// The session's ordered outbound channel, shared by relays,
+    /// configuration updates, and admissions.
     pub(crate) tx: mpsc::Sender<GatewayMessage>,
-    /// The outbound stream's control channel, which `tx` reaches through a
-    /// forwarding task. Configuration admissions skip that hop, so one
-    /// reaches the supervisor before any configuration released after it.
-    pub(crate) control: mpsc::Sender<GatewayMessage>,
     pub(crate) supports_session_redirect: bool,
     /// The supervisor applies streamed configuration and must answer the
     /// bootstrap it was accepted with. False for a supervisor that keeps
@@ -2971,7 +2985,7 @@ async fn run_session_loop(
                 return SessionLoopExit::GatewayShutdown { redirected };
             }
             _ = &mut shutdown_rx => {
-                info!(sandbox_id = %sandbox_id, session_id = %session_id, "supervisor session: superseded by reconnect, shutting down");
+                info!(sandbox_id = %sandbox_id, session_id = %session_id, "supervisor session: superseded or closed by the gateway, shutting down");
                 break;
             }
             msg = tokio_stream::StreamExt::next(inbound) => {
@@ -3352,7 +3366,6 @@ mod tests {
             sandbox_id: "sb-no-peer".into(),
             session_id: "session-no-peer".into(),
             instance_id: String::new(),
-            control: tx.clone(),
             tx,
             supports_session_redirect: true,
             pushes_config: false,

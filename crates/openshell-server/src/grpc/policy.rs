@@ -13265,10 +13265,11 @@ mod tests {
             .expect("committed policy");
         let snapshot = tokio::time::timeout(std::time::Duration::from_secs(2), async {
             loop {
-                let message = tokio_stream::StreamExt::next(&mut session.outbound)
+                let message = session
+                    .outbound
+                    .recv()
                     .await
-                    .expect("configuration stream closed")
-                    .unwrap();
+                    .expect("configuration stream closed");
                 let Some(openshell_core::proto::gateway_message::Payload::ConfigUpdate(update)) =
                     message.payload
                 else {

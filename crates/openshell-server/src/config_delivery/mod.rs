@@ -5,7 +5,6 @@
 
 mod result_writer;
 pub mod session;
-mod session_slots;
 mod task;
 
 use std::collections::{HashMap, HashSet};
@@ -33,7 +32,6 @@ use crate::grpc::policy::{
 };
 use crate::supervisor_owner::{OWNER_TTL, SupervisorOwnerIndex};
 
-pub use session_slots::{ConfigSlots, SessionOutbound};
 pub use task::Registration;
 use task::{Deliver, FanoutScope, SessionRecord};
 
@@ -102,27 +100,28 @@ fn unresolved_provider_environment(sandbox: &SandboxConfigSnapshot) -> ProviderE
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DeliveryDisposition {
     Queued,
-    /// Replaced an older update the session had not sent yet.
-    Replaced,
-    /// Held until the supervisor acknowledges the previous update.
+    /// Held until the supervisor answers the previous update.
     Coalesced,
     /// Matches the update the supervisor last acknowledged.
     SuppressedUnchanged,
     NoActiveSession,
     UnsupportedSession,
     PayloadTooLarge,
+    /// The session's outbound stream was full or closed, so the session was
+    /// closed for its supervisor to reconnect.
+    StreamClosed,
 }
 
 impl DeliveryDisposition {
     fn metric_label(self) -> &'static str {
         match self {
             Self::Queued => "queued",
-            Self::Replaced => "replaced",
             Self::Coalesced => "coalesced",
             Self::SuppressedUnchanged => "unchanged",
             Self::NoActiveSession => "no_active_session",
             Self::UnsupportedSession => "unsupported_session",
             Self::PayloadTooLarge => "payload_too_large",
+            Self::StreamClosed => "stream_closed",
         }
     }
 }
@@ -767,10 +766,10 @@ pub fn handle_peer_notify_config_update(
 
 /// Streamed-apply supervisor session registered without a gRPC stream. It
 /// holds each update until the previous one is acknowledged. The registry
-/// keeps its control channel open while the session is registered.
+/// keeps its outbound channel open while the session is registered.
 #[cfg(test)]
 pub struct TestApplySession {
-    pub outbound: SessionOutbound,
+    pub outbound: tokio::sync::mpsc::Receiver<openshell_core::proto::GatewayMessage>,
 }
 
 #[cfg(test)]
@@ -794,15 +793,14 @@ fn register_test_apply_session_after(
 ) -> TestApplySession {
     use crate::persistence::{ObjectId, ObjectWorkspace};
 
-    let (control, rx) = tokio::sync::mpsc::channel(4);
-    let slots = Arc::new(ConfigSlots::default());
+    let (tx, outbound) = tokio::sync::mpsc::channel(4);
     let sandbox_id = sandbox.object_id().to_string();
     state.supervisor_sessions.register_with_mode(
         sandbox_id.clone(),
         session_id.to_string(),
-        control,
+        tx,
         tokio::sync::oneshot::channel().0,
-        crate::supervisor_session::SessionMode::Push(Arc::clone(&slots)),
+        crate::supervisor_session::SessionMode::Push,
     );
     register_session(
         state,
@@ -819,9 +817,7 @@ fn register_test_apply_session_after(
             captured_seq,
         },
     );
-    TestApplySession {
-        outbound: SessionOutbound::new(rx, slots),
-    }
+    TestApplySession { outbound }
 }
 
 fn record_build(outcome: &'static str, elapsed: Duration) {
@@ -1250,14 +1246,10 @@ mod tests {
             register_test_apply_session_after(&state, &sandbox, "session-1", captured_seq);
         // Reconciliation is at least 30 seconds away, so only registration
         // can have caught the publication.
-        let update = tokio::time::timeout(
-            Duration::from_secs(5),
-            tokio_stream::StreamExt::next(&mut session.outbound),
-        )
-        .await
-        .expect("registration delivers the missed publication")
-        .expect("outbound frame")
-        .expect("outbound message");
+        let update = tokio::time::timeout(Duration::from_secs(5), session.outbound.recv())
+            .await
+            .expect("registration delivers the missed publication")
+            .expect("outbound message");
         assert!(is_config_update(&update));
     }
 
