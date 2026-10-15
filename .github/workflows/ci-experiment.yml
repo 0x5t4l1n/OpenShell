@@ -1,0 +1,79 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Throwaway experiment: compare the current macOS test job against a sharded
+# one in the same run, with a spawn-cost diagnostic. Not for merge.
+name: CI Experiment
+
+on:
+  push:
+    branches:
+      - "ci/4618-branch-checks-experiments/matthewgrossman"
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  MISE_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+permissions:
+  contents: read
+  packages: read
+
+jobs:
+  test:
+    name: ${{ matrix.label }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: darwin-control
+            runner: macos-15-xlarge
+            partition: ""
+          - label: darwin-shard-1
+            runner: macos-15-xlarge
+            partition: "hash:1/2"
+          - label: darwin-shard-2
+            runner: macos-15-xlarge
+            partition: "hash:2/2"
+          - label: linux-amd64-control
+            runner: linux-amd64-cpu8
+            partition: ""
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: ./.github/actions/setup-nix
+        with:
+          prepare-shell: "true"
+          cachix-auth-token: ${{ secrets.CACHIX_AUTH_TOKEN }}
+
+      - uses: ./.github/actions/setup-rust
+        with:
+          cache-key: rust-checks-v2
+          # Flip to "false" on the second push to measure a warm, restore-only run.
+          save-cache: "true"
+
+      - name: Test
+        shell: nix develop -c bash -euo pipefail {0}
+        env:
+          OPENSHELL_TELEMETRY_ENABLED: "false"
+          PARTITION: ${{ matrix.partition }}
+        run: |
+          date -u +"test start %T"
+          cargo nextest run --locked --profile ci --workspace --features openshell-server/test-support ${PARTITION:+--partition "$PARTITION"}
+          date -u +"test end %T"
+
+      - name: Diagnostics
+        if: always()
+        shell: nix develop -c bash -euo pipefail {0}
+        run: |
+          uname -a
+          (sysctl -n machdep.cpu.brand_string hw.ncpu hw.memsize 2>/dev/null) || (nproc; free -m | head -2)
+          echo "--- 200 x trivial process spawn"
+          time (for i in $(seq 200); do /bin/true; done)
+          bin=$(find target/debug/deps -maxdepth 1 -type f -perm -u+x -name 'openshell_core-*' ! -name '*.so' ! -name '*.dylib' ! -name '*.d' | head -1)
+          echo "--- 50 x test-binary --list: $bin"
+          time (for i in $(seq 50); do "$bin" --list >/dev/null; done)
+          spctl --status 2>/dev/null || true
