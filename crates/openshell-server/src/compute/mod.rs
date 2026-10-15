@@ -4986,11 +4986,7 @@ impl ComputeRuntime {
                         if connected {
                             let status = sandbox.status.get_or_insert_with(Default::default);
                             if let Some(admission) = admission {
-                                status.configuration_admission = Some(admission.clone());
-                                status.configuration_activated = Some(
-                                    admission.state
-                                        == i32::from(openshell_core::proto::ConfigurationAdmissionState::Accepted),
-                                );
+                                record_session_admission(status, admission);
                             }
                             if provisioning.is_some() {
                                 status.provisioning.clone_from(&provisioning);
@@ -6742,6 +6738,35 @@ fn apply_driver_snapshot(
     sandbox.set_phase(phase as i32);
     sandbox.set_current_policy_version(cpv);
     apply_configuration_readiness(sandbox);
+}
+
+/// Record a supervisor session's admission as a polled configuration report
+/// does. A rejected update leaves an accepted runtime accepted and records only
+/// its error, and activation is recorded but never revoked.
+fn record_session_admission(
+    status: &mut SandboxStatus,
+    admission: &openshell_core::proto::SandboxConfigurationAdmission,
+) {
+    use openshell_core::proto::ConfigurationAdmissionState;
+
+    let accepted = admission.state == i32::from(ConfigurationAdmissionState::Accepted);
+    let admission = match status.configuration_admission.as_ref() {
+        Some(current)
+            if !accepted
+                && current.state == i32::from(ConfigurationAdmissionState::Accepted)
+                && current.instance_id == admission.instance_id =>
+        {
+            openshell_core::proto::SandboxConfigurationAdmission {
+                error: admission.error.clone(),
+                ..current.clone()
+            }
+        }
+        _ => admission.clone(),
+    };
+    status.configuration_admission = Some(admission);
+    if accepted {
+        status.configuration_activated = Some(true);
+    }
 }
 
 /// Admission evidence from a supervisor session ends image preparation, as a
@@ -14460,6 +14485,63 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(stored.phase(), SandboxPhase::Stopped as i32);
+    }
+
+    #[tokio::test]
+    async fn rejected_session_admission_keeps_an_accepted_runtime_ready() {
+        use openshell_core::proto::{ConfigurationAdmissionState, SandboxConfigurationAdmission};
+
+        let runtime = test_runtime(Arc::new(TestDriver::default())).await;
+        let sandbox = sandbox_record("sb-1", "sandbox-a", SandboxPhase::Provisioning);
+        runtime.store.put_message(&sandbox).await.unwrap();
+        runtime
+            .supervisor_session_connected("sb-1", "supervisor-1")
+            .await
+            .unwrap();
+        let accepted = SandboxConfigurationAdmission {
+            instance_id: "configuration-1".into(),
+            state: ConfigurationAdmissionState::Accepted.into(),
+            policy_version: 1,
+            config_revision: 7,
+            ..Default::default()
+        };
+        runtime
+            .supervisor_session_admission("sb-1", "supervisor-1", &accepted)
+            .await
+            .unwrap();
+
+        // A later update fails to apply on the running supervisor.
+        let rejected = SandboxConfigurationAdmission {
+            state: ConfigurationAdmissionState::Rejected.into(),
+            policy_version: 2,
+            config_revision: 8,
+            error: "effective configuration could not be activated".into(),
+            ..accepted.clone()
+        };
+        runtime
+            .supervisor_session_admission("sb-1", "supervisor-1", &rejected)
+            .await
+            .unwrap();
+
+        let stored = runtime
+            .store
+            .get_message::<Sandbox>("sb-1")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.phase(), SandboxPhase::Ready as i32);
+        let status = stored.status.as_ref().unwrap();
+        assert_eq!(status.configuration_activated, Some(true));
+        assert_eq!(
+            status.configuration_admission,
+            Some(SandboxConfigurationAdmission {
+                error: rejected.error.clone(),
+                ..accepted
+            })
+        );
+        assert!(status.conditions.iter().any(|condition| {
+            condition.r#type == "DesiredConfigurationReady" && condition.status == "False"
+        }));
     }
 
     #[tokio::test]
