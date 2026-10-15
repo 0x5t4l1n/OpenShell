@@ -36,6 +36,10 @@ jobs:
           - label: darwin-shard-2
             runner: macos-15-xlarge
             partition: "hash:2/2"
+          - label: darwin-threads-16
+            runner: macos-15-xlarge
+            partition: ""
+            extra: "--test-threads 16"
           - label: linux-amd64-control
             runner: linux-amd64-cpu8
             partition: ""
@@ -52,25 +56,26 @@ jobs:
       - uses: ./.github/actions/setup-rust
         with:
           cache-key: rust-checks-v2
-          # Flip to "false" on the second push to measure a warm, restore-only run.
-          save-cache: "true"
+          # Second push: warm, restore-only run.
+          save-cache: "false"
 
       - name: Test
         shell: nix develop -c bash -euo pipefail {0}
         env:
           OPENSHELL_TELEMETRY_ENABLED: "false"
           PARTITION: ${{ matrix.partition }}
+          EXTRA: ${{ matrix.extra }}
         run: |
           date -u +"test start %T"
-          cargo nextest run --locked --profile ci --workspace --features openshell-server/test-support ${PARTITION:+--partition "$PARTITION"}
+          cargo nextest run --locked --profile ci --workspace --features openshell-server/test-support ${PARTITION:+--partition "$PARTITION"} ${EXTRA:-}
           date -u +"test end %T"
 
       - name: Diagnostics
         if: always()
-        shell: nix develop -c bash -euo pipefail {0}
+        shell: bash --noprofile --norc {0}
         run: |
           uname -a
-          (sysctl -n machdep.cpu.brand_string hw.ncpu hw.memsize 2>/dev/null) || (nproc; free -m | head -2)
+          (sysctl -n machdep.cpu.brand_string hw.ncpu hw.memsize 2>/dev/null) || (nproc; free -m | head -2) || true
           echo "--- 200 x trivial process spawn"
           time (for i in $(seq 200); do /bin/true; done)
           bin=$(find target/debug/deps -maxdepth 1 -type f -perm -u+x -name 'openshell_core-*' ! -name '*.so' ! -name '*.dylib' ! -name '*.d' | head -1)
