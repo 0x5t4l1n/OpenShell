@@ -36,7 +36,7 @@ use crate::supervisor_owner::{OWNER_TTL, SupervisorOwnerIndex};
 
 pub use session_slots::{ConfigSlots, SessionOutbound};
 pub use task::Registration;
-use task::{Deliver, FanoutScope, Lane, Permits, SessionRecord, Work};
+use task::{Deliver, FanoutScope, SessionRecord};
 
 /// Leaves headroom below tonic's default 4 MiB decode limit for framing and
 /// future envelope fields.
@@ -204,7 +204,8 @@ impl From<ConfigComponentKind> for ConfigComponent {
 #[derive(Debug)]
 pub struct ConfigDelivery {
     sessions: Mutex<Sessions>,
-    permits: Permits,
+    /// Snapshot builds in progress, bounded by the database pool they read.
+    builds: Arc<Semaphore>,
     peer_notifies: Mutex<HashMap<PeerNotifyTarget, ConfigComponents>>,
     peer_notify_permits: Arc<Semaphore>,
     /// Admission and policy-result writes for running workloads.
@@ -241,7 +242,7 @@ impl ConfigDelivery {
             .max(MIN_CONCURRENT_SNAPSHOT_BUILDS);
         Self {
             sessions: Mutex::new(Sessions::default()),
-            permits: Permits::new(builds),
+            builds: Arc::new(Semaphore::new(builds)),
             peer_notifies: Mutex::new(HashMap::new()),
             peer_notify_permits: Arc::new(Semaphore::new(MAX_CONCURRENT_PEER_NOTIFIES)),
             results: result_writer::ResultWriter::default(),
@@ -281,7 +282,7 @@ impl ConfigDelivery {
         let Some(record) = record else {
             return false;
         };
-        record.mark(components, Lane::Sandbox);
+        record.mark(components);
         true
     }
 
@@ -290,7 +291,7 @@ impl ConfigDelivery {
         sessions.publications += 1;
         for record in sessions.records.values() {
             if record.in_scope(scope) {
-                record.mark(components, Lane::Fanout);
+                record.mark(components);
             }
         }
     }
@@ -392,13 +393,13 @@ pub fn register_session(state: &Arc<ServerState>, registration: Registration) {
     // A publication between the bootstrap read and registration may have
     // missed this session.
     if raced {
-        record.mark(ConfigComponents::ALL, Lane::Sandbox);
+        record.mark(ConfigComponents::ALL);
     }
     let state = Arc::clone(state);
     tokio::spawn(async move {
         task::run(
             record,
-            &state.config_delivery.permits,
+            &state.config_delivery.builds,
             &Builder(&state),
             task::RECONCILE_INTERVAL,
         )
@@ -432,15 +433,14 @@ impl Deliver for Builder<'_> {
     async fn deliver(
         &self,
         record: &SessionRecord,
-        work: Work,
+        components: ConfigComponents,
     ) -> (ConfigComponents, Option<HashSet<String>>) {
         let state = self.0;
         let sandbox_id = record.sandbox_id.as_str();
         // Selected components share one input load. The load counts against
         // each component's own deadline, and each component still builds,
         // delivers, and fails on its own.
-        let load_timeout = work
-            .components
+        let load_timeout = components
             .selected()
             .map(build_timeout)
             .max()
@@ -451,41 +451,39 @@ impl Deliver for Builder<'_> {
         let inputs = match loaded {
             Ok(Ok(Some(inputs))) => inputs,
             Ok(Ok(None)) => {
-                for component in work.components.selected() {
-                    record_build(component, work.lane, "ok", load_elapsed);
+                for component in components.selected() {
+                    record_build(component, "ok", load_elapsed);
                 }
                 return (ConfigComponents::default(), None);
             }
             Ok(Err(error)) => {
-                for component in work.components.selected() {
+                for component in components.selected() {
                     record_build_failure(
                         sandbox_id,
                         component,
-                        work.lane,
                         "failed",
                         error.code(),
                         load_elapsed,
                     );
                 }
-                return (work.components, None);
+                return (components, None);
             }
             Err(_) => {
-                for component in work.components.selected() {
+                for component in components.selected() {
                     record_build_failure(
                         sandbox_id,
                         component,
-                        work.lane,
                         "timeout",
                         Code::DeadlineExceeded,
                         load_elapsed,
                     );
                 }
-                return (work.components, None);
+                return (components, None);
             }
         };
         let mut failed = ConfigComponents::default();
-        for component in work.components.selected() {
-            match run_build(state, record, component, work.lane, &inputs, load_elapsed).await {
+        for component in components.selected() {
+            match run_build(state, record, component, &inputs, load_elapsed).await {
                 BuildResult::Built { owner_moved } => {
                     if owner_moved {
                         notify_peer(
@@ -543,7 +541,6 @@ async fn run_build(
     state: &Arc<ServerState>,
     record: &SessionRecord,
     component: ConfigComponentKind,
-    lane: Lane,
     inputs: &SandboxConfigInputs,
     load_elapsed: Duration,
 ) -> BuildResult {
@@ -558,7 +555,7 @@ async fn run_build(
     let elapsed = load_elapsed + started.elapsed();
     let (outcome, error_code) = match built {
         Ok(Ok(message)) => {
-            record_build(component, lane, "ok", elapsed);
+            record_build(component, "ok", elapsed);
             return match deliver_if_owner(state, sandbox_id, session_id, component, message).await {
                 OwnerCheck::Unknown => BuildResult::Failed,
                 owner => BuildResult::Built {
@@ -569,7 +566,7 @@ async fn run_build(
         Ok(Err(error)) => ("failed", error.code()),
         Err(_) => ("timeout", Code::DeadlineExceeded),
     };
-    record_build_failure(sandbox_id, component, lane, outcome, error_code, elapsed);
+    record_build_failure(sandbox_id, component, outcome, error_code, elapsed);
     // A provider environment that cannot be built revokes the supervisor's
     // static credentials, as a failed fetch does when polling. A supervisor
     // that already holds this revision ignores it as a duplicate.
@@ -1018,16 +1015,10 @@ fn register_test_apply_session_after(
     }
 }
 
-fn record_build(
-    component: ConfigComponentKind,
-    lane: Lane,
-    outcome: &'static str,
-    elapsed: Duration,
-) {
+fn record_build(component: ConfigComponentKind, outcome: &'static str, elapsed: Duration) {
     counter!(
         "openshell_supervisor_config_builds_total",
         "component" => component.name(),
-        "lane" => lane.name(),
         "outcome" => outcome,
     )
     .increment(1);
@@ -1042,12 +1033,11 @@ fn record_build(
 fn record_build_failure(
     sandbox_id: &str,
     component: ConfigComponentKind,
-    lane: Lane,
     outcome: &'static str,
     error_code: Code,
     elapsed: Duration,
 ) {
-    record_build(component, lane, outcome, elapsed);
+    record_build(component, outcome, elapsed);
     warn!(
         sandbox_id,
         component = component.name(),
@@ -1510,8 +1500,8 @@ mod tests {
     fn build_slots_are_sized_from_the_database_pool() {
         let builds = |connections| {
             ConfigDelivery::for_db_connections(connections)
-                .permits
-                .builds()
+                .builds
+                .available_permits()
         };
         assert_eq!(builds(10), 20);
         assert_eq!(builds(1), MIN_CONCURRENT_SNAPSHOT_BUILDS);
@@ -1799,11 +1789,9 @@ mod tests {
         .await;
         change_policy(&state, "sandbox", 1).await;
 
-        let work = Work {
-            components: ConfigComponents::ALL,
-            lane: Lane::Sandbox,
-        };
-        let (failed, providers) = Builder(&state).deliver(&record, work).await;
+        let (failed, providers) = Builder(&state)
+            .deliver(&record, ConfigComponents::ALL)
+            .await;
         assert_eq!(
             failed,
             ConfigComponents::only(ConfigComponentKind::ProviderEnvironment)
@@ -1825,13 +1813,9 @@ mod tests {
         let (mut resolve_hit, _release_resolve) = state.credentials.gate_next_resolve();
         change_policy(&state, "sandbox", 1).await;
 
-        let work = Work {
-            components: ConfigComponents::SANDBOX_CONFIG,
-            lane: Lane::Sandbox,
-        };
         let (failed, _) = tokio::time::timeout(
             Duration::from_secs(5),
-            Builder(&state).deliver(&record, work),
+            Builder(&state).deliver(&record, ConfigComponents::SANDBOX_CONFIG),
         )
         .await
         .expect("a sandbox configuration build must not wait on credentials");
