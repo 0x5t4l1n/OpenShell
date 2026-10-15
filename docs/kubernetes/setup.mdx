@@ -118,6 +118,10 @@ helm upgrade --install openshell \
 
 The chart automatically generates PKI secrets on first install using pre-install Helm hooks. No manual secret creation is required.
 
+The default Kubernetes driver puts all workspaces in one sandbox namespace. To
+have the gateway create a namespace for each workspace, follow
+[Workspace on Kubernetes](/kubernetes/workspaces).
+
 ### Split gateway and workspace releases
 
 For a platform-managed namespace, install the gateway without namespace-scoped
@@ -525,6 +529,10 @@ helm template openshell \
 
 To grant the installer the sandbox permissions instead, bind it to a Role
 carrying the same rules as the chart's `openshell-sandbox` Role.
+
+## Pod Security
+
+The gateway workload and the PKI bootstrap hooks satisfy the [Restricted Pod Security Standard](https://kubernetes.io/docs/concepts/security/pod-security-standards/), so the release installs into a namespace labeled `pod-security.kubernetes.io/enforce=restricted`.
 
 ## Probes
 

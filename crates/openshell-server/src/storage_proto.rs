@@ -146,12 +146,20 @@ mod tests {
     // Legacy payloads decode empty owners; the gateway rebuilds their authority
     // from effective policy rather than trusting persisted owner stamps.
     // Operator credential export adds four public messages and no durable types.
+    // ListProvidersRequest field 4 adds a public-only label selector. Older
+    // requests decode an empty selector; durable schemas remain unchanged.
+    // Endpoint failure causes add EndpointFailure and EndpointFailureDomain to
+    // both closures through EndpointStatus.last_failure. Stored statuses decode
+    // without a cause, and the next accepted report or reset replaces them.
+    // Sandbox-wide grant reporting adds TokenGrantFailureObservation to both
+    // closures and TokenGrantStatus to public reports. Older rows have no grant
+    // record; absent report extensions retain compatibility without a rewrite.
     const PUBLIC_RPC_SCHEMA_SHA256: &str =
-        "5ae8334d9f6212a00c38ba965ff62e567d2846b15f4df8faf85954023da542e7";
+        "cc06b38c9ecb4c6518e0d4963f40c4f16f992483ce111c7b23cbcb729db946ea";
     const DURABLE_SCHEMA_SHA256: &str =
-        "5281143e2825539af6148785c91f9df67f654eb74d215f57940af9314867a55f";
+        "d4dc7abdb91b919db1f7be0d4652e30cbfda86f3b2ed9b59d5de1f76a2bf691d";
     const PUBLIC_DURABLE_OVERLAP_SHA256: &str =
-        "761dea31a521b0650840fe2a823ad6e36a265ed323ba4506889781d630df0ee3";
+        "ac1ffc4b5b81467de27270a4e33f6db1e31eeb2c52f79750dbaaf19515eadbb2";
     // Encoded with the schema that omitted stable_placeholder. Keep these
     // bytes fixed so the current encoder cannot hide a compatibility change.
     const LEGACY_STATIC_PROFILE: &str = "0a240a116c65676163792d70726f66696c652d6964120d6c65676163792d737461746963280712510a0d6c65676163792d73746174696312184c6567616379207374617469632063726564656e7469616c2a260a076170695f6b65791a1153594e5448455449435f4150495f4b455920012a06626561726572";
@@ -619,9 +627,9 @@ mod tests {
                 overlap_hash.as_str(),
             ),
             (
-                (311, 27),
-                (93, 21),
-                (81, 21),
+                (314, 28),
+                (95, 22),
+                (83, 22),
                 PUBLIC_RPC_SCHEMA_SHA256,
                 DURABLE_SCHEMA_SHA256,
                 PUBLIC_DURABLE_OVERLAP_SHA256
@@ -722,6 +730,7 @@ mod tests {
         assert_eq!(status.main_process_instance_id, "supervisor-id");
         assert_eq!(status.exit_code, None);
         assert_eq!(status.restart_count, 0);
+        assert!(status.last_token_grant_failure.is_none());
         assert!(status.next_restart_time.is_none());
         assert!(status.main_process_started_time.is_none());
         assert_eq!(status.conditions.len(), 1);
