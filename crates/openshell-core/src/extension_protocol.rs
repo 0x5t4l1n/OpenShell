@@ -22,6 +22,9 @@ pub const COMPUTE_LAUNCH_AUTHENTICATION: &str = "openshell.compute.launch-authen
 /// Driver stages operator-selected external isolation routes for the supervisor.
 pub const COMPUTE_ISOLATION_BACKEND: &str = "openshell.compute.isolation-backend";
 
+/// Optional stopped-state image updates retaining the resource and its storage.
+pub const COMPUTE_UPDATE_SANDBOX_IMAGE: &str = "openshell.compute.update-sandbox-image";
+
 const MAX_IMPLEMENTATION_NAME_BYTES: usize = 128;
 const MAX_IMPLEMENTATION_VERSION_BYTES: usize = 128;
 const MAX_CAPABILITY_BYTES: usize = 128;
@@ -125,6 +128,7 @@ pub fn gateway_metadata(family: ExtensionFamily) -> PeerMetadata {
     if family == ExtensionFamily::Compute {
         supported_capabilities.push(COMPUTE_LAUNCH_AUTHENTICATION.to_string());
         supported_capabilities.push(COMPUTE_ISOLATION_BACKEND.to_string());
+        supported_capabilities.push(COMPUTE_UPDATE_SANDBOX_IMAGE.to_string());
     }
     PeerMetadata {
         protocol_version: Some(ProtocolVersion {
