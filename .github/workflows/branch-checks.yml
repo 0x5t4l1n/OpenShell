@@ -239,6 +239,10 @@ jobs:
         shell: nix develop -c bash -euo pipefail {0}
         run: tasks/scripts/check-cargo-lockfiles.sh
 
+      - name: Verify Cargo lockfile alignment
+        shell: nix develop -c bash -euo pipefail {0}
+        run: uv run tasks/scripts/check_cargo_lockfile_alignment.py
+
   rust-lint:
     name: Rust lint (${{ matrix.system }})
     needs: pr_metadata

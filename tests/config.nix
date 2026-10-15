@@ -259,7 +259,7 @@ let
     text = ''
       root=$(git rev-parse --show-toplevel)
       export ANSIBLE_CONFIG="$root/tests/ansible/ansible.cfg"
-      exec cargo run --quiet --manifest-path "$root/tests/runner/Cargo.toml" --bin openshell-test -- "$@"
+      exec cargo run --quiet --locked --manifest-path "$root/tests/runner/Cargo.toml" --bin openshell-test -- "$@"
     '';
   };
 in

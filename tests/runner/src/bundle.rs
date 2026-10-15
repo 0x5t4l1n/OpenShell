@@ -60,7 +60,7 @@ pub fn build(
 
     let mut command = Command::new("cargo");
     command
-        .args(["nextest", "archive", "--manifest-path"])
+        .args(["nextest", "archive", "--locked", "--manifest-path"])
         .arg(&manifest)
         .args(["--target", target, "--archive-file"])
         .arg(&archive);

@@ -48,6 +48,17 @@ mise run test:rust     # cargo test --workspace
 
 Rust validation checks tracked Cargo lockfiles; run `mise run rust:lockfiles:check` to check them directly. If one is stale, refresh it with Cargo using its adjacent manifest, review the diff, and commit the update.
 
+Workspaces that build root crates through path dependencies keep their own
+lockfiles, which `--locked` does not compare with the root's. The check also
+requires the workspaces listed in
+`tasks/scripts/check_cargo_lockfile_alignment.py` to lock shared crates at the
+root's versions. If it fails, re-lock them from the root lockfile and commit the
+result:
+
+```shell
+uv run tasks/scripts/check_cargo_lockfile_alignment.py --fix
+```
+
 ### PostgreSQL-backed tests
 
 Tests that need a real PostgreSQL server, such as advisory-lock concurrency
