@@ -171,6 +171,13 @@ let
         };
       }
       {
+        name = "cdi";
+        playbooks = [ "ansible/playbooks/features/cdi/tests.yaml" ];
+        inputs = {
+          openshell_cdi_test_bundle = "../artifacts/test-archives/${muslTarget}/openshell-cdi-tests.tar";
+        };
+      }
+      {
         name = "provider-refresh";
         playbooks = [ "ansible/playbooks/features/provider-refresh/keycloak.yaml" ];
         inputs = {
