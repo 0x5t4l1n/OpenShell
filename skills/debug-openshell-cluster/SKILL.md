@@ -987,15 +987,15 @@ first connection the supervisor offers the policy found in the workload image.
 The gateway selects its stored policy when present, otherwise the image policy,
 and sends that candidate back for image-specific filesystem preparation. It
 validates and persists the prepared result before sending the authoritative
-bootstrap. The bootstrap must contain both sandbox configuration and provider
-environment. The supervisor acknowledges application only after boundary
+bootstrap. The bootstrap, like every later update, must contain both the
+sandbox configuration and the provider environment it names. The supervisor acknowledges application only after boundary
 enforcement, the canonical process, and SSH are ready. In poll mode the
 supervisor loads configuration through the polling RPCs instead.
 
 If the supervisor Pod is running but the sandbox remains Starting in push mode,
 inspect gateway and supervisor logs for `StartupConfigCandidate` or
 `StartupConfigPrepared` failures, policy validation errors, bootstrap build
-failures, missing components, apply failures, or the two-minute bootstrap
+failures, updates missing a configuration part, apply failures, or the two-minute bootstrap
 timeout. A failed startup preparation rejects the session before runtime
 initialization. Reconnects skip preparation and use the current gateway
 bootstrap. Do not add gateway credentials to the workload Pod;

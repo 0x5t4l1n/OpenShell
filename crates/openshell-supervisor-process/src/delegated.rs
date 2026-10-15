@@ -87,7 +87,7 @@ impl Drop for PrestartedSupervisorSession {
 /// its loopback connector.
 pub async fn start_prepared_supervisor_session(
     prepared: crate::supervisor_session::PreparedSupervisorSession,
-    bootstrap_result: Option<openshell_core::proto::ConfigBootstrapResult>,
+    bootstrap_result: Option<openshell_core::proto::ConfigUpdateResult>,
     ssh_socket_path: Option<&str>,
     config_apply_tx: tokio::sync::mpsc::Sender<crate::supervisor_session::ConfigApplyRequest>,
     supervisor_session_updates: Option<tokio::sync::watch::Sender<Option<String>>>,

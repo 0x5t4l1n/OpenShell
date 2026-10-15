@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Latest-wins configuration slots for one supervisor session stream.
+//! Latest-wins configuration slot for one supervisor session stream.
 
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
@@ -12,60 +12,30 @@ use openshell_core::proto::GatewayMessage;
 use tokio::sync::mpsc;
 use tonic::Status;
 
-use super::ConfigComponentKind;
-
-/// One unsent snapshot per component. A newer snapshot replaces an unsent one,
-/// so a slow stream holds at most one message per component.
+/// One unsent configuration update. A newer update replaces an unsent one,
+/// so a slow stream holds at most one.
 #[derive(Debug, Default)]
 pub struct ConfigSlots {
-    pending: Mutex<PendingSlots>,
+    pending: Mutex<Option<GatewayMessage>>,
     waker: AtomicWaker,
 }
 
-#[derive(Debug, Default)]
-struct PendingSlots {
-    next_order: u64,
-    sandbox_config: Option<(u64, GatewayMessage)>,
-    provider_environment: Option<(u64, GatewayMessage)>,
-}
-
 impl ConfigSlots {
-    /// Returns true when an unsent snapshot was replaced.
-    pub(crate) fn replace(&self, component: ConfigComponentKind, message: GatewayMessage) -> bool {
-        let replaced = {
-            let mut pending = self.pending.lock().unwrap();
-            let order = pending.next_order;
-            pending.next_order += 1;
-            let slot = match component {
-                ConfigComponentKind::SandboxConfig => &mut pending.sandbox_config,
-                ConfigComponentKind::ProviderEnvironment => &mut pending.provider_environment,
-            };
-            slot.replace((order, message)).is_some()
-        };
+    /// Returns true when an unsent update was replaced.
+    pub(crate) fn replace(&self, message: GatewayMessage) -> bool {
+        let replaced = self.pending.lock().unwrap().replace(message).is_some();
         self.waker.wake();
         replaced
     }
 
-    /// Takes the oldest unsent snapshot without an outbound stream.
+    /// Takes the unsent update without an outbound stream.
     #[cfg(test)]
     pub(crate) fn take_for_test(&self) -> Option<GatewayMessage> {
-        self.take_oldest()
+        self.take()
     }
 
-    fn take_oldest(&self) -> Option<GatewayMessage> {
-        let mut pending = self.pending.lock().unwrap();
-        let sandbox_first = match (&pending.sandbox_config, &pending.provider_environment) {
-            (Some((sandbox, _)), Some((provider, _))) => sandbox < provider,
-            (Some(_), None) => true,
-            (None, Some(_)) => false,
-            (None, None) => return None,
-        };
-        let slot = if sandbox_first {
-            pending.sandbox_config.take()
-        } else {
-            pending.provider_environment.take()
-        };
-        slot.map(|(_, message)| message)
+    fn take(&self) -> Option<GatewayMessage> {
+        self.pending.lock().unwrap().take()
     }
 }
 
@@ -96,7 +66,7 @@ impl tokio_stream::Stream for SessionOutbound {
         }
         this.config.waker.register(cx.waker());
         this.config
-            .take_oldest()
+            .take()
             .map_or(Poll::Pending, |message| Poll::Ready(Some(Ok(message))))
     }
 }
@@ -134,7 +104,7 @@ mod tests {
         let (tx, rx) = mpsc::channel(4);
         let slots = Arc::new(ConfigSlots::default());
         let mut outbound = SessionOutbound::new(rx, Arc::clone(&slots));
-        assert!(!slots.replace(ConfigComponentKind::SandboxConfig, config("config")));
+        assert!(!slots.replace(config("config")));
         tx.send(relay_open()).await.unwrap();
 
         let first = outbound.next().await.unwrap().unwrap();
@@ -146,18 +116,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn newer_snapshot_replaces_an_unsent_one() {
+    async fn newer_update_replaces_an_unsent_one() {
         let (_tx, rx) = mpsc::channel(4);
         let slots = Arc::new(ConfigSlots::default());
         let mut outbound = SessionOutbound::new(rx, Arc::clone(&slots));
-        assert!(!slots.replace(ConfigComponentKind::SandboxConfig, config("old")));
-        assert!(!slots.replace(ConfigComponentKind::ProviderEnvironment, config("provider")));
-        assert!(slots.replace(ConfigComponentKind::SandboxConfig, config("new")));
+        assert!(!slots.replace(config("old")));
+        assert!(slots.replace(config("new")));
 
-        assert_eq!(
-            update_id(outbound.next().await.unwrap().unwrap()),
-            "provider"
-        );
         assert_eq!(update_id(outbound.next().await.unwrap().unwrap()), "new");
     }
 
@@ -168,7 +133,7 @@ mod tests {
         let mut outbound = SessionOutbound::new(rx, Arc::clone(&slots));
         let next = tokio::spawn(async move { outbound.next().await.unwrap().unwrap() });
         tokio::task::yield_now().await;
-        slots.replace(ConfigComponentKind::ProviderEnvironment, config("late"));
+        slots.replace(config("late"));
         assert_eq!(update_id(next.await.unwrap()), "late");
     }
 
@@ -177,7 +142,7 @@ mod tests {
         let (tx, rx) = mpsc::channel(4);
         let slots = Arc::new(ConfigSlots::default());
         let mut outbound = SessionOutbound::new(rx, Arc::clone(&slots));
-        slots.replace(ConfigComponentKind::SandboxConfig, config("discarded"));
+        slots.replace(config("discarded"));
         drop(tx);
         assert!(outbound.next().await.is_none());
     }

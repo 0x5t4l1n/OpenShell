@@ -26,8 +26,7 @@ mod mechanistic_mapper;
 mod provider_readiness;
 
 use config_runtime::{
-    agent_proposals_enabled_from_settings, bootstrap_result, config_apply_result_activates,
-    run_policy_poll_loop,
+    agent_proposals_enabled_from_settings, run_policy_poll_loop, startup_bootstrap_result,
 };
 use miette::{IntoDiagnostic, Result, WrapErr};
 use std::future::Future;
@@ -358,10 +357,7 @@ use openshell_core::proto::ProviderReadinessReason;
 use openshell_core::provider_credentials::ProviderCredentialState;
 use openshell_supervisor_network::opa::{OpaEngine, PolicyGenerationGuard};
 use openshell_supervisor_network::proxy::ProxyHandle;
-use openshell_supervisor_process::supervisor_session::{
-    ConfigApplyRequest, config_admission, config_apply_result, provider_config_revision,
-    sandbox_config_revision,
-};
+use openshell_supervisor_process::supervisor_session::ConfigApplyRequest;
 use provider_readiness::{EnvironmentIdentity, Tracker as ProviderReadinessTracker};
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::time::timeout;
@@ -1003,60 +999,17 @@ async fn run_sandbox_with_backend(
 
     // The bootstrap already initialized the runtime. Report what startup
     // installed before the workload starts.
-    let mut prepared_bootstrap_result = stream_bootstrap.as_ref().map(|bootstrap| {
-        use openshell_core::proto::{ConfigApplyOutcome, ConfigComponent};
-
-        let provider = bootstrap.provider_environment.as_ref().map(|snapshot| {
-            let revision = provider_config_revision(snapshot.provider_env_revision);
-            let outcome = if provider_bootstrap_degraded {
-                ConfigApplyOutcome::Degraded
-            } else {
-                ConfigApplyOutcome::Applied
-            };
-            config_apply_result(
-                ConfigComponent::ProviderEnvironment,
-                Some(revision.clone()),
-                Some(revision),
-                outcome,
-                None,
+    let mut prepared_bootstrap_result = stream_bootstrap
+        .as_ref()
+        .zip(initial_stream_snapshot.as_ref())
+        .map(|(bootstrap, snapshot)| {
+            startup_bootstrap_result(
+                bootstrap.update_id.clone(),
+                snapshot,
+                provider_bootstrap_degraded
+                    || middleware_registry_status != MiddlewareRegistryStatus::Synchronized,
             )
         });
-        let sandbox = initial_stream_snapshot.as_ref().map(|snapshot| {
-            let revision = sandbox_config_revision(snapshot);
-            let result = if snapshot.configuration_admitted {
-                // Unreachable middleware leaves the policy enforced with only
-                // built-in middleware until the runtime connects it.
-                let outcome =
-                    if middleware_registry_status == MiddlewareRegistryStatus::Synchronized {
-                        ConfigApplyOutcome::Applied
-                    } else {
-                        ConfigApplyOutcome::Degraded
-                    };
-                config_apply_result(
-                    ConfigComponent::SandboxConfig,
-                    Some(revision.clone()),
-                    Some(revision),
-                    outcome,
-                    None,
-                )
-            } else {
-                config_apply_result(
-                    ConfigComponent::SandboxConfig,
-                    Some(revision),
-                    None,
-                    ConfigApplyOutcome::FailedClosed,
-                    Some((
-                        "configuration_rejected",
-                        &snapshot.configuration_error,
-                        true,
-                    )),
-                )
-            };
-            let admission = config_admission(snapshot, config_apply_result_activates(&result));
-            (result, admission)
-        });
-        bootstrap_result(provider, sandbox, true)
-    });
 
     if credential_gating_unavailable(
         &loaded_policy_origin,

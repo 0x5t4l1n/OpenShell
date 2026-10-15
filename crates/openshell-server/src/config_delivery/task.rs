@@ -3,10 +3,10 @@
 
 //! One delivery task per push session.
 //!
-//! A publication only marks the components a session must rebuild, so
-//! repeated publications coalesce into one build. The session's task takes
-//! the marks after it holds a build permit, so every build reads state at
-//! least as new as every publication it covers.
+//! A publication only marks a session for a rebuild, so repeated
+//! publications coalesce into one build. The session's task takes the mark
+//! after it holds a build permit, so every build reads state at least as new
+//! as every publication it covers.
 //!
 //! Build permits come from one FIFO semaphore sized from the database pool.
 
@@ -15,16 +15,16 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use metrics::{Gauge, gauge, histogram};
+use openshell_core::proto::ProviderEnvironmentSnapshot;
 use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore};
 use tokio::time::Instant;
 
-use super::ConfigComponents;
-
-/// How often a session rebuilds its sandbox configuration, any component
-/// its supervisor failed to apply, and both halves of a staged deadlock, to
-/// repair a missed publication or retry a failure that may have cleared. A session first reconciles one to two intervals after it
-/// registers, at a random offset, so reconciliation is a steady trickle
-/// rather than a burst and never repeats the bootstrap it just applied.
+/// How often a session rebuilds its configuration, to repair a missed
+/// publication or retry an update its supervisor failed to apply. Unchanged
+/// configuration the supervisor already acknowledged is not sent again. A
+/// session first reconciles one to two intervals after it registers, at a
+/// random offset, so reconciliation is a steady trickle rather than a burst
+/// and never repeats the bootstrap it just applied.
 pub(super) const RECONCILE_INTERVAL: Duration = Duration::from_secs(30);
 const MIN_FAILURE_BACKOFF: Duration = Duration::from_secs(1);
 const MAX_FAILURE_BACKOFF: Duration = Duration::from_secs(30);
@@ -47,6 +47,8 @@ pub struct Registration {
     pub session_id: String,
     pub workspace: String,
     pub providers: HashSet<String>,
+    /// The provider environment the bootstrap delivered.
+    pub provider_environment: Option<ProviderEnvironmentSnapshot>,
     /// [`super::ConfigDelivery::publications`] observed before the bootstrap
     /// inputs were read.
     pub captured_seq: u64,
@@ -59,11 +61,14 @@ pub(super) struct SessionRecord {
     workspace: String,
     marks: Mutex<Marks>,
     wake: Notify,
+    /// The last provider environment this session resolved, reused while the
+    /// sandbox configuration names it.
+    provider_environment: Mutex<Option<ProviderEnvironmentSnapshot>>,
 }
 
 #[derive(Debug, Default)]
 struct Marks {
-    dirty: ConfigComponents,
+    dirty: bool,
     dirty_since: Option<Instant>,
     dirty_gauge: Option<GaugeGuard>,
     /// Attachments read by the last build, for provider-scoped fanouts.
@@ -92,7 +97,22 @@ impl SessionRecord {
                 ..Marks::default()
             }),
             wake: Notify::new(),
+            provider_environment: Mutex::new(registration.provider_environment),
         }
+    }
+
+    pub(super) fn provider_environment(&self) -> Option<ProviderEnvironmentSnapshot> {
+        self.provider_environment
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    pub(super) fn cache_provider_environment(&self, snapshot: ProviderEnvironmentSnapshot) {
+        *self
+            .provider_environment
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(snapshot);
     }
 
     /// Delivery is best effort beside the session lifecycle, so a poisoned
@@ -103,31 +123,28 @@ impl SessionRecord {
 
     /// Wakes the task only when the session becomes dirty, so a waiter keeps
     /// its place in the permit queue.
-    pub(super) fn mark(&self, components: ConfigComponents) {
-        if self.add_marks(components) {
+    pub(super) fn mark(&self) {
+        if self.add_mark() {
             self.wake.notify_one();
         }
     }
 
     /// Returns whether the session became dirty.
-    fn add_marks(&self, components: ConfigComponents) -> bool {
+    fn add_mark(&self) -> bool {
         let mut marks = self.marks();
-        if marks.closed || components.is_empty() {
+        if marks.closed || marks.dirty {
             return false;
         }
-        let became_dirty = marks.dirty.is_empty();
-        if became_dirty {
-            marks.dirty_since = Some(Instant::now());
-            marks.dirty_gauge = Some(GaugeGuard::acquire(gauge!(DIRTY_SESSIONS)));
-        }
-        marks.dirty = marks.dirty.union(components);
-        became_dirty
+        marks.dirty = true;
+        marks.dirty_since = Some(Instant::now());
+        marks.dirty_gauge = Some(GaugeGuard::acquire(gauge!(DIRTY_SESSIONS)));
+        true
     }
 
     pub(super) fn close(&self) {
         let mut marks = self.marks();
         marks.closed = true;
-        marks.dirty = ConfigComponents::default();
+        marks.dirty = false;
         marks.dirty_gauge = None;
         drop(marks);
         self.wake.notify_one();
@@ -150,27 +167,27 @@ impl SessionRecord {
         let marks = self.marks();
         if marks.closed {
             Status::Closed
-        } else if marks.dirty.is_empty() {
-            Status::Clean
-        } else {
+        } else if marks.dirty {
             Status::Dirty
+        } else {
+            Status::Clean
         }
     }
 
-    /// Take the marked components once a build permit is held.
-    fn take(&self) -> Option<ConfigComponents> {
+    /// Take the mark once a build permit is held. Returns false when there
+    /// was none.
+    fn take(&self) -> bool {
         let mut marks = self.marks();
-        if marks.dirty.is_empty() {
-            return None;
+        if !std::mem::take(&mut marks.dirty) {
+            return false;
         }
-        let components = std::mem::take(&mut marks.dirty);
         marks.dirty_gauge = None;
         marks.building = true;
         if let Some(since) = marks.dirty_since.take() {
             histogram!("openshell_supervisor_config_queue_wait_seconds")
                 .record(since.elapsed().as_secs_f64());
         }
-        Some(components)
+        true
     }
 
     fn finish(&self, providers: Option<HashSet<String>>) {
@@ -202,23 +219,17 @@ pub(super) async fn acquire_permit(
     }
 }
 
-/// Build and deliver one taken set of components. Returns the components
-/// whose build failed and the attachments the builds read.
+/// Build and deliver a session's configuration. Returns whether the build
+/// failed and the attachments it read.
 pub(super) trait Deliver: Sync {
     fn deliver(
         &self,
         record: &SessionRecord,
-        components: ConfigComponents,
-    ) -> impl Future<Output = (ConfigComponents, Option<HashSet<String>>)> + Send;
-
-    /// Components reconciliation rebuilds beyond the sandbox configuration:
-    /// ones the supervisor failed to apply, and halves staged waiting for
-    /// each other.
-    fn repair(&self, record: &SessionRecord) -> ConfigComponents;
+    ) -> impl Future<Output = (bool, Option<HashSet<String>>)> + Send;
 }
 
-/// Run a session's deliveries until it closes, rebuilding its sandbox
-/// configuration and any component needing repair every `reconcile_interval`.
+/// Run a session's deliveries until it closes, rebuilding its configuration
+/// every `reconcile_interval`.
 pub(super) async fn run(
     record: Arc<SessionRecord>,
     builds: &Arc<Semaphore>,
@@ -238,21 +249,20 @@ pub(super) async fn run(
                 () = record.wake.notified() => {}
                 () = tokio::time::sleep_until(next_reconcile) => {
                     next_reconcile = Instant::now() + reconcile_interval;
-                    let components = ConfigComponents::SANDBOX_CONFIG.union(deliver.repair(&record));
-                    record.mark(components);
+                    record.mark();
                 }
             }
         }
         let Some(permit) = acquire_permit(builds, &record).await else {
             return;
         };
-        let Some(components) = record.take() else {
+        if !record.take() {
             continue;
-        };
-        let (failed, providers) = deliver.deliver(&record, components).await;
+        }
+        let (failed, providers) = deliver.deliver(&record).await;
         drop(permit);
         record.finish(providers);
-        if failed.is_empty() {
+        if !failed {
             failures = 0;
             continue;
         }
@@ -270,7 +280,7 @@ pub(super) async fn run(
         }
         failures = failures.saturating_add(1);
         // The task is awake, so the retry needs no wakeup.
-        record.add_marks(failed);
+        record.add_mark();
     }
 }
 
@@ -309,8 +319,7 @@ impl Drop for GaugeGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config_delivery::ConfigComponentKind;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     /// Long enough that the reconcile timer never fires in a test that does
     /// not ask for it.
@@ -322,6 +331,7 @@ mod tests {
             session_id: format!("{sandbox_id}-session"),
             workspace: workspace.to_string(),
             providers: providers.iter().map(ToString::to_string).collect(),
+            provider_environment: None,
             captured_seq: 0,
         }))
     }
@@ -330,39 +340,29 @@ mod tests {
         Arc::new(Semaphore::new(permits))
     }
 
-    /// Records each delivery and fails the components in `fail`. Reports the
-    /// components in `rejected` as rejected by the supervisor.
+    /// Counts deliveries and fails them while `fail` is set.
     #[derive(Default)]
     struct Recorder {
-        delivered: Mutex<Vec<ConfigComponents>>,
-        fail: Mutex<ConfigComponents>,
-        rejected: Mutex<ConfigComponents>,
+        fail: AtomicBool,
         gate: Option<Arc<Semaphore>>,
         calls: AtomicUsize,
+        delivered: AtomicUsize,
     }
 
     impl Deliver for Recorder {
-        async fn deliver(
-            &self,
-            _record: &SessionRecord,
-            components: ConfigComponents,
-        ) -> (ConfigComponents, Option<HashSet<String>>) {
+        async fn deliver(&self, _record: &SessionRecord) -> (bool, Option<HashSet<String>>) {
             self.calls.fetch_add(1, Ordering::SeqCst);
             if let Some(gate) = &self.gate {
                 gate.acquire().await.unwrap().forget();
             }
-            self.delivered.lock().unwrap().push(components);
-            (*self.fail.lock().unwrap(), None)
-        }
-
-        fn repair(&self, _record: &SessionRecord) -> ConfigComponents {
-            *self.rejected.lock().unwrap()
+            self.delivered.fetch_add(1, Ordering::SeqCst);
+            (self.fail.load(Ordering::SeqCst), None)
         }
     }
 
     impl Recorder {
-        fn delivered(&self) -> Vec<ConfigComponents> {
-            self.delivered.lock().unwrap().clone()
+        fn delivered(&self) -> usize {
+            self.delivered.load(Ordering::SeqCst)
         }
     }
 
@@ -375,13 +375,10 @@ mod tests {
     #[test]
     fn marks_coalesce_until_taken() {
         let record = record("sb", "ws", &[]);
-        assert!(record.add_marks(ConfigComponents::SANDBOX_CONFIG));
-        assert!(!record.add_marks(ConfigComponents::SANDBOX_CONFIG));
-        assert!(!record.add_marks(ConfigComponents::only(
-            ConfigComponentKind::ProviderEnvironment
-        )));
-        assert_eq!(record.take(), Some(ConfigComponents::ALL));
-        assert_eq!(record.take(), None);
+        assert!(record.add_mark());
+        assert!(!record.add_mark());
+        assert!(record.take());
+        assert!(!record.take());
     }
 
     #[test]
@@ -396,8 +393,8 @@ mod tests {
         assert!(!other.in_scope(&scope));
         assert!(!record("c", "other", &["github"]).in_scope(&scope));
 
-        other.mark(ConfigComponents::ALL);
-        other.take().unwrap();
+        other.mark();
+        assert!(other.take());
         assert!(other.in_scope(&scope), "a running build may attach it");
         other.finish(Some(HashSet::from(["github".to_string()])));
         assert!(other.in_scope(&scope));
@@ -414,7 +411,7 @@ mod tests {
             ..Recorder::default()
         });
         let session = record("sb", "ws", &[]);
-        session.mark(ConfigComponents::SANDBOX_CONFIG);
+        session.mark();
         let task = tokio::spawn({
             let session = Arc::clone(&session);
             let recorder = Arc::clone(&recorder);
@@ -424,17 +421,11 @@ mod tests {
         assert_eq!(recorder.calls.load(Ordering::SeqCst), 1);
 
         for _ in 0..5 {
-            session.mark(ConfigComponents::SANDBOX_CONFIG);
+            session.mark();
         }
-        session.mark(ConfigComponents::only(
-            ConfigComponentKind::ProviderEnvironment,
-        ));
-        gate.add_permits(2);
+        gate.add_permits(3);
         settle().await;
-        assert_eq!(
-            recorder.delivered(),
-            [ConfigComponents::SANDBOX_CONFIG, ConfigComponents::ALL]
-        );
+        assert_eq!(recorder.delivered(), 2);
 
         session.close();
         task.await.unwrap();
@@ -444,9 +435,9 @@ mod tests {
     async fn failed_builds_retry_with_backoff_until_they_succeed() {
         let builds = builds(4);
         let recorder = Arc::new(Recorder::default());
-        *recorder.fail.lock().unwrap() = ConfigComponents::SANDBOX_CONFIG;
+        recorder.fail.store(true, Ordering::SeqCst);
         let session = record("sb", "ws", &[]);
-        session.mark(ConfigComponents::SANDBOX_CONFIG);
+        session.mark();
         let task = tokio::spawn({
             let session = Arc::clone(&session);
             let recorder = Arc::clone(&recorder);
@@ -462,10 +453,13 @@ mod tests {
         settle().await;
         assert_eq!(recorder.calls.load(Ordering::SeqCst), 2);
 
-        *recorder.fail.lock().unwrap() = ConfigComponents::default();
+        recorder.fail.store(false, Ordering::SeqCst);
         tokio::time::advance(Duration::from_secs(2)).await;
         settle().await;
         assert_eq!(recorder.calls.load(Ordering::SeqCst), 3, "then 2 s");
+        tokio::time::advance(Duration::from_mins(1)).await;
+        settle().await;
+        assert_eq!(recorder.calls.load(Ordering::SeqCst), 3, "then stops");
 
         session.close();
         task.await.unwrap();
@@ -478,7 +472,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn idle_sessions_reconcile_their_sandbox_configuration() {
+    async fn idle_sessions_reconcile_their_configuration() {
         let builds = builds(4);
         let recorder = Arc::new(Recorder::default());
         let session = record("sb", "ws", &[]);
@@ -491,40 +485,13 @@ mod tests {
 
         tokio::time::advance(RECONCILE_INTERVAL).await;
         settle().await;
-        assert!(recorder.delivered().is_empty(), "not right after bootstrap");
+        assert_eq!(recorder.delivered(), 0, "not right after bootstrap");
         tokio::time::advance(RECONCILE_INTERVAL).await;
         settle().await;
-        assert_eq!(recorder.delivered(), [ConfigComponents::SANDBOX_CONFIG]);
+        assert_eq!(recorder.delivered(), 1);
         tokio::time::advance(RECONCILE_INTERVAL).await;
         settle().await;
-        assert_eq!(recorder.delivered().len(), 2);
-
-        session.close();
-        task.await.unwrap();
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn reconciliation_retries_rejected_components() {
-        let builds = builds(4);
-        let recorder = Arc::new(Recorder::default());
-        *recorder.rejected.lock().unwrap() =
-            ConfigComponents::only(ConfigComponentKind::ProviderEnvironment);
-        let session = record("sb", "ws", &[]);
-        let task = tokio::spawn({
-            let session = Arc::clone(&session);
-            let recorder = Arc::clone(&recorder);
-            async move { run(session, &builds, recorder.as_ref(), RECONCILE_INTERVAL).await }
-        });
-        settle().await;
-
-        tokio::time::advance(RECONCILE_INTERVAL * 2).await;
-        settle().await;
-        assert_eq!(recorder.delivered(), [ConfigComponents::ALL]);
-
-        *recorder.rejected.lock().unwrap() = ConfigComponents::default();
-        tokio::time::advance(RECONCILE_INTERVAL).await;
-        settle().await;
-        assert_eq!(recorder.delivered()[1], ConfigComponents::SANDBOX_CONFIG);
+        assert_eq!(recorder.delivered(), 2);
 
         session.close();
         task.await.unwrap();
@@ -536,7 +503,7 @@ mod tests {
         let _held = Arc::clone(&builds).acquire_owned().await.unwrap();
         let recorder = Arc::new(Recorder::default());
         let session = record("sb", "ws", &[]);
-        session.mark(ConfigComponents::ALL);
+        session.mark();
         let task = tokio::spawn({
             let session = Arc::clone(&session);
             let builds = Arc::clone(&builds);
@@ -547,8 +514,8 @@ mod tests {
 
         session.close();
         task.await.unwrap();
-        assert!(recorder.delivered().is_empty());
-        session.mark(ConfigComponents::ALL);
-        assert_eq!(session.take(), None);
+        assert_eq!(recorder.delivered(), 0);
+        session.mark();
+        assert!(!session.take());
     }
 }

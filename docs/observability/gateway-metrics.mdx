@@ -255,33 +255,33 @@ empty in poll mode, where `GetSandboxConfig` and
 
 | Metric | Type | Labels | Description |
 |---|---|---|---|
-| `openshell_supervisor_config_builds_total` | Counter | `component`, `outcome` | Configuration builds for sessions on this replica. |
-| `openshell_supervisor_config_build_duration_seconds` | Histogram | `component`, `outcome` | Time to build one component, including store reads and credential resolution. |
+| `openshell_supervisor_config_builds_total` | Counter | `outcome` | Configuration builds for sessions on this replica. |
+| `openshell_supervisor_config_build_duration_seconds` | Histogram | `outcome` | Time to build one configuration, including store reads and credential resolution. |
 | `openshell_supervisor_config_queue_wait_seconds` | Summary | None | Time from a session needing a rebuild to its build starting. |
 | `openshell_supervisor_config_dirty_sessions` | Gauge | None | Sessions with a rebuild pending. |
-| `openshell_supervisor_config_deliveries_total` | Counter | `component`, `outcome` | What happened to each built snapshot. |
-| `openshell_supervisor_config_apply_results_total` | Counter | `component`, `outcome` | Apply results that supervisors reported. |
-| `openshell_supervisor_config_apply_duration_seconds` | Histogram | `component`, `outcome` | Time from queuing an update on the supervisor session to receiving its apply result. |
+| `openshell_supervisor_config_deliveries_total` | Counter | `outcome` | What happened to each built configuration. |
+| `openshell_supervisor_config_apply_results_total` | Counter | `outcome` | Apply results that supervisors reported. |
+| `openshell_supervisor_config_apply_duration_seconds` | Histogram | `outcome` | Time from queuing an update on the supervisor session to receiving its apply result. |
 | `openshell_supervisor_policy_apply_results_total` | Counter | `source`, `outcome` | Sandbox policy load results that supervisors reported. `source` is `polling` or `stream`, and `outcome` is `loaded` or `failed`. |
 | `openshell_supervisor_config_bootstrap_total` | Counter | `outcome` | Session bootstraps: `built` or `build_failed`. |
-| `openshell_supervisor_config_bootstrap_revision_mismatches_total` | Counter | None | Bootstrap builds retried because the two components disagreed on provider revision, provider attachments, or effective policy. |
 | `openshell_supervisor_config_peer_notifications_total` | Counter | `outcome` | Notifications sent to the replica that owns a sandbox's session. |
 | `openshell_supervisor_config_result_writes_total` | Counter | `kind`, `outcome` | Admission and policy-result writes for running workloads, which a single background writer persists after the supervisor is acknowledged. |
 | `openshell_supervisor_config_result_writes_pending` | Gauge | None | Sandboxes with result writes waiting for the background writer. |
 
 The labels take these values:
 
-- `component` is `sandbox_config` or `provider_environment`. On
-  `apply_results_total` and `apply_duration_seconds` it is the protocol name,
-  such as `CONFIG_COMPONENT_SANDBOX_CONFIG`, and `outcome` is a
-  `ConfigApplyOutcome` name, such as `CONFIG_APPLY_OUTCOME_APPLIED`.
+- Each configuration carries the sandbox configuration and the provider
+  environment it names. Credentials are resolved only when that provider
+  environment changed.
 - On builds, `outcome` is `ok`, `failed`, or `timeout`. A failed build retries
   with a per-session backoff from 1 to 30 seconds. Each session also rebuilds
-  its sandbox configuration every 30 seconds to repair a missed change.
-- On deliveries, `outcome` is `queued`, `replaced` (a newer snapshot replaced
-  an unsent one), `coalesced` (held until the supervisor acknowledges its
+  its configuration every 30 seconds to repair a missed change.
+- On deliveries, `outcome` is `queued`, `replaced` (a newer configuration
+  replaced an unsent one), `coalesced` (held until the supervisor acknowledges its
   previous update), `unchanged`, `no_active_session`, `unsupported_session`,
   `payload_too_large`, `owner_moved`, or `owner_lookup_failed`.
+- On `apply_results_total` and `apply_duration_seconds`, `outcome` is a
+  `ConfigApplyOutcome` name, such as `CONFIG_APPLY_OUTCOME_APPLIED`.
 - On peer notifications, `outcome` is `accepted`, `stale_owner`,
   `unsupported_peer`, `peer_error`, or `timeout`.
 - On result writes, `kind` is `admission` or `policy_result`, and `outcome`

@@ -2243,11 +2243,10 @@ pub fn spawn_refresh_worker(state: std::sync::Arc<crate::ServerState>, interval:
             {
                 Ok(providers) => {
                     for (workspace, provider_name) in providers {
-                        crate::config_delivery::publish_provider_components(
+                        crate::config_delivery::publish_provider(
                             &state,
                             &workspace,
                             &provider_name,
-                            crate::config_delivery::ConfigComponents::ALL,
                         );
                     }
                 }

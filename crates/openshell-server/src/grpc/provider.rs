@@ -2607,27 +2607,15 @@ async fn authorize_and_resolve_profile_workspace(
 
 /// Publish a provider record change to the sandboxes that attach it.
 fn publish_provider_change(state: &Arc<ServerState>, workspace: &str, provider_name: &str) {
-    crate::config_delivery::publish_provider_components(
-        state,
-        workspace,
-        provider_name,
-        crate::config_delivery::ConfigComponents::ALL,
-    );
+    crate::config_delivery::publish_provider(state, workspace, provider_name);
 }
 
 /// A profile change affects every provider of its type in scope.
 fn publish_provider_profile_change(state: &Arc<ServerState>, workspace: &str) {
     if workspace.is_empty() {
-        crate::config_delivery::publish_all_connected(
-            state,
-            crate::config_delivery::ConfigComponents::ALL,
-        );
+        crate::config_delivery::publish_all_connected(state);
     } else {
-        crate::config_delivery::publish_workspace_components(
-            state,
-            workspace,
-            crate::config_delivery::ConfigComponents::ALL,
-        );
+        crate::config_delivery::publish_workspace(state, workspace);
     }
 }
 

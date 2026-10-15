@@ -11,13 +11,15 @@ use std::time::Duration;
 use miette::Result;
 use openshell_core::PolicyValidationFailureMode;
 use openshell_core::proposals::AgentProposals;
-use openshell_core::proto::ProviderReadinessReason;
+use openshell_core::proto::{
+    ConfigApplyFailure, ConfigApplyOutcome, ConfigUpdateResult, PolicyLoadResult,
+    ProviderReadinessReason, SandboxConfigurationAdmission,
+};
 use openshell_ocsf::{ConfigStateChangeBuilder, SeverityId, StateId, StatusId, ocsf_emit};
 use openshell_supervisor_network::opa::PolicyGenerationGuard;
 use openshell_supervisor_process::skills;
 use openshell_supervisor_process::supervisor_session::{
-    ConfigApplyRequest, config_admission, config_apply_result, provider_config_revision,
-    sandbox_config_revision,
+    ConfigApplyRequest, config_admission, config_apply_failure, sandbox_config_revision,
 };
 use tracing::{debug, info, warn};
 
@@ -45,65 +47,88 @@ async fn receive_config_apply(
     }
 }
 
-pub fn config_apply_result_activates(
-    result: &openshell_core::proto::ConfigComponentApplyResult,
-) -> bool {
-    use openshell_core::proto::ConfigApplyOutcome;
-
-    matches!(
-        ConfigApplyOutcome::try_from(result.outcome),
-        Ok(ConfigApplyOutcome::Applied
-            | ConfigApplyOutcome::IgnoredDuplicate
-            | ConfigApplyOutcome::RetainedLocalOverride
-            | ConfigApplyOutcome::Degraded)
-    )
+/// What applying one delivered update produced, before its update ID is
+/// attached.
+#[derive(Clone, Debug)]
+struct DeliveredResult {
+    outcome: ConfigApplyOutcome,
+    failure: Option<ConfigApplyFailure>,
+    admission: SandboxConfigurationAdmission,
+    policy_load: Option<PolicyLoadResult>,
 }
 
-fn is_awaiting_component(result: &openshell_core::proto::ConfigComponentApplyResult) -> bool {
-    result.outcome == i32::from(openshell_core::proto::ConfigApplyOutcome::AwaitingComponent)
+impl DeliveredResult {
+    fn into_update_result(self, update_id: String) -> ConfigUpdateResult {
+        ConfigUpdateResult {
+            update_id,
+            outcome: self.outcome.into(),
+            failure: self.failure,
+            admission: Some(self.admission),
+            policy_load: self.policy_load,
+        }
+    }
 }
 
-/// A provider snapshot staged for its sandbox configuration is applied once
-/// that configuration activates with it.
-fn provider_applied_with_sandbox(
-    provider: openshell_core::proto::ConfigComponentApplyResult,
-    sandbox: &openshell_core::proto::ConfigComponentApplyResult,
-    provider_consumed: bool,
-) -> openshell_core::proto::ConfigComponentApplyResult {
-    if is_awaiting_component(&provider)
-        && provider_consumed
-        && config_apply_result_activates(sandbox)
-    {
-        config_apply_result(
-            openshell_core::proto::ConfigComponent::ProviderEnvironment,
-            provider.requested_revision.clone(),
-            provider.requested_revision,
-            openshell_core::proto::ConfigApplyOutcome::Applied,
-            None,
-        )
+/// Policy load result for a gateway sandbox policy revision, as polling
+/// reports it.
+fn sandbox_policy_load(
+    snapshot: &openshell_core::grpc_client::SettingsPollResult,
+    loaded: bool,
+    error: &str,
+) -> Option<PolicyLoadResult> {
+    (snapshot.version > 0 && snapshot.policy_source == openshell_core::proto::PolicySource::Sandbox)
+        .then(|| PolicyLoadResult {
+            version: snapshot.version,
+            loaded,
+            error: if loaded {
+                String::new()
+            } else {
+                error.chars().take(1024).collect()
+            },
+        })
+}
+
+fn policy_load_result(status: PolicyStatusUpdate) -> PolicyLoadResult {
+    PolicyLoadResult {
+        version: status.version,
+        loaded: status.loaded,
+        error: status.error,
+    }
+}
+
+/// Result for the bootstrap that startup installed before the workload
+/// starts.
+pub fn startup_bootstrap_result(
+    update_id: String,
+    snapshot: &openshell_core::grpc_client::SettingsPollResult,
+    degraded: bool,
+) -> ConfigUpdateResult {
+    let result = if snapshot.configuration_admitted {
+        DeliveredResult {
+            // Unreachable middleware leaves the policy enforced with only
+            // built-in middleware until the runtime connects it.
+            outcome: if degraded {
+                ConfigApplyOutcome::Degraded
+            } else {
+                ConfigApplyOutcome::Applied
+            },
+            failure: None,
+            admission: config_admission(snapshot, true),
+            policy_load: sandbox_policy_load(snapshot, true, ""),
+        }
     } else {
-        provider
-    }
-}
-
-/// Session result for a bootstrap, from its component results.
-pub fn bootstrap_result(
-    provider: Option<openshell_core::proto::ConfigComponentApplyResult>,
-    sandbox: Option<(
-        openshell_core::proto::ConfigComponentApplyResult,
-        openshell_core::proto::SandboxConfigurationAdmission,
-    )>,
-    provider_consumed: bool,
-) -> openshell_core::proto::ConfigBootstrapResult {
-    let (sandbox, admission) = sandbox.unzip();
-    let provider = provider.map(|provider| match sandbox.as_ref() {
-        Some(sandbox) => provider_applied_with_sandbox(provider, sandbox, provider_consumed),
-        None => provider,
-    });
-    openshell_core::proto::ConfigBootstrapResult {
-        results: provider.into_iter().chain(sandbox).collect(),
-        admission,
-    }
+        DeliveredResult {
+            outcome: ConfigApplyOutcome::FailedClosed,
+            failure: Some(config_apply_failure(
+                "configuration_rejected",
+                &snapshot.configuration_error,
+                true,
+            )),
+            admission: config_admission(snapshot, false),
+            policy_load: sandbox_policy_load(snapshot, false, &snapshot.configuration_error),
+        }
+    };
+    result.into_update_result(update_id)
 }
 
 #[derive(Debug)]
@@ -113,7 +138,7 @@ struct RejectedStreamSandbox {
     environment: EnvironmentIdentity,
     error: String,
     failure_mode: PolicyValidationFailureMode,
-    result: openshell_core::proto::ConfigComponentApplyResult,
+    result: DeliveredResult,
 }
 
 impl RejectedStreamSandbox {
@@ -131,17 +156,12 @@ impl RejectedStreamSandbox {
     }
 }
 
-/// Snapshots delivered over the supervisor session. Each component arrives
-/// separately, so a sandbox configuration and the provider environment it
-/// names wait for each other before either is installed.
+/// Configuration delivered over the supervisor session. Each update carries
+/// the sandbox configuration and the provider environment it names.
 #[derive(Default)]
 struct StreamConfigurationState {
     /// Provider environment installed from the last activated delivery.
     active_environment: EnvironmentIdentity,
-    /// Provider snapshot waiting for its matching sandbox configuration.
-    pending_provider: Option<CapturedProviderEnvironment>,
-    /// Sandbox configuration waiting for its matching provider snapshot.
-    pending_sandbox: Option<Box<openshell_core::grpc_client::SettingsPollResult>>,
     /// Last rejected configuration, so a redelivery does not quarantine the
     /// runtime again.
     rejected_sandbox: Option<Box<RejectedStreamSandbox>>,
@@ -157,8 +177,8 @@ enum ProviderSource {
     /// Policy polling fetches the environment when the requested one changed
     /// or the last installation needs a retry.
     Fetch,
-    /// Session delivery already staged the matching environment, or `None`
-    /// when the installed environment matches.
+    /// Session delivery prepared the environment its update carried, or
+    /// `None` when the installed environment matches.
     Delivered(Option<CapturedProviderEnvironment>),
 }
 
@@ -946,125 +966,83 @@ impl ConfigRuntime {
         client: &C,
         request: ConfigApplyRequest,
     ) {
-        use openshell_core::proto::config_update;
-
-        match request {
-            ConfigApplyRequest::Bootstrap {
-                bootstrap,
-                response,
-            } => {
-                let provider = match bootstrap.provider_environment {
-                    Some(snapshot) => Some(self.stage_delivered_provider(ctx, snapshot).await),
-                    None => None,
-                };
-                let sandbox = match bootstrap.sandbox_config {
-                    Some(snapshot) => Some(
-                        self.apply_delivered_sandbox(ctx, client, snapshot.into())
-                            .await,
-                    ),
-                    None => None,
-                };
-                let _ = response.send(bootstrap_result(
-                    provider,
-                    sandbox,
-                    self.stream.pending_provider.is_none(),
-                ));
-            }
-            ConfigApplyRequest::Update { update, response } => {
-                let (result, admission) = match update.component {
-                    Some(config_update::Component::SandboxConfig(snapshot)) => {
-                        let (result, admission) = self
-                            .apply_delivered_sandbox(ctx, client, snapshot.into())
-                            .await;
-                        (result, Some(admission))
-                    }
-                    Some(config_update::Component::ProviderEnvironment(snapshot)) => {
-                        let mut result = self.stage_delivered_provider(ctx, snapshot).await;
-                        if is_awaiting_component(&result)
-                            && let Some(sandbox) = self.stream.pending_sandbox.take()
-                        {
-                            let (sandbox_result, _) =
-                                self.apply_delivered_sandbox(ctx, client, *sandbox).await;
-                            result = provider_applied_with_sandbox(
-                                result,
-                                &sandbox_result,
-                                self.stream.pending_provider.is_none(),
-                            );
-                        }
-                        (result, None)
-                    }
-                    None => (
-                        config_apply_result(
-                            openshell_core::proto::ConfigComponent::Unspecified,
-                            None,
-                            None,
-                            openshell_core::proto::ConfigApplyOutcome::Unsupported,
-                            Some((
-                                "unsupported_component",
-                                "configuration update has no supported component",
-                                false,
-                            )),
-                        ),
-                        None,
-                    ),
-                };
-                let _ = response.send(openshell_core::proto::ConfigUpdateResult {
-                    update_id: update.update_id,
-                    component_sequence: update.component_sequence,
-                    result: Some(result),
-                    admission,
-                });
-            }
-        }
+        let ConfigApplyRequest { update, response } = request;
+        let openshell_core::proto::ConfigUpdate {
+            update_id,
+            sandbox_config,
+            provider_environment,
+        } = update;
+        let (Some(sandbox_config), Some(provider_environment)) =
+            (sandbox_config, provider_environment)
+        else {
+            // The session validates updates before they reach the runtime.
+            let _ = response.send(ConfigUpdateResult {
+                update_id,
+                outcome: ConfigApplyOutcome::Unsupported.into(),
+                failure: Some(config_apply_failure(
+                    "invalid_update",
+                    "configuration update is missing a configuration part",
+                    false,
+                )),
+                admission: None,
+                policy_load: None,
+            });
+            return;
+        };
+        let result = self
+            .apply_delivered_sandbox(ctx, client, sandbox_config.into(), provider_environment)
+            .await;
+        let _ = response.send(result.into_update_result(update_id));
     }
 
-    /// Apply a delivered sandbox configuration. Unless the provider
-    /// environment it names is installed, it waits for that snapshot.
+    /// Apply a delivered sandbox configuration with the provider environment
+    /// it names. The environment is installed only when the runtime does not
+    /// already hold it; one that cannot be installed rejects the update, as a
+    /// failed fetch does when polling.
     async fn apply_delivered_sandbox<C: PolicyGatewayClient>(
         &mut self,
         ctx: &PolicyPollLoopContext,
         client: &C,
         snapshot: openshell_core::grpc_client::SettingsPollResult,
-    ) -> (
-        openshell_core::proto::ConfigComponentApplyResult,
-        openshell_core::proto::SandboxConfigurationAdmission,
-    ) {
-        use openshell_core::proto::{ConfigApplyOutcome, ConfigComponent};
-
+        provider_environment: openshell_core::proto::ProviderEnvironmentSnapshot,
+    ) -> DeliveredResult {
         let requested_revision = sandbox_config_revision(&snapshot);
         let desired_environment = EnvironmentIdentity::from_settings(&snapshot);
         let provider = if !snapshot.configuration_admitted {
-            // A rejected generation supersedes one waiting for its provider.
-            self.stream.pending_sandbox = None;
             if self.reloads_gateway_policy
                 && let Some(rejected) = self.stream.rejected_sandbox.as_ref()
                 && rejected.matches(&snapshot, &requested_revision, &desired_environment)
             {
-                return (rejected.result.clone(), config_admission(&snapshot, false));
+                return DeliveredResult {
+                    admission: config_admission(&snapshot, false),
+                    ..rejected.result.clone()
+                };
             }
             None
         } else if desired_environment == self.stream.active_environment {
             None
-        } else if let Some(provider) = self
-            .stream
-            .pending_provider
-            .as_ref()
-            .filter(|provider| provider.identity == desired_environment)
-        {
-            Some(provider.clone())
         } else {
-            let admission = config_admission(&snapshot, false);
-            self.stream.pending_sandbox = Some(Box::new(snapshot));
-            return (
-                config_apply_result(
-                    ConfigComponent::SandboxConfig,
-                    Some(requested_revision),
-                    None,
-                    ConfigApplyOutcome::AwaitingComponent,
-                    None,
-                ),
-                admission,
-            );
+            match self
+                .prepare_delivered_provider(ctx, provider_environment, &desired_environment)
+                .await
+            {
+                Ok(prepared) => Some(prepared),
+                Err(failure) => {
+                    // Static credentials were revoked, so this configuration
+                    // is not applied until its environment installs.
+                    let outcome = if self.applied_revision.is_some() {
+                        ConfigApplyOutcome::FailedRetainedLastKnownGood
+                    } else {
+                        ConfigApplyOutcome::FailedClosed
+                    };
+                    return DeliveredResult {
+                        outcome,
+                        failure: Some(failure),
+                        admission: config_admission(&snapshot, false),
+                        policy_load: None,
+                    };
+                }
+            }
         };
 
         // Once a later configuration reconciles, its result governs the
@@ -1079,46 +1057,39 @@ impl ConfigRuntime {
             self.stream.degraded_startup = None;
         }
         let consumes_provider = provider.is_some();
-        let rejection = match self
+        let (rejection, policy_status) = match self
             .reconcile(ctx, client, &snapshot, ProviderSource::Delivered(provider))
             .await
         {
             Ok(Reconciled {
                 outcome: ReconcileOutcome::Rejected(rejection),
-                ..
-            }) => rejection,
-            Ok(Reconciled { outcome, .. }) => {
+                policy_status,
+            }) => (rejection, policy_status),
+            Ok(Reconciled {
+                outcome,
+                policy_status,
+            }) => {
                 if consumes_provider {
                     self.stream.active_environment = desired_environment;
-                    self.stream.pending_provider = None;
                 }
-                self.stream.pending_sandbox = None;
                 self.stream.rejected_sandbox = None;
                 self.stream.degraded_startup = None;
                 let _ = ctx.workspace_tx.send(snapshot.workspace.clone());
-                let (outcome, applied_revision) = if !self.reloads_gateway_policy {
-                    (ConfigApplyOutcome::RetainedLocalOverride, None)
+                let outcome = if !self.reloads_gateway_policy {
+                    ConfigApplyOutcome::RetainedLocalOverride
                 } else if matches!(outcome, ReconcileOutcome::Unchanged) {
-                    (
-                        ConfigApplyOutcome::IgnoredDuplicate,
-                        Some(requested_revision.clone()),
-                    )
+                    ConfigApplyOutcome::IgnoredDuplicate
                 } else {
-                    (
-                        ConfigApplyOutcome::Applied,
-                        Some(requested_revision.clone()),
-                    )
+                    ConfigApplyOutcome::Applied
                 };
                 let admission = config_admission(&snapshot, true);
                 self.commit(snapshot);
-                let result = config_apply_result(
-                    ConfigComponent::SandboxConfig,
-                    Some(requested_revision),
-                    applied_revision,
+                return DeliveredResult {
                     outcome,
-                    None,
-                );
-                return (result, admission);
+                    failure: None,
+                    admission,
+                    policy_load: policy_status.map(policy_load_result),
+                };
             }
             Err(error) => {
                 // Polling ends its loop on this error; session delivery
@@ -1134,14 +1105,16 @@ impl ConfigRuntime {
                         snapshot.config_revision
                     ))
                     .build());
-                let result = config_apply_result(
-                    ConfigComponent::SandboxConfig,
-                    Some(requested_revision),
-                    None,
-                    ConfigApplyOutcome::FailedClosed,
-                    Some(("configuration_rejected", &error.to_string(), true)),
-                );
-                return (result, config_admission(&snapshot, false));
+                return DeliveredResult {
+                    outcome: ConfigApplyOutcome::FailedClosed,
+                    failure: Some(config_apply_failure(
+                        "configuration_rejected",
+                        &error.to_string(),
+                        true,
+                    )),
+                    admission: config_admission(&snapshot, false),
+                    policy_load: None,
+                };
             }
         };
 
@@ -1153,7 +1126,9 @@ impl ConfigRuntime {
         let outcome = match retained_revision.as_ref() {
             // The requested configuration is still the enforced one, so only
             // its runtime upgrade failed, as at a degraded startup.
-            Some(retained) if *retained == requested_revision => ConfigApplyOutcome::Degraded,
+            Some(retained) if *retained == requested_revision && !consumes_provider => {
+                ConfigApplyOutcome::Degraded
+            }
             Some(_) => ConfigApplyOutcome::FailedRetainedLastKnownGood,
             None => ConfigApplyOutcome::FailedClosed,
         };
@@ -1167,17 +1142,16 @@ impl ConfigRuntime {
             (None, config_admission(&snapshot, true))
         } else {
             (
-                Some((rejection.code, detail, true)),
+                Some(config_apply_failure(rejection.code, detail, true)),
                 config_admission(&snapshot, false),
             )
         };
-        let result = config_apply_result(
-            ConfigComponent::SandboxConfig,
-            Some(requested_revision.clone()),
-            retained_revision,
+        let result = DeliveredResult {
             outcome,
             failure,
-        );
+            admission,
+            policy_load: policy_status.map(policy_load_result),
+        };
         if !snapshot.configuration_admitted {
             self.stream.rejected_sandbox = Some(Box::new(RejectedStreamSandbox {
                 configuration_instance_id: snapshot.configuration_instance_id.clone(),
@@ -1187,97 +1161,81 @@ impl ConfigRuntime {
                 failure_mode: snapshot.policy_validation_failure_mode,
                 result: result.clone(),
             }));
-        } else if consumes_provider {
-            // Retry when the matching provider snapshot is delivered again.
-            self.stream.pending_sandbox = Some(Box::new(snapshot));
         }
-        (result, admission)
+        result
     }
 
-    /// Stage a delivered provider environment until the sandbox configuration
-    /// that names it arrives. An environment that cannot be installed revokes
-    /// static credentials, as a failed refresh does when polling.
-    async fn stage_delivered_provider(
+    /// Prepare the provider environment an update carried. One that does not
+    /// match the configuration naming it, or cannot be installed, revokes
+    /// static credentials as a failed refresh does when polling.
+    async fn prepare_delivered_provider(
         &mut self,
         ctx: &PolicyPollLoopContext,
         snapshot: openshell_core::proto::ProviderEnvironmentSnapshot,
-    ) -> openshell_core::proto::ConfigComponentApplyResult {
-        use openshell_core::proto::{ConfigApplyOutcome, ConfigComponent};
-
-        let requested_revision = provider_config_revision(snapshot.provider_env_revision);
+        desired: &EnvironmentIdentity,
+    ) -> std::result::Result<CapturedProviderEnvironment, ConfigApplyFailure> {
         let identity = EnvironmentIdentity {
             attachment_epoch: snapshot.provider_attachment_epoch.clone(),
             revision: snapshot.provider_env_revision,
             policy_hash: snapshot.policy_hash.clone(),
         };
-        if identity == self.stream.active_environment {
-            return config_apply_result(
-                ConfigComponent::ProviderEnvironment,
-                Some(requested_revision.clone()),
-                Some(requested_revision),
-                ConfigApplyOutcome::IgnoredDuplicate,
-                None,
-            );
-        }
-        // A newer component delivery supersedes any older unmatched provider
-        // snapshot. Never let a later sandbox delivery commit stale credentials.
-        self.stream.pending_provider = None;
-        let revision = identity.revision;
-        let failure =
+        let revision = desired.revision;
+        let failure = if identity == *desired {
             match openshell_core::grpc_client::ProviderEnvironmentResult::try_from(snapshot) {
                 Err(error) => {
                     self.revoke_provider_environment(
                         ctx,
-                        identity,
+                        desired.clone(),
                         ProviderReadinessReason::CredentialInstallFailed,
                         revision,
                     )
                     .await;
-                    ("invalid_provider_environment", error.to_string(), false)
+                    config_apply_failure("invalid_provider_environment", &error.to_string(), false)
                 }
                 Ok(provider) if !provider_environment_is_installable(provider.readiness_reason) => {
                     self.revoke_provider_environment(
                         ctx,
-                        identity,
+                        desired.clone(),
                         provider.readiness_reason,
                         revision,
                     )
                     .await;
-                    (
+                    config_apply_failure(
                         "provider_environment_unavailable",
-                        "provider environment is not ready for installation".to_string(),
+                        "provider environment is not ready for installation",
                         true,
                     )
                 }
                 Ok(provider) => match CapturedProviderEnvironment::prepare(&provider) {
-                    Ok(prepared) => {
-                        self.stream.pending_provider = Some(prepared);
-                        // The provider environment waits for its matching
-                        // admitted sandbox configuration.
-                        return config_apply_result(
-                            ConfigComponent::ProviderEnvironment,
-                            Some(requested_revision),
-                            None,
-                            ConfigApplyOutcome::AwaitingComponent,
-                            None,
-                        );
-                    }
+                    Ok(prepared) => return Ok(prepared),
                     Err(error) => {
-                        self.reject_provider_bindings(ctx, identity, provider).await;
-                        ("invalid_provider_environment", error.to_string(), false)
+                        self.reject_provider_bindings(ctx, desired.clone(), provider)
+                            .await;
+                        config_apply_failure(
+                            "invalid_provider_environment",
+                            &error.to_string(),
+                            false,
+                        )
                     }
                 },
-            };
+            }
+        } else {
+            self.revoke_provider_environment(
+                ctx,
+                desired.clone(),
+                ProviderReadinessReason::SnapshotMismatch,
+                revision,
+            )
+            .await;
+            config_apply_failure(
+                "provider_environment_mismatch",
+                "provider environment does not match the sandbox configuration",
+                false,
+            )
+        };
         // The revoked credentials no longer match any delivered environment.
         self.stream.active_environment = EnvironmentIdentity::default();
-        let (code, message, retryable) = failure;
-        config_apply_result(
-            ConfigComponent::ProviderEnvironment,
-            Some(requested_revision),
-            None,
-            ConfigApplyOutcome::FailedClosed,
-            Some((code, &message, retryable)),
-        )
+        Err(failure)
     }
 
     /// Retry the middleware registry of a startup configuration that could
@@ -3406,10 +3364,22 @@ mod tests {
         handle.abort();
     }
 
-    fn outcome(
-        result: &openshell_core::proto::ConfigComponentApplyResult,
-    ) -> openshell_core::proto::ConfigApplyOutcome {
-        openshell_core::proto::ConfigApplyOutcome::try_from(result.outcome).unwrap()
+    /// Apply `snapshot` with the provider environment it names, as one update
+    /// carries them.
+    async fn apply_with_provider(
+        runtime: &mut ConfigRuntime,
+        ctx: &PolicyPollLoopContext,
+        client: &ScriptedPolicyGateway,
+        snapshot: &openshell_core::grpc_client::SettingsPollResult,
+    ) -> DeliveredResult {
+        runtime
+            .apply_delivered_sandbox(
+                ctx,
+                client,
+                snapshot.clone(),
+                provider_snapshot_for(snapshot, "REGION", "west"),
+            )
+            .await
     }
 
     #[tokio::test]
@@ -3433,13 +3403,10 @@ mod tests {
         runtime.config_revision = 0;
 
         for _ in 0..2 {
-            let (result, _) = runtime
-                .apply_delivered_sandbox(&ctx, &client, candidate.clone())
-                .await;
+            let result = apply_with_provider(&mut runtime, &ctx, &client, &candidate).await;
 
             assert_eq!(engine.current_generation(), initial_generation);
-            assert_eq!(outcome(&result), ConfigApplyOutcome::RetainedLocalOverride);
-            assert!(result.applied_revision.is_none());
+            assert_eq!(result.outcome, ConfigApplyOutcome::RetainedLocalOverride);
             assert!(runtime.applied_revision.is_none());
         }
     }
@@ -3480,29 +3447,26 @@ mod tests {
         let (client, _polls, _reports) = scripted_policy_gateway();
         let initial_revision = sandbox_config_revision(&initial);
         let mut runtime = ConfigRuntime::new(&ctx, Some(&initial));
-        let _ = runtime
-            .stage_delivered_provider(&ctx, provider_snapshot_for(&desired, "REGION", "west"))
-            .await;
 
-        let (result, admission) = runtime
-            .apply_delivered_sandbox(&ctx, &client, desired)
-            .await;
+        let result = apply_with_provider(&mut runtime, &ctx, &client, &desired).await;
 
         assert_eq!(runtime.config_revision, initial.config_revision);
         assert_eq!(runtime.policy_version, initial.version);
         assert_eq!(runtime.policy_hash, initial.policy_hash);
-        assert_eq!(result.applied_revision, Some(initial_revision));
+        assert_eq!(runtime.applied_revision, Some(initial_revision));
         assert_eq!(
-            outcome(&result),
-            openshell_core::proto::ConfigApplyOutcome::FailedRetainedLastKnownGood
+            result.outcome,
+            ConfigApplyOutcome::FailedRetainedLastKnownGood
         );
         assert_eq!(
-            admission.state,
+            result.admission.state,
             i32::from(openshell_core::proto::ConfigurationAdmissionState::Rejected)
         );
-        // A redelivered provider snapshot retries the held configuration.
-        assert!(runtime.stream.pending_sandbox.is_some());
-        assert!(runtime.stream.pending_provider.is_some());
+        // The environment was not installed, so a redelivery retries it.
+        assert_ne!(
+            runtime.stream.active_environment,
+            EnvironmentIdentity::from_settings(&desired)
+        );
     }
 
     fn provider_snapshot_for(
@@ -3568,18 +3532,54 @@ mod tests {
         let (client, _polls, _reports) = scripted_policy_gateway();
         let mut runtime = ConfigRuntime::new(&ctx, Some(&initial));
         let initial_revision = sandbox_config_revision(&initial);
-        let (result, _) = runtime
-            .apply_delivered_sandbox(&ctx, &client, rejected)
-            .await;
+        let result = apply_with_provider(&mut runtime, &ctx, &client, &rejected).await;
 
         assert_eq!(
-            outcome(&result),
+            result.outcome,
             ConfigApplyOutcome::FailedRetainedLastKnownGood
         );
-        assert_eq!(result.applied_revision, Some(initial_revision));
+        assert_eq!(runtime.applied_revision, Some(initial_revision));
         assert!(ctx.ocsf_enabled.load(Ordering::Relaxed));
         assert!(ctx.agent_proposals.enabled());
         assert_eq!(runtime.settings, initial.settings);
+    }
+
+    /// One update carrying `snapshot` and the provider environment it names.
+    fn config_update(
+        update_id: &str,
+        snapshot: &openshell_core::grpc_client::SettingsPollResult,
+    ) -> openshell_core::proto::ConfigUpdate {
+        openshell_core::proto::ConfigUpdate {
+            update_id: update_id.to_string(),
+            sandbox_config: Some(openshell_core::proto::SandboxConfigSnapshot {
+                version: snapshot.version,
+                policy_hash: snapshot.policy_hash.clone(),
+                config_revision: snapshot.config_revision,
+                policy_source: snapshot.policy_source.into(),
+                policy: snapshot.policy.clone(),
+                provider_env_revision: snapshot.provider_env_revision,
+                provider_attachment_epoch: snapshot.provider_attachment_epoch.clone(),
+                supervisor_middleware_services: snapshot.supervisor_middleware_services.clone(),
+                configuration_admitted: snapshot.configuration_admitted,
+                ..Default::default()
+            }),
+            provider_environment: Some(provider_snapshot_for(snapshot, "REGION", "west")),
+        }
+    }
+
+    async fn deliver_update(
+        config_apply_tx: &tokio::sync::mpsc::Sender<ConfigApplyRequest>,
+        update: openshell_core::proto::ConfigUpdate,
+    ) -> ConfigUpdateResult {
+        let (response, receiver) = tokio::sync::oneshot::channel();
+        config_apply_tx
+            .send(ConfigApplyRequest { update, response })
+            .await
+            .unwrap();
+        timeout(Duration::from_secs(5), receiver)
+            .await
+            .expect("stream update timed out")
+            .expect("stream update responder stopped")
     }
 
     #[tokio::test]
@@ -3589,6 +3589,8 @@ mod tests {
             1,
             openshell_core::proto::PolicySource::Sandbox,
         );
+        let mut desired = initial.clone();
+        desired.provider_env_revision = 2;
         let engine =
             Arc::new(OpaEngine::from_proto(&proto_policy_fixture()).expect("build OPA engine"));
         let mut ctx = policy_poll_test_context(
@@ -3606,60 +3608,15 @@ mod tests {
         let poll_calls = Arc::clone(&client.poll_calls);
 
         let handle = tokio::spawn(run_policy_poll_loop_with_client(ctx, client));
-        let (response_tx, response_rx) = tokio::sync::oneshot::channel();
-        config_apply_tx
-            .send(ConfigApplyRequest::Update {
-                update: openshell_core::proto::ConfigUpdate {
-                    update_id: "provider-2".to_string(),
-                    component_sequence: 1,
-                    component: Some(
-                        openshell_core::proto::config_update::Component::ProviderEnvironment(
-                            openshell_core::proto::ProviderEnvironmentSnapshot {
-                                provider_env_revision: 2,
-                                ..Default::default()
-                            },
-                        ),
-                    ),
-                },
-                response: response_tx,
-            })
-            .await
-            .unwrap();
-        timeout(Duration::from_secs(1), response_rx)
-            .await
-            .expect("stream update timed out")
-            .expect("stream update responder stopped");
+        deliver_update(&config_apply_tx, config_update("update-2", &desired)).await;
 
         assert_eq!(poll_calls.load(Ordering::SeqCst), 0);
         handle.abort();
     }
 
-    async fn deliver_update(
-        config_apply_tx: &tokio::sync::mpsc::Sender<ConfigApplyRequest>,
-        update_id: &str,
-        component: openshell_core::proto::config_update::Component,
-    ) -> openshell_core::proto::ConfigUpdateResult {
-        let (response, receiver) = tokio::sync::oneshot::channel();
-        config_apply_tx
-            .send(ConfigApplyRequest::Update {
-                update: openshell_core::proto::ConfigUpdate {
-                    update_id: update_id.to_string(),
-                    component_sequence: 1,
-                    component: Some(component),
-                },
-                response,
-            })
-            .await
-            .unwrap();
-        timeout(Duration::from_secs(5), receiver)
-            .await
-            .expect("stream update timed out")
-            .expect("stream update responder stopped")
-    }
-
     #[tokio::test]
-    async fn stream_policy_status_is_reported_only_in_acknowledgements() {
-        use openshell_core::proto::{ConfigApplyOutcome, PolicySource, config_update::Component};
+    async fn stream_policy_status_is_reported_only_in_results() {
+        use openshell_core::proto::{ConfigApplyOutcome, PolicySource};
 
         let initial = settings_poll_result(Some(proto_policy_fixture()), 1, PolicySource::Sandbox);
         let desired = settings_poll_result(Some(proto_policy_fixture()), 2, PolicySource::Sandbox);
@@ -3679,43 +3636,57 @@ mod tests {
         let (client, _polls, mut reports) = scripted_policy_gateway();
         let handle = tokio::spawn(run_policy_poll_loop_with_client(ctx, client));
 
-        let provider = deliver_update(
-            &config_apply_tx,
-            "provider-2",
-            Component::ProviderEnvironment(provider_snapshot_for(&desired, "REGION", "west")),
-        )
-        .await;
+        let result = deliver_update(&config_apply_tx, config_update("update-2", &desired)).await;
+        assert_eq!(result.update_id, "update-2");
+        assert_eq!(result.outcome, i32::from(ConfigApplyOutcome::Applied));
         assert_eq!(
-            outcome(provider.result.as_ref().unwrap()),
-            ConfigApplyOutcome::AwaitingComponent
-        );
-        let sandbox = deliver_update(
-            &config_apply_tx,
-            "sandbox-2",
-            Component::SandboxConfig(openshell_core::proto::SandboxConfigSnapshot {
-                version: desired.version,
-                policy_hash: desired.policy_hash.clone(),
-                config_revision: desired.config_revision,
-                policy_source: PolicySource::Sandbox.into(),
-                policy: desired.policy.clone(),
-                configuration_admitted: true,
-                ..Default::default()
-            }),
-        )
-        .await;
-        assert_eq!(
-            outcome(sandbox.result.as_ref().unwrap()),
-            ConfigApplyOutcome::Applied
+            result.policy_load,
+            Some(PolicyLoadResult {
+                version: 2,
+                loaded: true,
+                error: String::new(),
+            })
         );
 
-        // The acknowledgement carries the loaded policy version; the polling
-        // status RPC must not report it a second time.
+        // The result carries the loaded policy version; the polling status
+        // RPC must not report it a second time.
         assert!(
             timeout(Duration::from_millis(200), reports.recv())
                 .await
                 .is_err()
         );
         handle.abort();
+    }
+
+    #[tokio::test]
+    async fn settings_only_update_reports_no_policy_load() {
+        use openshell_core::proto::{ConfigApplyOutcome, PolicySource};
+
+        let initial = settings_poll_result(Some(proto_policy_fixture()), 1, PolicySource::Sandbox);
+        let mut desired = initial.clone();
+        desired.config_revision = 101;
+        desired.settings_revision = 2;
+        desired
+            .settings
+            .insert("ocsf_json_enabled".to_string(), effective_bool(true));
+        let engine =
+            Arc::new(OpaEngine::from_proto(&proto_policy_fixture()).expect("build OPA engine"));
+        let ctx = policy_poll_test_context(
+            engine,
+            LoadedPolicyOrigin::Gateway {
+                revision: Some(LoadedPolicyRevision::from_snapshot(&initial)),
+                has_last_valid_policy: true,
+            },
+            default_middleware_connector(),
+        );
+        let (client, _polls, _reports) = scripted_policy_gateway();
+        let mut runtime = ConfigRuntime::new(&ctx, Some(&initial));
+
+        let result = apply_with_provider(&mut runtime, &ctx, &client, &desired).await;
+
+        assert_eq!(result.outcome, ConfigApplyOutcome::Applied);
+        assert_eq!(result.policy_load, None);
+        assert!(ctx.ocsf_enabled.load(Ordering::Relaxed));
     }
 
     #[tokio::test]
@@ -3786,20 +3757,15 @@ mod tests {
         let initial_revision = sandbox_config_revision(&initial);
         let initial_generation = engine.current_generation();
         let mut runtime = ConfigRuntime::new(&ctx, Some(&initial));
-        let _ = runtime
-            .stage_delivered_provider(&ctx, provider_snapshot_for(&candidate, "REGION", "west"))
-            .await;
-        let (result, _) = runtime
-            .apply_delivered_sandbox(&ctx, &client, candidate)
-            .await;
+        let result = apply_with_provider(&mut runtime, &ctx, &client, &candidate).await;
 
         assert_eq!(engine.current_generation(), initial_generation);
         assert!(engine.fail_closed_reason().is_none());
         assert_eq!(
-            outcome(&result),
+            result.outcome,
             ConfigApplyOutcome::FailedRetainedLastKnownGood
         );
-        assert_eq!(result.applied_revision, Some(initial_revision));
+        assert_eq!(runtime.applied_revision, Some(initial_revision));
         assert!(
             result
                 .failure
@@ -3807,6 +3773,10 @@ mod tests {
                 .unwrap()
                 .message
                 .contains("without the transparent TCP substrate")
+        );
+        assert_eq!(
+            result.policy_load.map(|load| (load.version, load.loaded)),
+            Some((2, false))
         );
         // Readiness reports the rejected generation rather than claiming the
         // retained policy as evidence for it.
@@ -3820,7 +3790,7 @@ mod tests {
 
     #[tokio::test]
     async fn stream_provider_rotation_rebinds_policy_generation() {
-        use openshell_core::proto::PolicySource;
+        use openshell_core::proto::{ConfigApplyOutcome, PolicySource};
 
         let initial = settings_poll_result(Some(proto_policy_fixture()), 1, PolicySource::Sandbox);
         let mut desired = initial.clone();
@@ -3840,15 +3810,10 @@ mod tests {
         );
         let (client, _polls, _reports) = scripted_policy_gateway();
         let mut runtime = ConfigRuntime::new(&ctx, Some(&initial));
-        let _ = runtime
-            .stage_delivered_provider(&ctx, provider_snapshot_for(&desired, "REGION", "west"))
-            .await;
 
-        let (applied, _) = runtime
-            .apply_delivered_sandbox(&ctx, &client, desired.clone())
-            .await;
+        let applied = apply_with_provider(&mut runtime, &ctx, &client, &desired).await;
 
-        assert!(config_apply_result_activates(&applied));
+        assert_eq!(applied.outcome, ConfigApplyOutcome::Applied);
         // As with polling, the credentials install with a fresh generation of
         // the unchanged policy, and readiness binds to that generation.
         assert!(ctx.opa_engine.current_generation() > initial_generation);
@@ -3864,58 +3829,35 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stream_provider_snapshot_waits_for_matching_sandbox_generation() {
+    async fn stream_update_installs_its_provider_environment_with_the_configuration() {
+        use openshell_core::proto::{ConfigApplyOutcome, PolicySource};
+
+        let initial = settings_poll_result(Some(proto_policy_fixture()), 1, PolicySource::Sandbox);
+        let mut desired =
+            settings_poll_result(Some(proto_policy_fixture()), 2, PolicySource::Sandbox);
+        desired.provider_env_revision = 17;
+        desired.provider_attachment_epoch = "epoch-b".to_string();
         let engine =
             Arc::new(OpaEngine::from_proto(&proto_policy_fixture()).expect("build OPA engine"));
         let ctx = policy_poll_test_context(
             engine,
             LoadedPolicyOrigin::Gateway {
-                revision: None,
+                revision: Some(LoadedPolicyRevision::from_snapshot(&initial)),
                 has_last_valid_policy: true,
             },
             default_middleware_connector(),
         );
-        let initial = settings_poll_result(
-            Some(proto_policy_fixture()),
-            1,
-            openshell_core::proto::PolicySource::Sandbox,
-        );
-        let mut desired = settings_poll_result(
-            Some(proto_policy_fixture()),
-            2,
-            openshell_core::proto::PolicySource::Sandbox,
-        );
-        desired.provider_env_revision = 17;
-        desired.provider_attachment_epoch = "epoch-b".to_string();
-        let mut runtime = ConfigRuntime::new(&ctx, Some(&initial));
-        let result = runtime
-            .stage_delivered_provider(&ctx, provider_snapshot_for(&desired, "REGION", "west"))
-            .await;
-
-        assert_eq!(
-            outcome(&result),
-            openshell_core::proto::ConfigApplyOutcome::AwaitingComponent
-        );
-        assert!(result.failure.is_none());
-        assert_eq!(ctx.provider_credentials.snapshot().revision, 0);
-        assert!(
-            !ctx.provider_credentials
-                .snapshot()
-                .child_env
-                .contains_key("REGION")
-        );
-
         let (client, _polls, _reports) = scripted_policy_gateway();
-        let (applied, _) = runtime
-            .apply_delivered_sandbox(&ctx, &client, desired.clone())
-            .await;
-        assert!(config_apply_result_activates(&applied));
-        let sandbox_revision_token = sandbox_config_revision(&desired);
+        let mut runtime = ConfigRuntime::new(&ctx, Some(&initial));
+
+        let applied = apply_with_provider(&mut runtime, &ctx, &client, &desired).await;
+
+        assert_eq!(applied.outcome, ConfigApplyOutcome::Applied);
         assert_eq!(
-            applied.requested_revision,
-            Some(sandbox_revision_token.clone())
+            applied.admission.state,
+            i32::from(openshell_core::proto::ConfigurationAdmissionState::Accepted)
         );
-        assert_eq!(applied.applied_revision, Some(sandbox_revision_token));
+        assert_eq!(runtime.config_revision, desired.config_revision);
         assert_eq!(runtime.provider_env_revision, 17);
         assert_eq!(ctx.provider_credentials.snapshot().revision, 17);
         assert!(
@@ -3924,151 +3866,61 @@ mod tests {
                 .child_env
                 .contains_key("REGION")
         );
-        let provider_retry = runtime
-            .stage_delivered_provider(&ctx, provider_snapshot_for(&desired, "REGION", "west"))
-            .await;
-        assert_eq!(
-            outcome(&provider_retry),
-            openshell_core::proto::ConfigApplyOutcome::IgnoredDuplicate
-        );
-        let provider_revision_token = provider_config_revision(17);
-        assert_eq!(
-            provider_retry.requested_revision,
-            Some(provider_revision_token.clone())
-        );
-        assert_eq!(
-            provider_retry.applied_revision,
-            Some(provider_revision_token)
-        );
-    }
-
-    #[tokio::test]
-    async fn stream_sandbox_snapshot_applies_without_fetching() {
-        let initial = settings_poll_result(
-            Some(proto_policy_fixture()),
-            1,
-            openshell_core::proto::PolicySource::Sandbox,
-        );
-        let desired = settings_poll_result(
-            Some(proto_policy_fixture()),
-            2,
-            openshell_core::proto::PolicySource::Sandbox,
-        );
-        let engine =
-            Arc::new(OpaEngine::from_proto(&proto_policy_fixture()).expect("build OPA engine"));
-        let ctx = policy_poll_test_context(
-            engine,
-            LoadedPolicyOrigin::Gateway {
-                revision: Some(LoadedPolicyRevision::from_snapshot(&initial)),
-                has_last_valid_policy: true,
-            },
-            default_middleware_connector(),
-        );
-        let (client, _polls, _reports) = scripted_policy_gateway();
-        let mut runtime = ConfigRuntime::new(&ctx, Some(&initial));
-        let _ = runtime
-            .stage_delivered_provider(&ctx, provider_snapshot_for(&desired, "REGION", "west"))
-            .await;
-
-        let (result, _) = runtime
-            .apply_delivered_sandbox(&ctx, &client, desired.clone())
-            .await;
-
-        assert_eq!(runtime.config_revision, desired.config_revision);
-        assert_eq!(runtime.policy_version, desired.version);
-        assert_eq!(runtime.policy_hash, desired.policy_hash);
-        assert_eq!(
-            outcome(&result),
-            openshell_core::proto::ConfigApplyOutcome::Applied
-        );
         assert_eq!(client.poll_calls.load(Ordering::SeqCst), 0);
-    }
 
-    #[tokio::test]
-    async fn stream_sandbox_snapshot_waits_for_provider_delivered_second() {
-        use openshell_core::proto::{ConfigApplyOutcome, PolicySource};
-
-        let initial = settings_poll_result(Some(proto_policy_fixture()), 1, PolicySource::Sandbox);
-        let mut desired =
-            settings_poll_result(Some(proto_policy_fixture()), 2, PolicySource::Sandbox);
-        desired.provider_env_revision = 23;
-        desired.provider_attachment_epoch = "epoch-23".to_string();
-        let engine =
-            Arc::new(OpaEngine::from_proto(&proto_policy_fixture()).expect("build OPA engine"));
-        let ctx = policy_poll_test_context(
-            engine,
-            LoadedPolicyOrigin::Gateway {
-                revision: Some(LoadedPolicyRevision::from_snapshot(&initial)),
-                has_last_valid_policy: true,
-            },
-            default_middleware_connector(),
-        );
-        let (client, _polls, _reports) = scripted_policy_gateway();
-        let mut runtime = ConfigRuntime::new(&ctx, Some(&initial));
-
-        let (waiting, _) = runtime
-            .apply_delivered_sandbox(&ctx, &client, desired.clone())
+        // Redelivered unchanged, the update is a duplicate and the installed
+        // environment is not prepared again.
+        let mut ignored = provider_snapshot_for(&desired, "REGION", "east");
+        ignored.values.clear();
+        let duplicate = runtime
+            .apply_delivered_sandbox(&ctx, &client, desired.clone(), ignored)
             .await;
-        assert_eq!(outcome(&waiting), ConfigApplyOutcome::AwaitingComponent);
-        assert!(waiting.failure.is_none());
-        assert!(runtime.stream.pending_sandbox.is_some());
-        assert_eq!(ctx.provider_credentials.snapshot().revision, 0);
-
-        let provider_revision_token = provider_config_revision(desired.provider_env_revision);
-        let (response, receiver) = tokio::sync::oneshot::channel();
-        runtime
-            .apply_delivered(
-                &ctx,
-                &client,
-                ConfigApplyRequest::Update {
-                    update: openshell_core::proto::ConfigUpdate {
-                        update_id: "provider-second".to_string(),
-                        component_sequence: 1,
-                        component: Some(
-                            openshell_core::proto::config_update::Component::ProviderEnvironment(
-                                provider_snapshot_for(&desired, "REGION", "west"),
-                            ),
-                        ),
-                    },
-                    response,
-                },
-            )
-            .await;
-        let provider_result = receiver
-            .await
-            .expect("provider result")
-            .result
-            .expect("provider component result");
-        assert_eq!(outcome(&provider_result), ConfigApplyOutcome::Applied);
-        assert_eq!(
-            provider_result.requested_revision,
-            Some(provider_revision_token.clone())
-        );
-        assert_eq!(
-            provider_result.applied_revision,
-            Some(provider_revision_token)
-        );
-        assert!(runtime.stream.pending_sandbox.is_none());
-
-        let (applied, admission) = runtime
-            .apply_delivered_sandbox(&ctx, &client, desired.clone())
-            .await;
-        assert_eq!(outcome(&applied), ConfigApplyOutcome::IgnoredDuplicate);
-        let desired_revision = sandbox_config_revision(&desired);
-        assert_eq!(applied.requested_revision, Some(desired_revision.clone()));
-        assert_eq!(applied.applied_revision, Some(desired_revision));
-        assert_eq!(
-            admission.state,
-            i32::from(openshell_core::proto::ConfigurationAdmissionState::Accepted)
-        );
-        assert_eq!(runtime.provider_env_revision, 23);
-        assert_eq!(ctx.provider_credentials.snapshot().revision, 23);
+        assert_eq!(duplicate.outcome, ConfigApplyOutcome::IgnoredDuplicate);
         assert!(
             ctx.provider_credentials
                 .snapshot()
                 .child_env
                 .contains_key("REGION")
         );
+    }
+
+    #[tokio::test]
+    async fn stream_update_rejects_a_provider_environment_it_does_not_name() {
+        use openshell_core::proto::{ConfigApplyOutcome, PolicySource};
+
+        let initial = settings_poll_result(Some(proto_policy_fixture()), 1, PolicySource::Sandbox);
+        let mut desired =
+            settings_poll_result(Some(proto_policy_fixture()), 2, PolicySource::Sandbox);
+        desired.provider_env_revision = 17;
+        let engine =
+            Arc::new(OpaEngine::from_proto(&proto_policy_fixture()).expect("build OPA engine"));
+        let ctx = policy_poll_test_context(
+            engine,
+            LoadedPolicyOrigin::Gateway {
+                revision: Some(LoadedPolicyRevision::from_snapshot(&initial)),
+                has_last_valid_policy: true,
+            },
+            default_middleware_connector(),
+        );
+        let (client, _polls, _reports) = scripted_policy_gateway();
+        let mut runtime = ConfigRuntime::new(&ctx, Some(&initial));
+        let mut other = provider_snapshot_for(&desired, "REGION", "west");
+        other.provider_env_revision = 18;
+
+        let result = runtime
+            .apply_delivered_sandbox(&ctx, &client, desired, other)
+            .await;
+
+        assert_eq!(
+            result.outcome,
+            ConfigApplyOutcome::FailedRetainedLastKnownGood
+        );
+        assert_eq!(
+            result.failure.as_ref().unwrap().code,
+            "provider_environment_mismatch"
+        );
+        assert_eq!(runtime.config_revision, initial.config_revision);
+        assert_eq!(result.policy_load, None);
     }
 
     #[tokio::test]
@@ -4097,19 +3949,18 @@ mod tests {
         let (client, _polls, _reports) = scripted_policy_gateway();
         let mut runtime = ConfigRuntime::new(&ctx, None);
 
-        let (result, _) = runtime
-            .apply_delivered_sandbox(&ctx, &client, rejected.clone())
-            .await;
+        let result = apply_with_provider(&mut runtime, &ctx, &client, &rejected).await;
 
-        assert_eq!(outcome(&result), ConfigApplyOutcome::FailedClosed);
+        assert_eq!(result.outcome, ConfigApplyOutcome::FailedClosed);
         let rejected_generation = ctx.opa_engine.current_generation();
         assert!(rejected_generation > initial_generation);
 
-        let (duplicate, _) = runtime
-            .apply_delivered_sandbox(&ctx, &client, rejected)
-            .await;
+        let duplicate = apply_with_provider(&mut runtime, &ctx, &client, &rejected).await;
 
-        assert_eq!(duplicate, result);
+        assert_eq!(
+            (duplicate.outcome, duplicate.failure, duplicate.admission),
+            (result.outcome, result.failure, result.admission)
+        );
         assert_eq!(ctx.opa_engine.current_generation(), rejected_generation);
     }
 
@@ -4143,23 +3994,19 @@ mod tests {
         let (client, _polls, _reports) = scripted_policy_gateway();
         let mut runtime = ConfigRuntime::new(&ctx, Some(&initial));
 
-        let (result, _) = runtime
-            .apply_delivered_sandbox(&ctx, &client, rejected)
-            .await;
-        assert_eq!(outcome(&result), ConfigApplyOutcome::FailedClosed);
+        let result = apply_with_provider(&mut runtime, &ctx, &client, &rejected).await;
+        assert_eq!(result.outcome, ConfigApplyOutcome::FailedClosed);
         assert!(engine.fail_closed_reason().is_some());
         let quarantined_generation = engine.current_generation();
 
-        let (result, admission) = runtime
-            .apply_delivered_sandbox(&ctx, &client, restored.clone())
-            .await;
-        assert_eq!(outcome(&result), ConfigApplyOutcome::Applied);
+        let result = apply_with_provider(&mut runtime, &ctx, &client, &restored).await;
+        assert_eq!(result.outcome, ConfigApplyOutcome::Applied);
         assert_eq!(
-            result.applied_revision,
+            runtime.applied_revision,
             Some(sandbox_config_revision(&restored))
         );
         assert_eq!(
-            admission.state,
+            result.admission.state,
             i32::from(openshell_core::proto::ConfigurationAdmissionState::Accepted)
         );
         // Matching policy bytes must not leave the runtime deny-all.
@@ -4183,6 +4030,7 @@ mod tests {
             },
             default_middleware_connector(),
         );
+        let (client, _polls, _reports) = scripted_policy_gateway();
         let mut runtime = ConfigRuntime::new(&ctx, Some(&initial));
         for (revision, readiness_reason, classification, expected_code) in [
             (
@@ -4214,16 +4062,26 @@ mod tests {
                     .resolver_for_endpoint("tools.example.com", 443, "/v1/chat")
                     .is_some()
             );
-            let mut snapshot = provider_snapshot_for(&initial, "REGION", "west");
-            snapshot.provider_env_revision = revision;
+            let mut desired = initial.clone();
+            desired.provider_env_revision = revision;
+            let mut snapshot = provider_snapshot_for(&desired, "REGION", "west");
             snapshot.readiness_reason = readiness_reason.into();
             snapshot.values[0].classification = classification.into();
 
-            let result = runtime.stage_delivered_provider(&ctx, snapshot).await;
+            let result = runtime
+                .apply_delivered_sandbox(&ctx, &client, desired, snapshot)
+                .await;
 
-            assert_eq!(outcome(&result), ConfigApplyOutcome::FailedClosed);
+            assert_eq!(
+                result.outcome,
+                ConfigApplyOutcome::FailedRetainedLastKnownGood
+            );
             assert_eq!(result.failure.as_ref().unwrap().code, expected_code);
-            assert!(runtime.stream.pending_provider.is_none());
+            assert_eq!(
+                result.admission.state,
+                i32::from(openshell_core::proto::ConfigurationAdmissionState::Rejected)
+            );
+            assert_eq!(runtime.config_revision, initial.config_revision);
             assert!(ctx.provider_credentials.resolver().is_none());
             assert!(
                 !ctx.provider_credentials
@@ -4271,41 +4129,12 @@ mod tests {
             .expect("install extension credential");
         let (client, _polls, _reports) = scripted_policy_gateway();
         let mut runtime = ConfigRuntime::new(&ctx, Some(&initial));
-        let _ = runtime
-            .stage_delivered_provider(&ctx, provider_snapshot_for(&desired, "REGION", "west"))
-            .await;
 
-        let (result, _) = runtime
-            .apply_delivered_sandbox(&ctx, &client, desired)
-            .await;
+        let result = apply_with_provider(&mut runtime, &ctx, &client, &desired).await;
 
-        assert_eq!(outcome(&result), ConfigApplyOutcome::Applied);
+        assert_eq!(result.outcome, ConfigApplyOutcome::Applied);
         assert!(runtime.middleware_services.is_empty());
         assert!(ctx.extension_credentials.get("removed-guard").is_none());
-    }
-
-    /// Mirrors the gateway's `validate_component_apply_result`; a result that
-    /// violates it makes the gateway end the supervisor session.
-    fn gateway_accepts_result(result: &openshell_core::proto::ConfigComponentApplyResult) -> bool {
-        use openshell_core::proto::ConfigApplyOutcome;
-
-        let Some(requested) = result.requested_revision.as_ref() else {
-            return false;
-        };
-        let applied_matches_request = result.applied_revision.as_ref() == Some(requested);
-        match ConfigApplyOutcome::try_from(result.outcome).unwrap_or_default() {
-            ConfigApplyOutcome::Applied
-            | ConfigApplyOutcome::IgnoredDuplicate
-            | ConfigApplyOutcome::Degraded => applied_matches_request,
-            ConfigApplyOutcome::RetainedLocalOverride
-            | ConfigApplyOutcome::FailedClosed
-            | ConfigApplyOutcome::AwaitingComponent => result.applied_revision.is_none(),
-            ConfigApplyOutcome::FailedRetainedLastKnownGood => {
-                result.applied_revision.is_some() && !applied_matches_request
-            }
-            ConfigApplyOutcome::IgnoredStale | ConfigApplyOutcome::Unsupported => true,
-            ConfigApplyOutcome::Unspecified => false,
-        }
     }
 
     /// A stream-started runtime whose startup middleware was unreachable.
@@ -4431,11 +4260,8 @@ mod tests {
         rejected.configuration_error = "invalid policy".to_string();
         rejected.policy_validation_failure_mode = PolicyValidationFailureMode::FailClosed;
 
-        let (result, _) = runtime
-            .apply_delivered_sandbox(&ctx, &client, rejected.clone())
-            .await;
-        assert_eq!(outcome(&result), ConfigApplyOutcome::FailedClosed);
-        assert!(gateway_accepts_result(&result));
+        let result = apply_with_provider(&mut runtime, &ctx, &client, &rejected).await;
+        assert_eq!(result.outcome, ConfigApplyOutcome::FailedClosed);
         let quarantined_generation = engine.current_generation();
 
         middleware_available.store(true, Ordering::SeqCst);
@@ -4445,10 +4271,8 @@ mod tests {
         assert!(engine.fail_closed_reason().is_some());
         assert_eq!(engine.current_generation(), quarantined_generation);
         assert_eq!(runtime.config_revision, startup.config_revision);
-        let (redelivered, _) = runtime
-            .apply_delivered_sandbox(&ctx, &client, rejected)
-            .await;
-        assert_eq!(outcome(&redelivered), ConfigApplyOutcome::FailedClosed);
+        let redelivered = apply_with_provider(&mut runtime, &ctx, &client, &rejected).await;
+        assert_eq!(redelivered.outcome, ConfigApplyOutcome::FailedClosed);
         assert!(engine.fail_closed_reason().is_some());
     }
 
@@ -4469,20 +4293,16 @@ mod tests {
         later
             .supervisor_middleware_services
             .clone_from(&startup.supervisor_middleware_services);
-        let _ = runtime
-            .stage_delivered_provider(&ctx, provider_snapshot_for(&later, "REGION", "west"))
-            .await;
 
-        let (result, _) = runtime.apply_delivered_sandbox(&ctx, &client, later).await;
+        let result = apply_with_provider(&mut runtime, &ctx, &client, &later).await;
         assert_eq!(
-            outcome(&result),
+            result.outcome,
             ConfigApplyOutcome::FailedRetainedLastKnownGood
         );
         assert_eq!(
-            result.applied_revision,
+            runtime.applied_revision,
             Some(sandbox_config_revision(&startup))
         );
-        assert!(gateway_accepts_result(&result));
         let failed_generation = engine.current_generation();
 
         middleware_available.store(true, Ordering::SeqCst);
@@ -4509,43 +4329,22 @@ mod tests {
             client,
             ..
         } = degraded_stream_startup();
-        let bootstrap = openshell_core::proto::ConfigBootstrap {
-            sandbox_config: Some(openshell_core::proto::SandboxConfigSnapshot {
-                version: startup.version,
-                policy_hash: startup.policy_hash.clone(),
-                config_revision: startup.config_revision,
-                policy_source: startup.policy_source.into(),
-                policy: startup.policy.clone(),
-                supervisor_middleware_services: startup.supervisor_middleware_services.clone(),
-                configuration_admitted: true,
-                ..Default::default()
-            }),
-            provider_environment: Some(provider_snapshot_for(&startup, "REGION", "west")),
-        };
         let (response, receiver) = tokio::sync::oneshot::channel();
 
         runtime
             .apply_delivered(
                 &ctx,
                 &client,
-                ConfigApplyRequest::Bootstrap {
-                    bootstrap,
+                ConfigApplyRequest {
+                    update: config_update("bootstrap", &startup),
                     response,
                 },
             )
             .await;
 
         let result = receiver.await.expect("bootstrap result");
-        let outcomes = result.results.iter().map(outcome).collect::<Vec<_>>();
-        assert_eq!(
-            outcomes,
-            [
-                ConfigApplyOutcome::IgnoredDuplicate,
-                ConfigApplyOutcome::Degraded
-            ]
-        );
-        assert!(result.results.iter().all(gateway_accepts_result));
-        assert!(result.results.iter().all(config_apply_result_activates));
+        assert_eq!(result.update_id, "bootstrap");
+        assert_eq!(result.outcome, i32::from(ConfigApplyOutcome::Degraded));
         assert_eq!(
             result.admission.expect("bootstrap admission").state,
             i32::from(ConfigurationAdmissionState::Accepted)

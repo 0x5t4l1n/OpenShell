@@ -40,7 +40,6 @@ use tokio::sync::Notify;
 use tokio::time::Instant;
 use tracing::{debug, warn};
 
-use super::ConfigComponentKind;
 use crate::ServerState;
 
 /// Attempts per queued write before it is dropped.
@@ -407,14 +406,12 @@ async fn write(
     retry
 }
 
-/// Both kinds of result come from a sandbox configuration update. A replaced
-/// session is left alone; its replacement's bootstrap reports them again.
+/// A replaced session is left alone; its replacement's bootstrap reports the
+/// results again.
 fn reopen_for_redelivery(state: &ServerState, sandbox_id: &str, session_id: &str) {
-    state.supervisor_sessions.reopen_config_component(
-        sandbox_id,
-        session_id,
-        ConfigComponentKind::SandboxConfig,
-    );
+    state
+        .supervisor_sessions
+        .reopen_config(sandbox_id, session_id);
 }
 
 fn record_write(kind: &'static str, outcome: &'static str) {

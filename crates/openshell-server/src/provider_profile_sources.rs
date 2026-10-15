@@ -553,10 +553,7 @@ pub fn spawn_refresh(state: Arc<ServerState>) {
                 .refresh_cached(&state.store)
                 .await
             {
-                crate::config_delivery::publish_all_connected(
-                    &state,
-                    crate::config_delivery::ConfigComponents::ALL,
-                );
+                crate::config_delivery::publish_all_connected(&state);
             }
         }
     });

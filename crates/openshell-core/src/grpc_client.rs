@@ -56,6 +56,10 @@ pub fn grpc_status_error(status: Status) -> miette::Report {
 /// generated client type signatures stay readable.
 pub type AuthedChannel = InterceptedService<Channel, AuthInterceptor>;
 
+/// Largest gateway message a supervisor accepts on its `ConnectSupervisor`
+/// stream. The gateway keeps configuration updates below it.
+pub const MAX_SUPERVISOR_STREAM_MESSAGE_BYTES: usize = 4 * 1024 * 1024;
+
 /// Shared, refreshable Bearer header. All [`AuthInterceptor`] clones read
 /// the same slot, so the renewal task can replace the token in place without
 /// rebuilding the channel.

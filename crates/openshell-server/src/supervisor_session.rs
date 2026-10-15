@@ -18,21 +18,21 @@ use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 use openshell_core::proto::{
-    ConfigBootstrap, GatewayMessage, GetSandboxProviderStatusRequest,
-    GetSandboxProviderStatusResponse, PeerNotifyConfigUpdateRequest,
-    PeerNotifyConfigUpdateResponse, PeerRelayFrame, PeerRelayInit, ProviderReadinessObservation,
-    RelayFrame, RelayInit, RelayOpen, ReportEndpointStatusRequest, ReportEndpointStatusResponse,
-    ReportMainProcessExitRequest, ReportMainProcessExitResponse, ReportProviderReadinessRequest,
-    ReportProviderReadinessResponse, Sandbox, SandboxPhase, SessionAccepted, SessionRedirect,
-    SessionRejected, SshRelayTarget, SupervisorHello, SupervisorMessage, gateway_message,
-    open_shell_client, peer_relay_frame, relay_open, supervisor_message,
+    GatewayMessage, GetSandboxProviderStatusRequest, GetSandboxProviderStatusResponse,
+    PeerNotifyConfigUpdateRequest, PeerNotifyConfigUpdateResponse, PeerRelayFrame, PeerRelayInit,
+    ProviderReadinessObservation, RelayFrame, RelayInit, RelayOpen, ReportEndpointStatusRequest,
+    ReportEndpointStatusResponse, ReportMainProcessExitRequest, ReportMainProcessExitResponse,
+    ReportProviderReadinessRequest, ReportProviderReadinessResponse, Sandbox, SandboxPhase,
+    SessionAccepted, SessionRedirect, SessionRejected, SshRelayTarget, SupervisorHello,
+    SupervisorMessage, gateway_message, open_shell_client, peer_relay_frame, relay_open,
+    supervisor_message,
 };
 use openshell_core::transport_errors::is_expected_transport_close_status;
 
 use crate::ServerState;
 use crate::auth::principal::Principal;
 use crate::config_delivery::session::{
-    self as config_session, ConfigSessionState, ExpectedBootstrap, ImagePolicyAdmission,
+    self as config_session, ConfigSessionState, ImagePolicyAdmission,
 };
 use crate::config_delivery::{ConfigSlots, MAX_SUPERVISOR_CONFIG_MESSAGE_BYTES, SessionOutbound};
 use crate::gateway_metrics::{
@@ -465,8 +465,8 @@ impl SupervisorSessionRegistry {
 
     /// Register a session with its configuration delivery and readiness mode.
     ///
-    /// A `ConfigApply` session acknowledges each update before the next one
-    /// for that component is released.
+    /// A push session acknowledges each update before the next one is
+    /// released.
     pub(crate) fn register_with_mode(
         &self,
         sandbox_id: String,
@@ -2212,7 +2212,7 @@ struct SessionSetup {
     connection_epoch: u64,
     supports_session_redirect: bool,
     mode: SessionMode,
-    bootstrap: Option<ConfigBootstrap>,
+    bootstrap: Option<crate::config_delivery::SupervisorConfig>,
     provider_readiness: ProviderReadinessEvidence,
     config_push: Option<ConfigPushSetup>,
     outbound_tx: mpsc::Sender<GatewayMessage>,
@@ -2242,7 +2242,11 @@ async fn accept_supervisor_session(setup: SessionSetup) -> Result<(), Status> {
             ready_on_accept: true
         }
     );
-    let expected_bootstrap = bootstrap.as_ref().map(ExpectedBootstrap::new);
+    // The registration seeds the session's provider environment cache.
+    let bootstrap_provider_environment = bootstrap
+        .as_ref()
+        .map(|bootstrap| bootstrap.provider_environment.clone());
+    let (bootstrap, bootstrap_in_flight) = bootstrap.map(config_session::bootstrap_update).unzip();
     let session_id = Uuid::new_v4().to_string();
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
     // Keep the session unroutable to the response stream until every fallible
@@ -2301,10 +2305,10 @@ async fn accept_supervisor_session(setup: SessionSetup) -> Result<(), Status> {
             "supervisor session: superseded previous session"
         );
     }
-    if expected_bootstrap.is_some() {
+    if let Some(bootstrap) = bootstrap_in_flight {
         state
             .supervisor_sessions
-            .await_config_bootstrap(&sandbox_id, &session_id);
+            .begin_config_bootstrap(&sandbox_id, &session_id, bootstrap);
     }
 
     // A replacement stream is a new observation authority. Reset its endpoint
@@ -2434,6 +2438,7 @@ async fn accept_supervisor_session(setup: SessionSetup) -> Result<(), Status> {
                 session_id: session_id.clone(),
                 workspace: setup.workspace,
                 providers: setup.providers,
+                provider_environment: bootstrap_provider_environment,
                 captured_seq: setup.captured_seq,
             },
         );
@@ -2447,7 +2452,7 @@ async fn accept_supervisor_session(setup: SessionSetup) -> Result<(), Status> {
         tx: session_tx,
         control: outbound_tx,
         supports_session_redirect,
-        expected_bootstrap,
+        pushes_config,
     };
     tokio::spawn(async move {
         let _session_lifetime = session_lifetime;
@@ -2635,7 +2640,7 @@ pub async fn handle_connect_supervisor(
         &tx,
         bootstrap
             .as_ref()
-            .and_then(|bootstrap| bootstrap.sandbox_config.as_ref()),
+            .map(|bootstrap| &bootstrap.sandbox_config),
         image_policy_admission,
     )
     .await?;
@@ -2927,9 +2932,10 @@ pub(crate) struct AcceptedSession {
     /// reaches the supervisor before any configuration released after it.
     pub(crate) control: mpsc::Sender<GatewayMessage>,
     pub(crate) supports_session_redirect: bool,
-    /// The bootstrap a streamed-apply supervisor must report. `None` for a
-    /// supervisor that keeps polling.
-    pub(crate) expected_bootstrap: Option<ExpectedBootstrap>,
+    /// The supervisor applies streamed configuration and must answer the
+    /// bootstrap it was accepted with. False for a supervisor that keeps
+    /// polling.
+    pub(crate) pushes_config: bool,
 }
 
 async fn run_session_loop(
@@ -2953,7 +2959,7 @@ async fn run_session_loop(
     heartbeat_timer.tick().await;
     let bootstrap_timeout = tokio::time::sleep(Duration::from_mins(2));
     tokio::pin!(bootstrap_timeout);
-    let mut bootstrap_complete = session.expected_bootstrap.is_none();
+    let mut bootstrap_complete = !session.pushes_config;
 
     loop {
         tokio::select! {
@@ -2976,22 +2982,13 @@ async fn run_session_loop(
                         {
                             break;
                         }
-                        match msg.payload {
-                            Some(supervisor_message::Payload::ConfigBootstrapResult(result)) => {
-                                if let Some(expected) = session.expected_bootstrap.as_ref() {
-                                    bootstrap_complete = true;
-                                    if !config_session::handle_bootstrap_result(session, expected, &result).await {
-                                        break;
-                                    }
-                                } else {
-                                    debug!(sandbox_id, session_id, "ignored bootstrap result from a polling supervisor");
-                                }
-                            }
-                            payload => {
-                                if !handle_supervisor_message(session, payload).await {
-                                    break;
-                                }
-                            }
+                        // One update is in flight at a time, so the first
+                        // result answers the bootstrap.
+                        if matches!(msg.payload.as_ref(), Some(supervisor_message::Payload::ConfigUpdateResult(_))) {
+                            bootstrap_complete = true;
+                        }
+                        if !handle_supervisor_message(session, msg.payload).await {
+                            break;
                         }
                     }
                     Ok(None) => {
@@ -3128,7 +3125,14 @@ async fn handle_supervisor_message(
             );
         }
         Some(supervisor_message::Payload::ConfigUpdateResult(result)) => {
-            config_session::handle_config_update_result(session, &result).await;
+            if !session.pushes_config {
+                debug!(
+                    sandbox_id,
+                    session_id, "ignored configuration result from a polling supervisor"
+                );
+            } else if !config_session::handle_config_update_result(session, &result).await {
+                return false;
+            }
         }
         Some(supervisor_message::Payload::RuntimeReady(_)) => {
             // A supervisor reports readiness again after every accepted
@@ -3146,7 +3150,7 @@ async fn handle_supervisor_message(
                 sandbox_id,
                 session_id,
                 instance_id,
-                session.expected_bootstrap.is_some(),
+                session.pushes_config,
             )
             .await
             {
@@ -3351,7 +3355,7 @@ mod tests {
             control: tx.clone(),
             tx,
             supports_session_redirect: true,
-            expected_bootstrap: None,
+            pushes_config: false,
         };
 
         let exit = run_session_loop(

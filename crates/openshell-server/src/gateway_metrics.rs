@@ -307,7 +307,7 @@ pub fn describe_and_initialize(relay: RelayCapacity, mutation_lock_connections: 
     describe_histogram!(
         SUPERVISOR_CONFIG_BUILD_DURATION_SECONDS,
         Unit::Seconds,
-        "Time to build one pushed supervisor configuration component, including store reads and credential resolution."
+        "Time to build one pushed supervisor configuration, including store reads and credential resolution."
     );
     describe_histogram!(
         SUPERVISOR_CONFIG_APPLY_DURATION_SECONDS,
@@ -751,13 +751,11 @@ mod tests {
         histogram!(MUTATION_LOCK_HOLD_SECONDS, LABEL_SCOPE => "sandbox").record(sample);
         histogram!(
             SUPERVISOR_CONFIG_BUILD_DURATION_SECONDS,
-            "component" => "sandbox_config",
             "outcome" => "ok"
         )
         .record(sample);
         histogram!(
             SUPERVISOR_CONFIG_APPLY_DURATION_SECONDS,
-            "component" => "CONFIG_COMPONENT_SANDBOX_CONFIG",
             "outcome" => "CONFIG_APPLY_OUTCOME_APPLIED"
         )
         .record(sample);

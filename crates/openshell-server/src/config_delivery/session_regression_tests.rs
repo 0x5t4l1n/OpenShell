@@ -49,10 +49,7 @@ async fn config_push_regression_global_policy_repair_wakes_pending_startup() {
         .expect("a global policy repair must wake startup without an unrelated sandbox update")
         .expect("startup task")
         .expect("valid repaired bootstrap");
-    assert_eq!(
-        bootstrap.sandbox_config.unwrap().policy,
-        Some(repaired_policy)
-    );
+    assert_eq!(bootstrap.sandbox_config.policy, Some(repaired_policy));
 }
 
 #[tokio::test]
@@ -73,36 +70,26 @@ async fn config_push_regression_admission_precedes_the_next_configuration() {
         SessionMode::Push(Arc::clone(&slots)),
     );
     let mut outbound = SessionOutbound::new(control_rx, slots);
-    let first_snapshot = sandbox_config(1);
     assert_eq!(
         state
             .supervisor_sessions
-            .deliver_config(sandbox_id, "session-1", first_snapshot.clone()),
+            .deliver_config(sandbox_id, "session-1", config(1)),
         DeliveryDisposition::Queued
     );
     let first_update = sent_update(outbound.next().await.unwrap().unwrap());
     assert_eq!(
         state
             .supervisor_sessions
-            .deliver_config(sandbox_id, "session-1", sandbox_config(2)),
+            .deliver_config(sandbox_id, "session-1", config(2)),
         DeliveryDisposition::Coalesced
     );
-    let revision = config_message_revision(&first_snapshot);
-    let result = ConfigUpdateResult {
-        update_id: first_update.update_id,
-        component_sequence: first_update.component_sequence,
-        result: Some(ConfigComponentApplyResult {
-            component: ConfigComponent::SandboxConfig.into(),
-            requested_revision: Some(revision.clone()),
-            applied_revision: Some(revision),
-            outcome: ConfigApplyOutcome::Applied.into(),
-            ..Default::default()
-        }),
-        ..Default::default()
-    };
     let completed = state
         .supervisor_sessions
-        .complete_config_update(sandbox_id, "session-1", &result)
+        .complete_config_update(
+            sandbox_id,
+            "session-1",
+            &update_result(&first_update, ConfigApplyOutcome::Applied),
+        )
         .unwrap();
     let admission = SandboxConfigurationAdmission {
         state: ConfigurationAdmissionState::Accepted.into(),
@@ -140,8 +127,5 @@ async fn config_push_regression_admission_precedes_the_next_configuration() {
             .unwrap()
             .unwrap(),
     );
-    let Some(config_update::Component::SandboxConfig(snapshot)) = second_update.component else {
-        panic!("expected sandbox configuration");
-    };
-    assert_eq!(snapshot.config_revision, 2);
+    assert_eq!(config_revision(&second_update), 2);
 }

@@ -139,14 +139,9 @@ const STORED_POLICY_SOURCE_GLOBAL: &str = "global policy setting";
 /// Maximum number of optimistic retry attempts for policy version conflicts.
 const MERGE_RETRY_LIMIT: usize = 5;
 
-/// Push a committed sandbox-scoped change to the sandbox's supervisor. A
-/// policy change also changes the provider environment's credential bindings.
-fn publish_sandbox_config_update(
-    state: &Arc<ServerState>,
-    sandbox_id: &str,
-    components: crate::config_delivery::ConfigComponents,
-) {
-    crate::config_delivery::publish_sandbox_components(state, sandbox_id, components);
+/// Push a committed sandbox-scoped change to the sandbox's supervisor.
+fn publish_sandbox_config_update(state: &Arc<ServerState>, sandbox_id: &str) {
+    crate::config_delivery::publish_sandbox(state, sandbox_id);
 }
 
 // Private wire-only compatibility types for policy history written before
@@ -1902,11 +1897,7 @@ async fn auto_approve_chunk(
             return Err(status);
         }
     };
-    crate::config_delivery::publish_sandbox_components(
-        state,
-        sandbox_id,
-        crate::config_delivery::ConfigComponents::ALL,
-    );
+    crate::config_delivery::publish_sandbox(state, sandbox_id);
     let chunk_summary = summarize_draft_chunk_rule(&chunk)?;
 
     let now_ms = current_time_ms();
@@ -2506,17 +2497,6 @@ pub(super) async fn provider_policy_composition_enabled(store: &Store) -> Result
     provider_policy_composition_enabled_in(&global_settings)
 }
 
-/// Components a global setting change can alter. The provider environment
-/// reads global settings only for the global policy, so other keys rebuild
-/// just the sandbox configuration.
-fn global_setting_components(key: &str) -> crate::config_delivery::ConfigComponents {
-    if key == POLICY_SETTING_KEY {
-        crate::config_delivery::ConfigComponents::ALL
-    } else {
-        crate::config_delivery::ConfigComponents::SANDBOX_CONFIG
-    }
-}
-
 fn provider_policy_composition_enabled_in(settings: &StoredSettings) -> Result<bool, Status> {
     Ok(decode_policy_from_global_settings(settings)?.is_none())
 }
@@ -2887,8 +2867,7 @@ pub async fn build_sandbox_config_snapshot(
 }
 
 /// Build the effective configuration from captured inputs. Sandbox settings
-/// and global policy version metadata are read here, so their failures stay
-/// with this component.
+/// and global policy version metadata are read here.
 pub async fn build_sandbox_config_snapshot_from_inputs(
     state: &ServerState,
     inputs: &SandboxConfigInputs,
@@ -3844,23 +3823,6 @@ fn provider_environment_target(
     })
 }
 
-/// The provider environment to deliver when one cannot be built from
-/// `inputs`: no values, marked as failed. The supervisor revokes its static
-/// credentials, as it does when a polling fetch fails, and keeps a sandbox
-/// configuration for this revision waiting for a successful build.
-pub fn unresolved_provider_environment_snapshot(
-    inputs: &SandboxConfigInputs,
-) -> Result<ProviderEnvironmentSnapshot, Status> {
-    let target = provider_environment_target(inputs)?;
-    Ok(ProviderEnvironmentSnapshot {
-        provider_env_revision: target.provider_env_revision,
-        provider_attachment_epoch: target.spec.provider_attachment_epoch.clone(),
-        policy_hash: deterministic_policy_hash(&target.effective_policy),
-        readiness_reason: ProviderReadinessReason::CredentialInstallFailed.into(),
-        ..Default::default()
-    })
-}
-
 /// Build the provider environment from captured inputs. This is the only
 /// configuration build step that resolves credential values.
 pub async fn build_provider_environment_snapshot_from_inputs(
@@ -4275,10 +4237,7 @@ async fn handle_update_config_inner(
                 if changed {
                     global_settings.revision = global_settings.revision.wrapping_add(1);
                     save_global_settings(state.store.as_ref(), &global_settings).await?;
-                    crate::config_delivery::publish_all_connected(
-                        state,
-                        crate::config_delivery::ConfigComponents::ALL,
-                    );
+                    crate::config_delivery::publish_all_connected(state);
                 }
                 return Ok(update_config_response(
                     u32::try_from(current.version).unwrap_or(0),
@@ -4335,10 +4294,7 @@ async fn handle_update_config_inner(
             if changed {
                 global_settings.revision = global_settings.revision.wrapping_add(1);
                 save_global_settings(state.store.as_ref(), &global_settings).await?;
-                crate::config_delivery::publish_all_connected(
-                    state,
-                    crate::config_delivery::ConfigComponents::ALL,
-                );
+                crate::config_delivery::publish_all_connected(state);
             }
 
             return Ok(update_config_response(
@@ -4386,7 +4342,7 @@ async fn handle_update_config_inner(
 
             global_settings.revision = global_settings.revision.wrapping_add(1);
             save_global_settings(state.store.as_ref(), &global_settings).await?;
-            crate::config_delivery::publish_all_connected(state, global_setting_components(key));
+            crate::config_delivery::publish_all_connected(state);
 
             if req.delete_setting
                 && key == POLICY_SETTING_KEY
@@ -4455,11 +4411,7 @@ async fn handle_update_config_inner(
                     &sandbox_settings,
                 )
                 .await?;
-                publish_sandbox_config_update(
-                    state,
-                    &sandbox_id,
-                    crate::config_delivery::ConfigComponents::SANDBOX_CONFIG,
-                );
+                publish_sandbox_config_update(state, &sandbox_id);
             }
 
             response_annotations = persist_update_config_annotations(
@@ -4505,11 +4457,7 @@ async fn handle_update_config_inner(
                 &sandbox_settings,
             )
             .await?;
-            publish_sandbox_config_update(
-                state,
-                &sandbox_id,
-                crate::config_delivery::ConfigComponents::SANDBOX_CONFIG,
-            );
+            publish_sandbox_config_update(state, &sandbox_id);
         }
 
         response_annotations = persist_update_config_annotations(
@@ -4624,11 +4572,7 @@ async fn handle_update_config_inner(
         spawn_pending_chunk_refresh(state, &workspace, &sandbox);
         emit_config_update_policy_success(sandbox_caller);
 
-        publish_sandbox_config_update(
-            state,
-            &sandbox_id,
-            crate::config_delivery::ConfigComponents::ALL,
-        );
+        publish_sandbox_config_update(state, &sandbox_id);
 
         return Ok(update_config_response(
             u32::try_from(version).unwrap_or(0),
@@ -4746,11 +4690,7 @@ async fn handle_update_config_inner(
                         sandbox_id = %sandbox_id,
                         "UpdateConfig: backfilled spec.policy from sandbox-discovered policy"
                     );
-                    publish_sandbox_config_update(
-                        state,
-                        &sandbox_id,
-                        crate::config_delivery::ConfigComponents::ALL,
-                    );
+                    publish_sandbox_config_update(state, &sandbox_id);
                 }
                 return Ok(update_config_response(
                     u32::try_from(current.version).unwrap_or(0),
@@ -4806,11 +4746,7 @@ async fn handle_update_config_inner(
     };
     response_annotations = committed_annotations;
     state.sandbox_watch_bus.notify(&sandbox_id);
-    publish_sandbox_config_update(
-        state,
-        &sandbox_id,
-        crate::config_delivery::ConfigComponents::ALL,
-    );
+    publish_sandbox_config_update(state, &sandbox_id);
     // The committed revision changed what pending proposals were evaluated
     // against. Schedule the refresh here: the matching-revision check below
     // returns before the end of this handler for every committed write.
@@ -6096,11 +6032,7 @@ async fn handle_approve_draft_chunk_inner(
             return Err(status);
         }
     };
-    crate::config_delivery::publish_sandbox_components(
-        state,
-        &sandbox_id,
-        crate::config_delivery::ConfigComponents::ALL,
-    );
+    crate::config_delivery::publish_sandbox(state, &sandbox_id);
     let chunk_summary = summarize_draft_chunk_rule(&chunk)?;
 
     let now_ms = current_time_ms();
@@ -6217,11 +6149,7 @@ async fn handle_reject_draft_chunk_inner(
         require_no_global_policy(state).await?;
         let (version, hash) =
             remove_chunk_from_policy(state, &sandbox_id, &workspace, &chunk).await?;
-        crate::config_delivery::publish_sandbox_components(
-            state,
-            &sandbox_id,
-            crate::config_delivery::ConfigComponents::ALL,
-        );
+        crate::config_delivery::publish_sandbox(state, &sandbox_id);
         emit_gateway_policy_audit_log(
             &sandbox_id,
             sandbox.object_name(),
@@ -6509,11 +6437,7 @@ async fn handle_approve_all_draft_chunks_inner(
     };
 
     if !accepted.is_empty() {
-        crate::config_delivery::publish_sandbox_components(
-            state,
-            &sandbox_id,
-            crate::config_delivery::ConfigComponents::ALL,
-        );
+        crate::config_delivery::publish_sandbox(state, &sandbox_id);
     }
 
     for (chunk, _, chunk_summary) in &accepted {
@@ -6704,11 +6628,7 @@ async fn handle_undo_draft_chunk_inner(
     );
 
     let (version, hash) = remove_chunk_from_policy(state, &sandbox_id, &workspace, &chunk).await?;
-    crate::config_delivery::publish_sandbox_components(
-        state,
-        &sandbox_id,
-        crate::config_delivery::ConfigComponents::ALL,
-    );
+    crate::config_delivery::publish_sandbox(state, &sandbox_id);
 
     // Clear any prior rejection_reason on the way back to "pending" so an
     // agent reading the chunk via policy.local cannot see a stale guidance
@@ -13354,10 +13274,7 @@ mod tests {
                 else {
                     panic!("expected ConfigUpdate");
                 };
-                if let Some(openshell_core::proto::config_update::Component::SandboxConfig(
-                    snapshot,
-                )) = update.component
-                {
+                if let Some(snapshot) = update.sandbox_config {
                     break snapshot;
                 }
             }
@@ -22283,18 +22200,6 @@ mod tests {
             );
             assert_eq!(setting.scope, SettingScope::Unspecified as i32);
         }
-    }
-
-    #[test]
-    fn global_setting_components_rebuild_provider_environment_only_for_policy() {
-        assert_eq!(
-            global_setting_components(POLICY_SETTING_KEY),
-            crate::config_delivery::ConfigComponents::ALL
-        );
-        assert_eq!(
-            global_setting_components("ocsf_json_enabled"),
-            crate::config_delivery::ConfigComponents::SANDBOX_CONFIG
-        );
     }
 
     #[test]

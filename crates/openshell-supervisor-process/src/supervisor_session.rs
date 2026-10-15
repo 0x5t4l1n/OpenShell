@@ -18,14 +18,13 @@ use std::time::Duration;
 use openshell_core::grpc_client::SettingsPollResult;
 use openshell_core::proto::open_shell_client::OpenShellClient;
 use openshell_core::proto::{
-    ConfigApplyFailure, ConfigApplyOutcome, ConfigBootstrap, ConfigBootstrapResult,
-    ConfigComponent, ConfigComponentApplyResult, ConfigSnapshotRevision, ConfigUpdate,
+    ConfigApplyFailure, ConfigApplyOutcome, ConfigSnapshotRevision, ConfigUpdate,
     ConfigUpdateResult, ConfigurationAdmissionState, FinalizeMainProcessExitRequest,
     GatewayMessage, ImagePolicyDiscovery, RelayFrame, RelayInit, RelayOpen, RelayOpenResult,
     ReportMainProcessExitRequest, SandboxConfigRevision, SandboxConfigurationAdmission,
     SandboxPolicy, StartupConfigPrepared, SupervisorHeartbeat, SupervisorHello, SupervisorMessage,
-    TcpRelayTarget, config_snapshot_revision, config_update, gateway_message, relay_open,
-    startup_config_prepared, supervisor_message,
+    TcpRelayTarget, config_snapshot_revision, gateway_message, relay_open, startup_config_prepared,
+    supervisor_message,
 };
 use openshell_isolation_interface::contract::{BoundaryLoopbackConnector, LoopbackTarget};
 use openshell_ocsf::{
@@ -50,17 +49,12 @@ pub const SESSION_PREPARE_TIMEOUT: Duration = Duration::from_mins(6);
 type StartupPolicyPreparer =
     Box<dyn FnOnce(SandboxPolicy) -> Result<Option<SandboxPolicy>, String> + Send>;
 
-/// A stream-delivered desired-state payload awaiting application by the
-/// supervisor runtime. The response travels back over `ConnectSupervisor`.
-pub enum ConfigApplyRequest {
-    Bootstrap {
-        bootstrap: ConfigBootstrap,
-        response: tokio::sync::oneshot::Sender<ConfigBootstrapResult>,
-    },
-    Update {
-        update: ConfigUpdate,
-        response: tokio::sync::oneshot::Sender<ConfigUpdateResult>,
-    },
+/// A stream-delivered configuration update awaiting application by the
+/// supervisor runtime, including the bootstrap of a reconnected session. The
+/// response travels back over `ConnectSupervisor`.
+pub struct ConfigApplyRequest {
+    pub update: ConfigUpdate,
+    pub response: tokio::sync::oneshot::Sender<ConfigUpdateResult>,
 }
 
 /// A supervisor session that has received its startup response.
@@ -90,11 +84,11 @@ pub struct PreparedSupervisorSession {
     /// The hello reported the workload as not started, so a polling gateway
     /// waits for `SupervisorRuntimeReady`.
     workload_pending: bool,
-    bootstrap: Option<ConfigBootstrap>,
+    bootstrap: Option<ConfigUpdate>,
 }
 
 impl PreparedSupervisorSession {
-    pub fn take_bootstrap(&mut self) -> Option<ConfigBootstrap> {
+    pub fn take_bootstrap(&mut self) -> Option<ConfigUpdate> {
         self.bootstrap.take()
     }
 
@@ -118,34 +112,13 @@ pub fn sandbox_config_revision(snapshot: &SettingsPollResult) -> ConfigSnapshotR
     }
 }
 
-/// Revision token the gateway correlates with a provider environment result.
-pub fn provider_config_revision(revision: u64) -> ConfigSnapshotRevision {
-    ConfigSnapshotRevision {
-        component: Some(config_snapshot_revision::Component::ProviderEnvironment(
-            revision,
-        )),
-    }
-}
-
-/// Result for one configuration component. A failure is `(code, message,
-/// retryable)`; the message is bounded for the wire.
-pub fn config_apply_result(
-    component: ConfigComponent,
-    requested_revision: Option<ConfigSnapshotRevision>,
-    applied_revision: Option<ConfigSnapshotRevision>,
-    outcome: ConfigApplyOutcome,
-    failure: Option<(&str, &str, bool)>,
-) -> ConfigComponentApplyResult {
-    ConfigComponentApplyResult {
-        component: component.into(),
-        requested_revision,
-        applied_revision,
-        outcome: outcome.into(),
-        failure: failure.map(|(code, message, retryable)| ConfigApplyFailure {
-            code: code.to_string(),
-            message: message.chars().take(1024).collect(),
-            retryable,
-        }),
+/// Sanitized failure for a configuration update result. The message is
+/// bounded for the wire.
+pub fn config_apply_failure(code: &str, message: &str, retryable: bool) -> ConfigApplyFailure {
+    ConfigApplyFailure {
+        code: code.to_string(),
+        message: message.chars().take(1024).collect(),
+        retryable,
     }
 }
 
@@ -177,86 +150,14 @@ pub fn config_admission(
     }
 }
 
-/// Component and requested revision of a delivered snapshot.
-fn snapshot_component(
-    component: config_update::Component,
-) -> (ConfigComponent, ConfigSnapshotRevision) {
-    match component {
-        config_update::Component::SandboxConfig(snapshot) => (
-            ConfigComponent::SandboxConfig,
-            sandbox_config_revision(&SettingsPollResult::from(snapshot)),
-        ),
-        config_update::Component::ProviderEnvironment(snapshot) => (
-            ConfigComponent::ProviderEnvironment,
-            provider_config_revision(snapshot.provider_env_revision),
-        ),
-    }
-}
-
-/// Result for a delivered snapshot that the runtime did not apply.
-fn unapplied_result(
-    component: Option<config_update::Component>,
-    outcome: ConfigApplyOutcome,
-    code: &str,
-    message: &str,
-) -> ConfigComponentApplyResult {
-    let (component, requested_revision) = component.map(snapshot_component).map_or(
-        (ConfigComponent::Unspecified, None),
-        |(component, revision)| (component, Some(revision)),
-    );
-    config_apply_result(
-        component,
-        requested_revision,
-        None,
-        outcome,
-        Some((code, message, false)),
-    )
-}
-
-/// Bootstrap result when the runtime did not apply the bootstrap. Every
-/// delivered component is answered, as for an update.
-fn unapplied_bootstrap(
-    bootstrap: ConfigBootstrap,
-    code: &str,
-    message: &str,
-) -> ConfigBootstrapResult {
-    let components = [
-        bootstrap
-            .provider_environment
-            .map(config_update::Component::ProviderEnvironment),
-        bootstrap
-            .sandbox_config
-            .map(config_update::Component::SandboxConfig),
-    ];
-    ConfigBootstrapResult {
-        results: components
-            .into_iter()
-            .flatten()
-            .map(|component| {
-                unapplied_result(
-                    Some(component),
-                    ConfigApplyOutcome::Unsupported,
-                    code,
-                    message,
-                )
-            })
-            .collect(),
-        admission: None,
-    }
-}
-
-/// Update result when the runtime did not apply the update.
-fn unapplied_update(
-    update: ConfigUpdate,
-    outcome: ConfigApplyOutcome,
-    code: &str,
-    message: &str,
-) -> ConfigUpdateResult {
+/// Result for an update the runtime did not apply.
+fn unapplied_update(update_id: String, code: &str, message: &str) -> ConfigUpdateResult {
     ConfigUpdateResult {
-        update_id: update.update_id,
-        component_sequence: update.component_sequence,
-        result: Some(unapplied_result(update.component, outcome, code, message)),
+        update_id,
+        outcome: ConfigApplyOutcome::Unsupported.into(),
+        failure: Some(config_apply_failure(code, message, false)),
         admission: None,
+        policy_load: None,
     }
 }
 
@@ -649,7 +550,7 @@ pub async fn prepare(
 #[allow(clippy::too_many_arguments)]
 pub fn spawn_prepared(
     prepared: PreparedSupervisorSession,
-    bootstrap_result: Option<ConfigBootstrapResult>,
+    bootstrap_result: Option<ConfigUpdateResult>,
     ssh_socket_path: std::path::PathBuf,
     port_forward: Arc<dyn BoundaryLoopbackConnector>,
     expected_ssh_peer_pid: Option<u32>,
@@ -705,7 +606,7 @@ struct SessionConfig {
 
 async fn run_session_loop(
     config: SessionConfig,
-    mut prepared: Option<(PreparedSupervisorSession, Option<ConfigBootstrapResult>)>,
+    mut prepared: Option<(PreparedSupervisorSession, Option<ConfigUpdateResult>)>,
 ) {
     let mut backoff = ReconnectBackoff::new();
     // A prepared session already used the startup epochs; continue after them
@@ -955,7 +856,8 @@ async fn open_session(
             ));
         }
     };
-    let mut client = OpenShellClient::new(channel.clone());
+    let mut client = OpenShellClient::new(channel.clone())
+        .max_decoding_message_size(grpc_client::MAX_SUPERVISOR_STREAM_MESSAGE_BYTES);
 
     // Create the outbound message stream.
     let (tx, rx) = mpsc::channel::<SupervisorMessage>(64);
@@ -1101,7 +1003,7 @@ async fn open_session(
 async fn run_prepared_session(
     config: &SessionConfig,
     mut prepared: PreparedSupervisorSession,
-    startup_result: Option<ConfigBootstrapResult>,
+    startup_result: Option<ConfigUpdateResult>,
 ) -> Result<SessionOutcome, Box<dyn std::error::Error + Send + Sync>> {
     if let Some(updates) = &config.session_id_updates {
         updates.send_replace(Some(prepared.session_id.clone()));
@@ -1115,16 +1017,14 @@ async fn run_prepared_session(
     let tx = prepared.tx;
     let mut inbound = prepared.inbound;
 
-    if let Some(result) = startup_result {
+    let bootstrap_result = match (startup_result, prepared.bootstrap.take()) {
+        (Some(result), _) => Some(result),
+        (None, Some(bootstrap)) => Some(apply_update(&config.config_apply_tx, bootstrap).await),
+        (None, None) => None,
+    };
+    if let Some(result) = bootstrap_result {
         tx.send(SupervisorMessage {
-            payload: Some(supervisor_message::Payload::ConfigBootstrapResult(result)),
-        })
-        .await
-        .map_err(|_| "failed to queue configuration bootstrap result")?;
-    } else if let Some(bootstrap) = prepared.bootstrap.take() {
-        let result = apply_bootstrap(&config.config_apply_tx, bootstrap).await;
-        tx.send(SupervisorMessage {
-            payload: Some(supervisor_message::Payload::ConfigBootstrapResult(result)),
+            payload: Some(supervisor_message::Payload::ConfigUpdateResult(result)),
         })
         .await
         .map_err(|_| "failed to queue configuration bootstrap result")?;
@@ -1205,51 +1105,43 @@ async fn run_prepared_session(
     }
 }
 
-/// Hand one delivered payload to the supervisor runtime and wait for its
-/// result. Failures return the code and message for an unapplied result.
-async fn request_apply<T>(
-    apply_tx: &mpsc::Sender<ConfigApplyRequest>,
-    request: impl FnOnce(tokio::sync::oneshot::Sender<T>) -> ConfigApplyRequest,
-) -> Result<T, (&'static str, &'static str)> {
-    let (response, receiver) = tokio::sync::oneshot::channel();
-    if apply_tx.send(request(response)).await.is_err() {
-        return Err((
-            "apply_unavailable",
-            "configuration apply service is unavailable",
-        ));
-    }
-    match tokio::time::timeout(CONFIG_APPLY_TIMEOUT, receiver).await {
-        Ok(Ok(result)) => Ok(result),
-        _ => Err(("apply_timeout", "configuration application timed out")),
-    }
-}
-
-async fn apply_bootstrap(
-    apply_tx: &mpsc::Sender<ConfigApplyRequest>,
-    bootstrap: ConfigBootstrap,
-) -> ConfigBootstrapResult {
-    let unapplied = bootstrap.clone();
-    request_apply(apply_tx, |response| ConfigApplyRequest::Bootstrap {
-        bootstrap,
-        response,
-    })
-    .await
-    .unwrap_or_else(|(code, message)| unapplied_bootstrap(unapplied, code, message))
-}
-
+/// Hand one delivered update to the supervisor runtime and wait for its
+/// result.
 async fn apply_update(
     apply_tx: &mpsc::Sender<ConfigApplyRequest>,
     update: ConfigUpdate,
 ) -> ConfigUpdateResult {
-    let unapplied = update.clone();
-    request_apply(apply_tx, |response| ConfigApplyRequest::Update {
-        update,
-        response,
-    })
-    .await
-    .unwrap_or_else(|(code, message)| {
-        unapplied_update(unapplied, ConfigApplyOutcome::Unsupported, code, message)
-    })
+    if update.update_id.is_empty()
+        || update.sandbox_config.is_none()
+        || update.provider_environment.is_none()
+    {
+        return unapplied_update(
+            update.update_id,
+            "invalid_update",
+            "configuration update identity and both configuration parts are required",
+        );
+    }
+    let update_id = update.update_id.clone();
+    let (response, receiver) = tokio::sync::oneshot::channel();
+    if apply_tx
+        .send(ConfigApplyRequest { update, response })
+        .await
+        .is_err()
+    {
+        return unapplied_update(
+            update_id,
+            "apply_unavailable",
+            "configuration apply service is unavailable",
+        );
+    }
+    match tokio::time::timeout(CONFIG_APPLY_TIMEOUT, receiver).await {
+        Ok(Ok(result)) => result,
+        _ => unapplied_update(
+            update_id,
+            "apply_timeout",
+            "configuration application timed out",
+        ),
+    }
 }
 
 /// Report the canonical process result and wait for durable handling.
@@ -1397,20 +1289,10 @@ fn handle_gateway_message(msg: &GatewayMessage, context: &GatewayMessageContext<
             let update = update.clone();
             let tx = context.tx.clone();
             let sandbox_id = context.sandbox_id.to_string();
-            let invalid_update = update.update_id.is_empty()
-                || update.component_sequence == 0
-                || update.component.is_none();
+            // The gateway sends the next update only after this one's result,
+            // so updates reach the runtime in order.
             tokio::spawn(async move {
-                let result = if invalid_update {
-                    unapplied_update(
-                        update,
-                        ConfigApplyOutcome::Unsupported,
-                        "invalid_update",
-                        "configuration update identity, sequence, and component are required",
-                    )
-                } else {
-                    apply_update(&apply_tx, update).await
-                };
+                let result = apply_update(&apply_tx, update).await;
                 if tx
                     .send(SupervisorMessage {
                         payload: Some(supervisor_message::Payload::ConfigUpdateResult(result)),
@@ -1779,8 +1661,9 @@ fn normalize_tcp_target_host(target: &TcpRelayTarget) -> Result<String, String> 
 mod target_tests {
     use super::*;
 
-    fn bootstrap() -> ConfigBootstrap {
-        ConfigBootstrap {
+    fn update() -> ConfigUpdate {
+        ConfigUpdate {
+            update_id: "update-1".into(),
             sandbox_config: Some(openshell_core::proto::SandboxConfigSnapshot {
                 config_revision: 7,
                 version: 2,
@@ -1793,44 +1676,41 @@ mod target_tests {
         }
     }
 
-    fn assert_unapplied(result: &ConfigBootstrapResult, code: &str) {
-        let sandbox = SettingsPollResult::from(bootstrap().sandbox_config.unwrap());
-        let expected = [
-            (
-                ConfigComponent::ProviderEnvironment,
-                provider_config_revision(3),
-            ),
-            (
-                ConfigComponent::SandboxConfig,
-                sandbox_config_revision(&sandbox),
-            ),
-        ];
-        assert_eq!(result.results.len(), expected.len());
-        for (result, (component, revision)) in result.results.iter().zip(expected) {
-            assert_eq!(result.component, i32::from(component));
-            assert_eq!(result.requested_revision, Some(revision));
-            assert_eq!(result.outcome, i32::from(ConfigApplyOutcome::Unsupported));
-            assert_eq!(result.failure.as_ref().unwrap().code, code);
-        }
+    fn assert_unapplied(result: &ConfigUpdateResult, code: &str) {
+        assert_eq!(result.update_id, "update-1");
+        assert_eq!(result.outcome, i32::from(ConfigApplyOutcome::Unsupported));
+        assert_eq!(result.failure.as_ref().unwrap().code, code);
+        assert!(result.admission.is_none());
     }
 
     #[tokio::test]
-    async fn unavailable_runtime_answers_every_bootstrap_component() {
+    async fn unavailable_runtime_answers_the_update() {
         let (apply_tx, apply_rx) = mpsc::channel(1);
         drop(apply_rx);
 
-        let result = apply_bootstrap(&apply_tx, bootstrap()).await;
+        let result = apply_update(&apply_tx, update()).await;
 
         assert_unapplied(&result, "apply_unavailable");
     }
 
     #[tokio::test(start_paused = true)]
-    async fn bootstrap_timeout_answers_every_component_like_an_update() {
+    async fn apply_timeout_answers_the_update() {
         let (apply_tx, _apply_rx) = mpsc::channel(1);
 
-        let result = apply_bootstrap(&apply_tx, bootstrap()).await;
+        let result = apply_update(&apply_tx, update()).await;
 
         assert_unapplied(&result, "apply_timeout");
+    }
+
+    #[tokio::test]
+    async fn update_without_both_parts_is_answered_without_the_runtime() {
+        let (apply_tx, _apply_rx) = mpsc::channel(1);
+        let mut partial = update();
+        partial.provider_environment = None;
+
+        let result = apply_update(&apply_tx, partial).await;
+
+        assert_unapplied(&result, "invalid_update");
     }
 
     #[test]

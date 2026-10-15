@@ -1623,9 +1623,6 @@ enum ConfigApplyOutcome {
   CONFIG_APPLY_OUTCOME_FAILED_RETAINED_LAST_KNOWN_GOOD = 6;
   CONFIG_APPLY_OUTCOME_FAILED_CLOSED = 7;
   CONFIG_APPLY_OUTCOME_UNSUPPORTED = 8;
-  // The supervisor holds the snapshot until the matching snapshot of the other
-  // component arrives. Not terminal.
-  CONFIG_APPLY_OUTCOME_AWAITING_COMPONENT = 9;
 }
 
 // Durable lifecycle of one desired-state update operation.
@@ -3108,10 +3105,9 @@ message SupervisorMessage {
     RelayOpenResult relay_open_result = 3;
     RelayClose relay_close = 4;
     ConfigUpdateResult config_update_result = 5;
-    ConfigBootstrapResult config_bootstrap_result = 6;
-    StartupConfigPrepared startup_config_prepared = 7;
+    StartupConfigPrepared startup_config_prepared = 6;
     // Sent after accepted admission once the workload relay is usable.
-    SupervisorRuntimeReady runtime_ready = 8;
+    SupervisorRuntimeReady runtime_ready = 7;
   }
 }
 
@@ -3163,8 +3159,8 @@ message SupervisorHello {
   // preparing the first authoritative bootstrap for this process.
   ImagePolicyDiscovery image_policy_discovery = 8;
   // The supervisor can receive its configuration over this stream instead of
-  // polling for it: it prepares its startup policy here, applies the
-  // ConfigBootstrap before starting the workload, applies and acknowledges
+  // polling for it: it prepares its startup policy here, applies the bootstrap
+  // ConfigUpdate before starting the workload, applies and acknowledges later
   // ConfigUpdate payloads, and reports admission. Gateways push configuration
   // only to supervisors that set this.
   bool supports_config_push = 9;
@@ -3209,9 +3205,9 @@ message SessionAccepted {
   reserved "heartbeat_interval_secs";
   // Gateway-assigned session ID for this connection.
   string session_id = 1;
-  // Complete gateway-owned configuration. Present exactly when
+  // The session's first configuration update. Present exactly when
   // config_push_enabled is set.
-  ConfigBootstrap bootstrap = 3;
+  ConfigUpdate bootstrap = 3;
   // The gateway pushes configuration authoritatively on this stream instead
   // of the supervisor polling for it: the bootstrap is required, ConfigUpdate
   // payloads are applied and acknowledged, and the supervisor stops polling.
@@ -3221,23 +3217,17 @@ message SessionAccepted {
   google.protobuf.Duration heartbeat_interval = 102;
 }
 
-// Complete gateway-owned configuration for a supervisor session.
-message ConfigBootstrap {
-  openshell.sandbox.v1.SandboxConfigSnapshot sandbox_config = 1;
-  ProviderEnvironmentSnapshot provider_environment = 2;
-}
-
-// A complete replacement snapshot for exactly one configuration component.
+// Complete gateway-owned configuration for a supervisor session. Each update
+// replaces the previous one. The supervisor applies the two parts together
+// and answers every update with one ConfigUpdateResult before the gateway
+// sends the next.
 message ConfigUpdate {
   // Opaque non-empty identifier scoped to the active supervisor session.
   string update_id = 1;
-  // Monotonic within one session and component. Snapshot revisions are
-  // content identities and must only be compared for equality.
-  uint64 component_sequence = 2;
-  oneof component {
-    openshell.sandbox.v1.SandboxConfigSnapshot sandbox_config = 3;
-    ProviderEnvironmentSnapshot provider_environment = 4;
-  }
+  openshell.sandbox.v1.SandboxConfigSnapshot sandbox_config = 2;
+  // The provider environment the sandbox configuration names through its
+  // provider revision, attachment epoch, and policy hash.
+  ProviderEnvironmentSnapshot provider_environment = 3;
 }
 
 // Sanitized application failure. Messages must not contain configuration
@@ -3248,34 +3238,27 @@ message ConfigApplyFailure {
   bool retryable = 3;
 }
 
-message ConfigComponentApplyResult {
-  ConfigComponent component = 1;
-  // Revision extracted from the received snapshot.
-  ConfigSnapshotRevision requested_revision = 2;
-  // Revision active after this attempt. Omitted when the received snapshot
-  // was not installed or a local override has no gateway revision.
-  ConfigSnapshotRevision applied_revision = 3;
-  ConfigApplyOutcome outcome = 4;
-  ConfigApplyFailure failure = 5;
-}
-
-// Application result for one ConfigUpdate.
+// Application result for one ConfigUpdate, including the bootstrap.
 message ConfigUpdateResult {
   // Echoes ConfigUpdate.update_id for session-local correlation.
   string update_id = 1;
-  // Echoes ConfigUpdate.component_sequence.
-  uint64 component_sequence = 2;
-  ConfigComponentApplyResult result = 3;
-  // Admission state for a sandbox-configuration update. Omitted for provider
-  // environment updates and compatibility supervisors.
+  ConfigApplyOutcome outcome = 2;
+  // Why the update did not take effect. Omitted when it did.
+  ConfigApplyFailure failure = 3;
+  // Admission state of the delivered sandbox configuration.
   SandboxConfigurationAdmission admission = 4;
+  // Load result of the sandbox policy revision the update changed, as a
+  // polling supervisor reports it with ReportPolicyStatus. Omitted when the
+  // update did not change the sandbox policy.
+  PolicyLoadResult policy_load = 5;
 }
 
-// Aggregate application result for the SessionAccepted bootstrap.
-message ConfigBootstrapResult {
-  repeated ConfigComponentApplyResult results = 1;
-  // Admission state of the complete gateway-authored bootstrap generation.
-  SandboxConfigurationAdmission admission = 2;
+// Load result of one sandbox policy revision.
+message PolicyLoadResult {
+  uint32 version = 1;
+  bool loaded = 2;
+  // Sanitized load error. Empty when loaded.
+  string error = 3;
 }
 
 // Gateway rejects the supervisor session.
@@ -3407,10 +3390,8 @@ message PeerNotifyConfigUpdateRequest {
     PeerConfigSandboxTarget sandbox = 1;
     string workspace = 2;
     bool all_connected = 3;
-    PeerConfigProviderTarget provider = 6;
+    PeerConfigProviderTarget provider = 4;
   }
-  bool sandbox_config = 4;
-  bool provider_environment = 5;
 }
 
 message PeerNotifyConfigUpdateResponse {

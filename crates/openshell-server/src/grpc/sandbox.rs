@@ -1478,11 +1478,7 @@ pub(super) async fn handle_attach_sandbox_provider(
 
     let attached = attached.load(Ordering::Relaxed);
     if attached {
-        crate::config_delivery::publish_sandbox_components(
-            state,
-            &sandbox_id,
-            crate::config_delivery::ConfigComponents::ALL,
-        );
+        crate::config_delivery::publish_sandbox(state, &sandbox_id);
         state.sandbox_watch_bus.notify(&sandbox_id);
     }
     let receipt = super::provider_readiness::record_provider_mutation(
@@ -1613,11 +1609,7 @@ pub(super) async fn handle_detach_sandbox_provider(
 
     let detached = detached.load(Ordering::Relaxed);
     if detached {
-        crate::config_delivery::publish_sandbox_components(
-            state,
-            &sandbox_id,
-            crate::config_delivery::ConfigComponents::ALL,
-        );
+        crate::config_delivery::publish_sandbox(state, &sandbox_id);
         state.sandbox_watch_bus.notify(&sandbox_id);
     }
     let receipt = super::provider_readiness::record_provider_mutation(

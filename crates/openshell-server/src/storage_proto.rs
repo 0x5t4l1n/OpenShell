@@ -151,12 +151,10 @@ mod tests {
     // Operator credential export adds four public messages and no durable types.
     // ListProvidersRequest field 4 adds a public-only label selector. Older
     // requests decode an empty selector; durable schemas remain unchanged.
-    // ConfigApplyOutcome gains AWAITING_COMPONENT, which is reachable from
-    // stored operations but never recorded on one: it is not terminal.
     const PUBLIC_RPC_SCHEMA_SHA256: &str =
-        "16489623cb0f6117c0279ea3a7a3b4653d2b51ddaf4a51e5a0d69324578555a8";
+        "e9b28aa6ed35780d5a7ee149bea5cbb93afba99fac3362046fc1bf8c975f3857";
     const DURABLE_SCHEMA_SHA256: &str =
-        "d7486389350bf6469ea50b37533ae4c8e578e755cfe786897ea212c9d608bd6b";
+        "5281143e2825539af6148785c91f9df67f654eb74d215f57940af9314867a55f";
     const PUBLIC_DURABLE_OVERLAP_SHA256: &str =
         "761dea31a521b0650840fe2a823ad6e36a265ed323ba4506889781d630df0ee3";
     // Encoded with the schema that omitted stable_placeholder. Keep these
@@ -641,7 +639,7 @@ mod tests {
                 overlap_hash.as_str(),
             ),
             (
-                (332, 28),
+                (330, 28),
                 (93, 21),
                 (81, 21),
                 PUBLIC_RPC_SCHEMA_SHA256,

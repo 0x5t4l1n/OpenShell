@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Build and deliver complete supervisor configuration snapshots.
+//! Build and deliver complete supervisor configuration.
 
 mod result_writer;
 pub mod session;
@@ -17,9 +17,9 @@ use futures::StreamExt;
 use metrics::{counter, histogram};
 use openshell_core::config::ConfigDeliveryMode;
 use openshell_core::proto::{
-    ConfigComponent, PeerConfigProviderTarget, PeerConfigSandboxTarget,
-    PeerNotifyConfigUpdateRequest, PeerNotifyConfigUpdateResponse, ProviderEnvironmentSnapshot,
-    Sandbox, SandboxConfigSnapshot, peer_notify_config_update_request,
+    PeerConfigProviderTarget, PeerConfigSandboxTarget, PeerNotifyConfigUpdateRequest,
+    PeerNotifyConfigUpdateResponse, ProviderEnvironmentSnapshot, ProviderReadinessReason, Sandbox,
+    SandboxConfigSnapshot, peer_notify_config_update_request,
 };
 use tokio::sync::Semaphore;
 use tonic::{Code, Request, Response, Status};
@@ -30,7 +30,6 @@ use crate::auth::principal::Principal;
 use crate::grpc::policy::{
     SandboxConfigInputs, build_provider_environment_snapshot_from_inputs,
     build_sandbox_config_snapshot_from_inputs, load_sandbox_config_inputs,
-    unresolved_provider_environment_snapshot,
 };
 use crate::supervisor_owner::{OWNER_TTL, SupervisorOwnerIndex};
 
@@ -38,14 +37,17 @@ pub use session_slots::{ConfigSlots, SessionOutbound};
 pub use task::Registration;
 use task::{Deliver, FanoutScope, SessionRecord};
 
-/// Leaves headroom below tonic's default 4 MiB decode limit for framing and
-/// future envelope fields.
-pub const MAX_SUPERVISOR_CONFIG_MESSAGE_BYTES: usize = 3 * 1024 * 1024;
-/// Sandbox configuration builds only read the store, which answers in
-/// milliseconds when healthy; anything slower means the store is in trouble.
+/// Leaves 1 MiB below the supervisor's receive limit for framing and future
+/// envelope fields.
+pub const MAX_SUPERVISOR_CONFIG_MESSAGE_BYTES: usize =
+    openshell_core::grpc_client::MAX_SUPERVISOR_STREAM_MESSAGE_BYTES - 1024 * 1024;
+/// Loading inputs and building the sandbox configuration only read the store,
+/// which answers in milliseconds when healthy; anything slower means the
+/// store is in trouble.
 const SANDBOX_CONFIG_BUILD_TIMEOUT: Duration = Duration::from_secs(5);
-/// Provider environment builds also resolve credentials. Covers a cold Vault
-/// Kubernetes-auth login plus a read at the default 10-second request timeout.
+/// Building the provider environment also resolves credentials. Covers a cold
+/// Vault Kubernetes-auth login plus a read at the default 10-second request
+/// timeout.
 const PROVIDER_ENVIRONMENT_BUILD_TIMEOUT: Duration = Duration::from_secs(20);
 /// Concurrent snapshot builds allowed per pooled database connection. Builds
 /// are short bursts of small queries, so a little oversubscription keeps the
@@ -56,40 +58,55 @@ const MAX_CONCURRENT_PEER_NOTIFIES: usize = 8;
 const PEER_NOTIFY_TIMEOUT: Duration = Duration::from_secs(5);
 const PEER_FANOUT_CONCURRENCY: usize = 8;
 
-/// One complete configuration component awaiting delivery to a supervisor.
+/// Complete configuration awaiting delivery to a supervisor: the sandbox
+/// configuration and the provider environment it names.
 #[derive(Clone)]
-pub enum SupervisorConfigMessage {
-    SandboxConfig(Box<SandboxConfigSnapshot>),
-    ProviderEnvironment(ProviderEnvironmentSnapshot),
+pub struct SupervisorConfig {
+    pub sandbox_config: SandboxConfigSnapshot,
+    pub provider_environment: ProviderEnvironmentSnapshot,
 }
 
-impl SupervisorConfigMessage {
-    pub(crate) fn component(&self) -> ConfigComponentKind {
-        match self {
-            Self::SandboxConfig(_) => ConfigComponentKind::SandboxConfig,
-            Self::ProviderEnvironment(_) => ConfigComponentKind::ProviderEnvironment,
-        }
-    }
-}
-
-impl fmt::Debug for SupervisorConfigMessage {
+impl fmt::Debug for SupervisorConfig {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(match self {
-            Self::SandboxConfig(_) => "SandboxConfig(<redacted>)",
-            Self::ProviderEnvironment(_) => "ProviderEnvironment(<redacted>)",
-        })
+        formatter.write_str("SupervisorConfig(<redacted>)")
     }
 }
 
-/// Result of handing one configuration snapshot to a supervisor session.
+/// Whether `provider` is the environment `sandbox` names. Without a gateway
+/// policy the sandbox configuration carries no policy hash and is not
+/// admitted, so its supervisor installs no provider environment.
+fn names_provider_environment(
+    sandbox: &SandboxConfigSnapshot,
+    provider: &ProviderEnvironmentSnapshot,
+) -> bool {
+    sandbox.provider_env_revision == provider.provider_env_revision
+        && sandbox.provider_attachment_epoch == provider.provider_attachment_epoch
+        && (sandbox.policy.is_none() || sandbox.policy_hash == provider.policy_hash)
+}
+
+/// The provider environment to deliver when the one `sandbox` names cannot
+/// be built: no values, marked as failed. The supervisor revokes its static
+/// credentials and rejects the update, as it does when a polling fetch
+/// fails, and the session retries the build.
+fn unresolved_provider_environment(sandbox: &SandboxConfigSnapshot) -> ProviderEnvironmentSnapshot {
+    ProviderEnvironmentSnapshot {
+        provider_env_revision: sandbox.provider_env_revision,
+        provider_attachment_epoch: sandbox.provider_attachment_epoch.clone(),
+        policy_hash: sandbox.policy_hash.clone(),
+        readiness_reason: ProviderReadinessReason::CredentialInstallFailed.into(),
+        ..Default::default()
+    }
+}
+
+/// Result of handing one configuration to a supervisor session.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DeliveryDisposition {
     Queued,
-    /// Replaced an older snapshot the session had not sent yet.
+    /// Replaced an older update the session had not sent yet.
     Replaced,
     /// Held until the supervisor acknowledges the previous update.
     Coalesced,
-    /// Matches the snapshot the supervisor last acknowledged.
+    /// Matches the update the supervisor last acknowledged.
     SuppressedUnchanged,
     NoActiveSession,
     UnsupportedSession,
@@ -110,95 +127,6 @@ impl DeliveryDisposition {
     }
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct ConfigComponents {
-    pub sandbox_config: bool,
-    pub provider_environment: bool,
-}
-
-impl ConfigComponents {
-    pub const ALL: Self = Self {
-        sandbox_config: true,
-        provider_environment: true,
-    };
-
-    pub const SANDBOX_CONFIG: Self = Self {
-        sandbox_config: true,
-        provider_environment: false,
-    };
-
-    pub(crate) fn only(component: ConfigComponentKind) -> Self {
-        Self {
-            sandbox_config: component == ConfigComponentKind::SandboxConfig,
-            provider_environment: component == ConfigComponentKind::ProviderEnvironment,
-        }
-    }
-
-    fn union(self, other: Self) -> Self {
-        Self {
-            sandbox_config: self.sandbox_config || other.sandbox_config,
-            provider_environment: self.provider_environment || other.provider_environment,
-        }
-    }
-
-    fn is_empty(self) -> bool {
-        !self.sandbox_config && !self.provider_environment
-    }
-
-    fn selected(self) -> impl Iterator<Item = ConfigComponentKind> {
-        [
-            (self.sandbox_config, ConfigComponentKind::SandboxConfig),
-            (
-                self.provider_environment,
-                ConfigComponentKind::ProviderEnvironment,
-            ),
-        ]
-        .into_iter()
-        .filter_map(|(selected, component)| selected.then_some(component))
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum ConfigComponentKind {
-    SandboxConfig,
-    ProviderEnvironment,
-}
-
-impl ConfigComponentKind {
-    /// The delivered component named by a wire value, if it is one.
-    pub(crate) fn from_proto(component: i32) -> Option<Self> {
-        match ConfigComponent::try_from(component).ok()? {
-            ConfigComponent::SandboxConfig => Some(Self::SandboxConfig),
-            ConfigComponent::ProviderEnvironment => Some(Self::ProviderEnvironment),
-            ConfigComponent::Unspecified => None,
-        }
-    }
-
-    /// The other half of a configuration generation.
-    pub(crate) fn counterpart(self) -> Self {
-        match self {
-            Self::SandboxConfig => Self::ProviderEnvironment,
-            Self::ProviderEnvironment => Self::SandboxConfig,
-        }
-    }
-
-    fn name(self) -> &'static str {
-        match self {
-            Self::SandboxConfig => "sandbox_config",
-            Self::ProviderEnvironment => "provider_environment",
-        }
-    }
-}
-
-impl From<ConfigComponentKind> for ConfigComponent {
-    fn from(component: ConfigComponentKind) -> Self {
-        match component {
-            ConfigComponentKind::SandboxConfig => Self::SandboxConfig,
-            ConfigComponentKind::ProviderEnvironment => Self::ProviderEnvironment,
-        }
-    }
-}
-
 /// Per-session delivery tasks for this replica's push sessions, plus
 /// coalesced notifications to peer replicas.
 #[derive(Debug)]
@@ -206,7 +134,9 @@ pub struct ConfigDelivery {
     sessions: Mutex<Sessions>,
     /// Snapshot builds in progress, bounded by the database pool they read.
     builds: Arc<Semaphore>,
-    peer_notifies: Mutex<HashMap<PeerNotifyTarget, ConfigComponents>>,
+    /// Targets with a notification task running, and whether another
+    /// notification arrived since that task last sent one.
+    peer_notifies: Mutex<HashMap<PeerNotifyTarget, bool>>,
     peer_notify_permits: Arc<Semaphore>,
     /// Admission and policy-result writes for running workloads.
     results: result_writer::ResultWriter,
@@ -273,7 +203,7 @@ impl ConfigDelivery {
     }
 
     /// Returns false when this gateway has no push session for the sandbox.
-    fn publish_sandbox(&self, sandbox_id: &str, components: ConfigComponents) -> bool {
+    fn publish_sandbox(&self, sandbox_id: &str) -> bool {
         let record = {
             let mut sessions = self.sessions();
             sessions.publications += 1;
@@ -282,16 +212,16 @@ impl ConfigDelivery {
         let Some(record) = record else {
             return false;
         };
-        record.mark(components);
+        record.mark();
         true
     }
 
-    fn publish_fanout(&self, scope: &FanoutScope, components: ConfigComponents) {
+    fn publish_fanout(&self, scope: &FanoutScope) {
         let mut sessions = self.sessions();
         sessions.publications += 1;
         for record in sessions.records.values() {
             if record.in_scope(scope) {
-                record.mark(components);
+                record.mark();
             }
         }
     }
@@ -301,69 +231,46 @@ pub fn push_enabled(state: &ServerState) -> bool {
     state.config.config_delivery_mode == ConfigDeliveryMode::Push
 }
 
-pub fn publish_sandbox_components(
-    state: &Arc<ServerState>,
-    sandbox_id: &str,
-    components: ConfigComponents,
-) {
+/// Push a committed change to one sandbox's supervisor.
+pub fn publish_sandbox(state: &Arc<ServerState>, sandbox_id: &str) {
     if !push_enabled(state) {
         return;
     }
     // A single-replica gateway owns every session, and registration covers a
     // session that is still connecting.
-    if !state
-        .config_delivery
-        .publish_sandbox(sandbox_id, components)
-        && !state.store.is_single_replica()
-    {
-        notify_peer(
-            state,
-            PeerNotifyTarget::Sandbox(sandbox_id.to_string()),
-            components,
-        );
+    if !state.config_delivery.publish_sandbox(sandbox_id) && !state.store.is_single_replica() {
+        notify_peer(state, PeerNotifyTarget::Sandbox(sandbox_id.to_string()));
     }
 }
 
-pub fn publish_workspace_components(
-    state: &Arc<ServerState>,
-    workspace: &str,
-    components: ConfigComponents,
-) {
-    publish_fanout(
-        state,
-        &FanoutScope::Workspace(workspace.to_string()),
-        components,
-    );
+/// Push a committed change to every sandbox in a workspace.
+pub fn publish_workspace(state: &Arc<ServerState>, workspace: &str) {
+    publish_fanout(state, &FanoutScope::Workspace(workspace.to_string()));
 }
 
-/// Publish a provider change to the sandboxes that attach that provider.
-pub fn publish_provider_components(
-    state: &Arc<ServerState>,
-    workspace: &str,
-    provider_name: &str,
-    components: ConfigComponents,
-) {
+/// Push a provider change to the sandboxes that attach that provider.
+pub fn publish_provider(state: &Arc<ServerState>, workspace: &str, provider_name: &str) {
     publish_fanout(
         state,
         &FanoutScope::Provider {
             workspace: workspace.to_string(),
             name: provider_name.to_string(),
         },
-        components,
     );
 }
 
-pub fn publish_all_connected(state: &Arc<ServerState>, components: ConfigComponents) {
-    publish_fanout(state, &FanoutScope::AllConnected, components);
+/// Push a committed change to every connected sandbox.
+pub fn publish_all_connected(state: &Arc<ServerState>) {
+    publish_fanout(state, &FanoutScope::AllConnected);
 }
 
-fn publish_fanout(state: &Arc<ServerState>, scope: &FanoutScope, components: ConfigComponents) {
+fn publish_fanout(state: &Arc<ServerState>, scope: &FanoutScope) {
     if !push_enabled(state) {
         return;
     }
-    state.config_delivery.publish_fanout(scope, components);
+    state.config_delivery.publish_fanout(scope);
     if !state.store.is_single_replica() {
-        notify_peer(state, PeerNotifyTarget::Peers(scope.clone()), components);
+        notify_peer(state, PeerNotifyTarget::Peers(scope.clone()));
     }
 }
 
@@ -393,7 +300,7 @@ pub fn register_session(state: &Arc<ServerState>, registration: Registration) {
     // A publication between the bootstrap read and registration may have
     // missed this session.
     if raced {
-        record.mark(ConfigComponents::ALL);
+        record.mark();
     }
     let state = Arc::clone(state);
     tokio::spawn(async move {
@@ -426,106 +333,74 @@ pub fn unregister_session(state: &ServerState, sandbox_id: &str, session_id: &st
     state.config_delivery.results.forget_recorded(sandbox_id);
 }
 
-/// Builds and delivers a session's components.
+/// Builds and delivers a session's configuration.
 struct Builder<'a>(&'a Arc<ServerState>);
 
 impl Deliver for Builder<'_> {
-    async fn deliver(
-        &self,
-        record: &SessionRecord,
-        components: ConfigComponents,
-    ) -> (ConfigComponents, Option<HashSet<String>>) {
+    async fn deliver(&self, record: &SessionRecord) -> (bool, Option<HashSet<String>>) {
         let state = self.0;
         let sandbox_id = record.sandbox_id.as_str();
-        // Selected components share one input load. The load counts against
-        // each component's own deadline, and each component still builds,
-        // delivers, and fails on its own.
-        let load_timeout = components
-            .selected()
-            .map(build_timeout)
-            .max()
-            .unwrap_or(SANDBOX_CONFIG_BUILD_TIMEOUT);
         let started = Instant::now();
-        let loaded = tokio::time::timeout(load_timeout, load_build_inputs(state, sandbox_id)).await;
-        let load_elapsed = started.elapsed();
-        let inputs = match loaded {
-            Ok(Ok(Some(inputs))) => inputs,
+        let built = tokio::time::timeout(
+            SANDBOX_CONFIG_BUILD_TIMEOUT,
+            build_sandbox_config(state, sandbox_id),
+        )
+        .await;
+        let (inputs, sandbox_config) = match built {
+            Ok(Ok(Some(built))) => built,
             Ok(Ok(None)) => {
-                for component in components.selected() {
-                    record_build(component, "ok", load_elapsed);
-                }
-                return (ConfigComponents::default(), None);
+                record_build("ok", started.elapsed());
+                return (false, None);
             }
             Ok(Err(error)) => {
-                for component in components.selected() {
-                    record_build_failure(
-                        sandbox_id,
-                        component,
-                        "failed",
-                        error.code(),
-                        load_elapsed,
-                    );
-                }
-                return (components, None);
+                record_build_failure(sandbox_id, "failed", error.code(), started.elapsed());
+                return (true, None);
             }
             Err(_) => {
-                for component in components.selected() {
-                    record_build_failure(
-                        sandbox_id,
-                        component,
-                        "timeout",
-                        Code::DeadlineExceeded,
-                        load_elapsed,
-                    );
-                }
-                return (components, None);
+                record_build_failure(
+                    sandbox_id,
+                    "timeout",
+                    Code::DeadlineExceeded,
+                    started.elapsed(),
+                );
+                return (true, None);
             }
         };
-        let mut failed = ConfigComponents::default();
-        for component in components.selected() {
-            match run_build(state, record, component, &inputs, load_elapsed).await {
-                BuildResult::Built { owner_moved } => {
-                    if owner_moved {
-                        notify_peer(
-                            state,
-                            PeerNotifyTarget::Sandbox(record.sandbox_id.clone()),
-                            ConfigComponents::only(component),
-                        );
-                    }
-                }
-                BuildResult::Failed => failed = failed.union(ConfigComponents::only(component)),
-            }
-        }
         let providers = inputs
             .sandbox()
             .spec
             .as_ref()
             .map(|spec| spec.providers.iter().cloned().collect())
             .unwrap_or_default();
-        (failed, Some(providers))
-    }
-
-    fn repair(&self, record: &SessionRecord) -> ConfigComponents {
-        self.0
-            .supervisor_sessions
-            .repair_config_components(&record.sandbox_id, &record.session_id)
+        let (provider_environment, failed) =
+            provider_environment(state, record, &inputs, &sandbox_config).await;
+        if failed.is_none() {
+            record_build("ok", started.elapsed());
+        }
+        let config = SupervisorConfig {
+            sandbox_config,
+            provider_environment,
+        };
+        let owner = deliver_if_owner(state, sandbox_id, &record.session_id, config).await;
+        if matches!(owner, OwnerCheck::Remote) {
+            notify_peer(state, PeerNotifyTarget::Sandbox(record.sandbox_id.clone()));
+        }
+        if let Some((outcome, error_code)) = failed {
+            record_build_failure(sandbox_id, outcome, error_code, started.elapsed());
+        }
+        (
+            failed.is_some() || matches!(owner, OwnerCheck::Unknown),
+            Some(providers),
+        )
     }
 }
 
-enum BuildResult {
-    Built {
-        /// The session moved to another gateway after the build started.
-        owner_moved: bool,
-    },
-    Failed,
-}
-
-/// Read the sandbox and the inputs its components share, or `None` once the
-/// sandbox is gone.
-async fn load_build_inputs(
+/// Read the sandbox and the inputs its configuration shares, and build its
+/// sandbox configuration, or `None` once the sandbox is gone.
+async fn build_sandbox_config(
     state: &Arc<ServerState>,
     sandbox_id: &str,
-) -> Result<Option<SandboxConfigInputs>, Status> {
+) -> Result<Option<(SandboxConfigInputs, SandboxConfigSnapshot)>, Status> {
     let Some(sandbox) = state
         .store
         .get_message::<Sandbox>(sandbox_id)
@@ -534,115 +409,73 @@ async fn load_build_inputs(
     else {
         return Ok(None);
     };
-    load_sandbox_config_inputs(state, sandbox).await.map(Some)
+    let inputs = load_sandbox_config_inputs(state, sandbox).await?;
+    let snapshot = build_sandbox_config_snapshot_from_inputs(state, &inputs).await?;
+    Ok(Some((inputs, snapshot)))
 }
 
-async fn run_build(
+/// The provider environment `sandbox` names. The session's last resolved
+/// environment is reused while the name is unchanged, so only a change
+/// resolves credentials. A failed resolution returns the unresolved
+/// environment and the failure to record.
+async fn provider_environment(
     state: &Arc<ServerState>,
     record: &SessionRecord,
-    component: ConfigComponentKind,
     inputs: &SandboxConfigInputs,
-    load_elapsed: Duration,
-) -> BuildResult {
-    let sandbox_id = record.sandbox_id.as_str();
-    let session_id = record.session_id.as_str();
-    let started = Instant::now();
+    sandbox: &SandboxConfigSnapshot,
+) -> (ProviderEnvironmentSnapshot, Option<(&'static str, Code)>) {
+    if let Some(cached) = record
+        .provider_environment()
+        .filter(|cached| names_provider_environment(sandbox, cached))
+    {
+        return (cached, None);
+    }
     let built = tokio::time::timeout(
-        build_timeout(component).saturating_sub(load_elapsed),
-        build_component(state, sandbox_id, inputs, component),
+        PROVIDER_ENVIRONMENT_BUILD_TIMEOUT,
+        build_provider_environment_snapshot_from_inputs(state, inputs, true, true),
     )
     .await;
-    let elapsed = load_elapsed + started.elapsed();
-    let (outcome, error_code) = match built {
-        Ok(Ok(message)) => {
-            record_build(component, "ok", elapsed);
-            return match deliver_if_owner(state, sandbox_id, session_id, component, message).await {
-                OwnerCheck::Unknown => BuildResult::Failed,
-                owner => BuildResult::Built {
-                    owner_moved: matches!(owner, OwnerCheck::Remote),
-                },
-            };
+    match built {
+        Ok(Ok(snapshot)) => {
+            record.cache_provider_environment(snapshot.clone());
+            (snapshot, None)
         }
-        Ok(Err(error)) => ("failed", error.code()),
-        Err(_) => ("timeout", Code::DeadlineExceeded),
-    };
-    record_build_failure(sandbox_id, component, outcome, error_code, elapsed);
-    // A provider environment that cannot be built revokes the supervisor's
-    // static credentials, as a failed fetch does when polling. A supervisor
-    // that already holds this revision ignores it as a duplicate.
-    if component == ConfigComponentKind::ProviderEnvironment
-        && let Ok(snapshot) = unresolved_provider_environment_snapshot(inputs)
-    {
-        deliver_if_owner(
-            state,
-            sandbox_id,
-            session_id,
-            component,
-            SupervisorConfigMessage::ProviderEnvironment(snapshot),
-        )
-        .await;
+        Ok(Err(error)) => (
+            unresolved_provider_environment(sandbox),
+            Some(("failed", error.code())),
+        ),
+        Err(_) => (
+            unresolved_provider_environment(sandbox),
+            Some(("timeout", Code::DeadlineExceeded)),
+        ),
     }
-    BuildResult::Failed
 }
 
-/// Deliver `message` if this gateway still owns the session it was built for.
+/// Deliver `config` if this gateway still owns the session it was built for.
 async fn deliver_if_owner(
     state: &Arc<ServerState>,
     sandbox_id: &str,
     session_id: &str,
-    component: ConfigComponentKind,
-    message: SupervisorConfigMessage,
+    config: SupervisorConfig,
 ) -> OwnerCheck {
     let owner = owner_check(state, sandbox_id, session_id).await;
     let outcome = match owner {
         OwnerCheck::Current => state
             .supervisor_sessions
-            .deliver_config(sandbox_id, session_id, message)
+            .deliver_config(sandbox_id, session_id, config)
             .metric_label(),
         OwnerCheck::Remote => "owner_moved",
         OwnerCheck::Gone => "no_active_session",
         OwnerCheck::Unknown => "owner_lookup_failed",
     };
-    record_delivery(component, outcome);
+    record_delivery(outcome);
     owner
-}
-
-const fn build_timeout(component: ConfigComponentKind) -> Duration {
-    match component {
-        ConfigComponentKind::SandboxConfig => SANDBOX_CONFIG_BUILD_TIMEOUT,
-        ConfigComponentKind::ProviderEnvironment => PROVIDER_ENVIRONMENT_BUILD_TIMEOUT,
-    }
-}
-
-#[tracing::instrument(
-    name = "config_build",
-    level = "debug",
-    skip_all,
-    fields(
-        otel.name = "config_delivery.build",
-        sandbox_id = %sandbox_id,
-        component = component.name()
-    )
-)]
-async fn build_component(
-    state: &Arc<ServerState>,
-    sandbox_id: &str,
-    inputs: &SandboxConfigInputs,
-    component: ConfigComponentKind,
-) -> Result<SupervisorConfigMessage, Status> {
-    Ok(match component {
-        ConfigComponentKind::SandboxConfig => SupervisorConfigMessage::SandboxConfig(Box::new(
-            build_sandbox_config_snapshot_from_inputs(state, inputs).await?,
-        )),
-        ConfigComponentKind::ProviderEnvironment => SupervisorConfigMessage::ProviderEnvironment(
-            build_provider_environment_snapshot_from_inputs(state, inputs, true, true).await?,
-        ),
-    })
 }
 
 enum OwnerCheck {
     /// This gateway owns the session the build started for.
     Current,
+    /// The session moved to another gateway after the build started.
     Remote,
     Gone,
     Unknown,
@@ -675,7 +508,7 @@ async fn owner_check(state: &Arc<ServerState>, sandbox_id: &str, session_id: &st
 
 /// Queue a notification for `target`. Notifications for the same target
 /// coalesce while one is pending or running.
-fn notify_peer(state: &Arc<ServerState>, target: PeerNotifyTarget, components: ConfigComponents) {
+fn notify_peer(state: &Arc<ServerState>, target: PeerNotifyTarget) {
     let start = {
         let mut pending = state
             .config_delivery
@@ -685,10 +518,10 @@ fn notify_peer(state: &Arc<ServerState>, target: PeerNotifyTarget, components: C
         let mut start = false;
         pending
             .entry(target.clone())
-            .and_modify(|queued| *queued = queued.union(components))
+            .and_modify(|queued| *queued = true)
             .or_insert_with(|| {
                 start = true;
-                components
+                true
             });
         start
     };
@@ -703,7 +536,7 @@ async fn run_peer_notifies(state: Arc<ServerState>, target: PeerNotifyTarget) {
         .await
         .expect("peer notification semaphore is never closed");
     loop {
-        let components = {
+        {
             let mut pending = state
                 .config_delivery
                 .peer_notifies
@@ -712,23 +545,18 @@ async fn run_peer_notifies(state: Arc<ServerState>, target: PeerNotifyTarget) {
             let Some(queued) = pending.get_mut(&target) else {
                 return;
             };
-            if queued.is_empty() {
+            if !std::mem::take(queued) {
                 pending.remove(&target);
                 return;
             }
-            std::mem::take(queued)
-        };
+        }
         match &target {
             PeerNotifyTarget::Sandbox(sandbox_id) => {
-                if notify_sandbox_owner(&state, sandbox_id, components).await
-                    == PeerNotifyResult::Local
-                {
-                    state
-                        .config_delivery
-                        .publish_sandbox(sandbox_id, components);
+                if notify_sandbox_owner(&state, sandbox_id).await == PeerNotifyResult::Local {
+                    state.config_delivery.publish_sandbox(sandbox_id);
                 }
             }
-            PeerNotifyTarget::Peers(scope) => notify_peers(&state, scope, components).await,
+            PeerNotifyTarget::Peers(scope) => notify_peers(&state, scope).await,
         }
     }
 }
@@ -741,12 +569,8 @@ enum PeerNotifyResult {
 }
 
 /// Send a secret-free notification to the gateway that owns the sandbox session. The
-/// owner builds its own snapshot from shared state.
-async fn notify_sandbox_owner(
-    state: &Arc<ServerState>,
-    sandbox_id: &str,
-    components: ConfigComponents,
-) -> PeerNotifyResult {
+/// owner builds its own configuration from shared state.
+async fn notify_sandbox_owner(state: &Arc<ServerState>, sandbox_id: &str) -> PeerNotifyResult {
     let owners = SupervisorOwnerIndex::new(Arc::clone(&state.store), OWNER_TTL);
     let mut final_outcome = "stale_owner";
     for attempt in 0..2 {
@@ -779,8 +603,6 @@ async fn notify_sandbox_owner(
                     session_id: owner.session_id,
                 },
             )),
-            sandbox_config: components.sandbox_config,
-            provider_environment: components.provider_environment,
         };
         match send_peer_notify(state, &peer_endpoint, request).await {
             PeerNotifyOutcome::StaleOwner => final_outcome = "stale_owner",
@@ -798,7 +620,7 @@ async fn notify_sandbox_owner(
     PeerNotifyResult::Done
 }
 
-async fn notify_peers(state: &Arc<ServerState>, scope: &FanoutScope, components: ConfigComponents) {
+async fn notify_peers(state: &Arc<ServerState>, scope: &FanoutScope) {
     let owners = SupervisorOwnerIndex::new(Arc::clone(&state.store), OWNER_TTL);
     let endpoints = match owners.list_fresh_peer_endpoints(&state.replica_id).await {
         Ok(endpoints) => endpoints,
@@ -812,8 +634,6 @@ async fn notify_peers(state: &Arc<ServerState>, scope: &FanoutScope, components:
         .for_each_concurrent(PEER_FANOUT_CONCURRENCY, |endpoint| {
             let request = PeerNotifyConfigUpdateRequest {
                 scope: Some(scope.clone()),
-                sandbox_config: components.sandbox_config,
-                provider_environment: components.provider_environment,
             };
             async move {
                 let outcome = send_peer_notify(state, &endpoint, request).await;
@@ -894,15 +714,6 @@ pub fn handle_peer_notify_config_update(
         ));
     }
     let notification = request.into_inner();
-    let components = ConfigComponents {
-        sandbox_config: notification.sandbox_config,
-        provider_environment: notification.provider_environment,
-    };
-    if components.is_empty() {
-        return Err(Status::invalid_argument(
-            "at least one configuration component is required",
-        ));
-    }
     let mut response = PeerNotifyConfigUpdateResponse::default();
     // Notifications from peers never fan out to peers again.
     let scope = match notification.scope {
@@ -918,9 +729,7 @@ pub fn handle_peer_notify_config_update(
                 .supervisor_sessions
                 .is_current_session(&target.sandbox_id, &target.session_id)
             {
-                state
-                    .config_delivery
-                    .publish_sandbox(&target.sandbox_id, components);
+                state.config_delivery.publish_sandbox(&target.sandbox_id);
             } else {
                 response.stale_owner = true;
             }
@@ -952,15 +761,15 @@ pub fn handle_peer_notify_config_update(
             ));
         }
     };
-    state.config_delivery.publish_fanout(&scope, components);
+    state.config_delivery.publish_fanout(&scope);
     Ok(Response::new(response))
 }
 
 /// Streamed-apply supervisor session registered without a gRPC stream. It
-/// holds each component until the previous update is acknowledged.
+/// holds each update until the previous one is acknowledged. The registry
+/// keeps its control channel open while the session is registered.
 #[cfg(test)]
 pub struct TestApplySession {
-    pub control: tokio::sync::mpsc::Sender<openshell_core::proto::GatewayMessage>,
     pub outbound: SessionOutbound,
 }
 
@@ -991,7 +800,7 @@ fn register_test_apply_session_after(
     state.supervisor_sessions.register_with_mode(
         sandbox_id.clone(),
         session_id.to_string(),
-        control.clone(),
+        control,
         tokio::sync::oneshot::channel().0,
         crate::supervisor_session::SessionMode::Push(Arc::clone(&slots)),
     );
@@ -1006,25 +815,23 @@ fn register_test_apply_session_after(
                 .as_ref()
                 .map(|spec| spec.providers.iter().cloned().collect())
                 .unwrap_or_default(),
+            provider_environment: None,
             captured_seq,
         },
     );
     TestApplySession {
-        control,
         outbound: SessionOutbound::new(rx, slots),
     }
 }
 
-fn record_build(component: ConfigComponentKind, outcome: &'static str, elapsed: Duration) {
+fn record_build(outcome: &'static str, elapsed: Duration) {
     counter!(
         "openshell_supervisor_config_builds_total",
-        "component" => component.name(),
         "outcome" => outcome,
     )
     .increment(1);
     histogram!(
         crate::gateway_metrics::SUPERVISOR_CONFIG_BUILD_DURATION_SECONDS,
-        "component" => component.name(),
         "outcome" => outcome,
     )
     .record(elapsed.as_secs_f64());
@@ -1032,24 +839,21 @@ fn record_build(component: ConfigComponentKind, outcome: &'static str, elapsed: 
 
 fn record_build_failure(
     sandbox_id: &str,
-    component: ConfigComponentKind,
     outcome: &'static str,
     error_code: Code,
     elapsed: Duration,
 ) {
-    record_build(component, outcome, elapsed);
+    record_build(outcome, elapsed);
     warn!(
         sandbox_id,
-        component = component.name(),
         ?error_code,
-        "failed to build supervisor configuration snapshot"
+        "failed to build supervisor configuration"
     );
 }
 
-fn record_delivery(component: ConfigComponentKind, outcome: &'static str) {
+fn record_delivery(outcome: &'static str) {
     counter!(
         "openshell_supervisor_config_deliveries_total",
-        "component" => component.name(),
         "outcome" => outcome,
     )
     .increment(1);
@@ -1074,11 +878,7 @@ mod tests {
     fn peer_request(
         scope: peer_notify_config_update_request::Scope,
     ) -> Request<PeerNotifyConfigUpdateRequest> {
-        let mut request = Request::new(PeerNotifyConfigUpdateRequest {
-            scope: Some(scope),
-            sandbox_config: true,
-            provider_environment: false,
-        });
+        let mut request = Request::new(PeerNotifyConfigUpdateRequest { scope: Some(scope) });
         request
             .extensions_mut()
             .insert(Principal::Peer(crate::auth::principal::PeerPrincipal {
@@ -1180,6 +980,18 @@ mod tests {
         state: &Arc<ServerState>,
         sandbox_id: &str,
     ) -> (SupervisorStreamHarness, String) {
+        let (harness, session_id, _) = accepted_session_with_bootstrap(state, sandbox_id).await;
+        (harness, session_id)
+    }
+
+    async fn accepted_session_with_bootstrap(
+        state: &Arc<ServerState>,
+        sandbox_id: &str,
+    ) -> (
+        SupervisorStreamHarness,
+        String,
+        Option<openshell_core::proto::ConfigUpdate>,
+    ) {
         let mut harness = reconnect_supervisor_stream(state, sandbox_id, StreamFeatures::Apply)
             .await
             .unwrap();
@@ -1193,13 +1005,13 @@ mod tests {
         };
         // Live updates wait for the bootstrap result, as from a real
         // supervisor; the gateway answers it with the admission.
-        if let Some(bootstrap) = accepted.bootstrap {
+        if let Some(bootstrap) = accepted.bootstrap.as_ref() {
             harness
                 .outbound
                 .send(openshell_core::proto::SupervisorMessage {
                     payload: Some(
-                        openshell_core::proto::supervisor_message::Payload::ConfigBootstrapResult(
-                            session::applied_bootstrap_result(&bootstrap),
+                        openshell_core::proto::supervisor_message::Payload::ConfigUpdateResult(
+                            session::applied_result(bootstrap),
                         ),
                     ),
                 })
@@ -1213,7 +1025,7 @@ mod tests {
                 Some(gateway_message::Payload::ConfigurationAdmission(_))
             ));
         }
-        (harness, accepted.session_id)
+        (harness, accepted.session_id, accepted.bootstrap)
     }
 
     async fn next_update(
@@ -1295,14 +1107,12 @@ mod tests {
         let (mut unattached, _) = accepted_session(&state, "unattached").await;
         put_provider_with_token(&state, "github", Some("rotated")).await;
 
-        publish_provider_components(&state, "default", "github", ConfigComponents::ALL);
+        publish_provider(&state, "default", "github");
 
-        for _ in 0..2 {
-            let update = next_update(&mut attached, Duration::from_secs(5))
-                .await
-                .expect("attached sandbox receives both components");
-            assert!(is_config_update(&update));
-        }
+        let update = next_update(&mut attached, Duration::from_secs(5))
+            .await
+            .expect("attached sandbox receives its configuration");
+        assert!(is_config_update(&update));
         assert!(
             next_update(&mut unattached, Duration::from_millis(200))
                 .await
@@ -1310,7 +1120,7 @@ mod tests {
         );
 
         change_policy(&state, "unattached", 1).await;
-        publish_workspace_components(&state, "default", ConfigComponents::SANDBOX_CONFIG);
+        publish_workspace(&state, "default");
         assert!(
             next_update(&mut unattached, Duration::from_secs(5))
                 .await
@@ -1330,10 +1140,10 @@ mod tests {
         let (mut harness, _) = accepted_session(&state, "sandbox").await;
         assert!(!has_recipient(&state, "sandbox"));
 
-        publish_sandbox_components(&state, "sandbox", ConfigComponents::ALL);
-        publish_workspace_components(&state, "default", ConfigComponents::ALL);
-        publish_provider_components(&state, "default", "github", ConfigComponents::ALL);
-        publish_all_connected(&state, ConfigComponents::ALL);
+        publish_sandbox(&state, "sandbox");
+        publish_workspace(&state, "default");
+        publish_provider(&state, "default", "github");
+        publish_all_connected(&state);
 
         assert_eq!(state.config_delivery.publications(), 0);
         assert!(
@@ -1364,16 +1174,12 @@ mod tests {
     async fn peer_notifications_for_one_target_coalesce() {
         let state = push_state().await;
         let target = PeerNotifyTarget::Sandbox("remote".into());
-        notify_peer(&state, target.clone(), ConfigComponents::SANDBOX_CONFIG);
-        notify_peer(
-            &state,
-            target.clone(),
-            ConfigComponents::only(ConfigComponentKind::ProviderEnvironment),
-        );
+        notify_peer(&state, target.clone());
+        notify_peer(&state, target.clone());
         {
             let pending = state.config_delivery.peer_notifies.lock().unwrap();
             assert_eq!(pending.len(), 1);
-            assert_eq!(pending[&target], ConfigComponents::ALL);
+            assert!(pending[&target]);
         }
         tokio::time::timeout(Duration::from_secs(5), async {
             while !state
@@ -1391,7 +1197,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unresolved_provider_environment_names_the_revision_a_build_would() {
+    async fn sandbox_configuration_names_its_built_and_unresolved_provider_environment() {
         let state = push_state().await;
         put_provider_with_token(&state, "provider", Some("token")).await;
         put_sandbox(&state, "sandbox", &["provider"]).await;
@@ -1402,32 +1208,25 @@ mod tests {
             .unwrap()
             .unwrap();
         let inputs = load_sandbox_config_inputs(&state, sandbox).await.unwrap();
+        let sandbox_config = build_sandbox_config_snapshot_from_inputs(&state, &inputs)
+            .await
+            .unwrap();
         let built = build_provider_environment_snapshot_from_inputs(&state, &inputs, true, true)
             .await
             .unwrap();
         assert!(!built.values.is_empty());
+        // The supervisor matches both to the sandbox configuration that names
+        // them, and to the one it holds.
+        assert!(names_provider_environment(&sandbox_config, &built));
 
-        // The supervisor matches the unresolved environment to the sandbox
-        // configuration that names this revision, and to the one it holds.
-        let unresolved = unresolved_provider_environment_snapshot(&inputs).unwrap();
-        assert_eq!(
-            (
-                unresolved.provider_env_revision,
-                &unresolved.provider_attachment_epoch,
-                &unresolved.policy_hash,
-            ),
-            (
-                built.provider_env_revision,
-                &built.provider_attachment_epoch,
-                &built.policy_hash,
-            )
-        );
+        let unresolved = unresolved_provider_environment(&sandbox_config);
+        assert!(names_provider_environment(&sandbox_config, &unresolved));
         assert!(unresolved.values.is_empty());
         assert!(unresolved.dynamic_credentials.is_empty());
         assert!(unresolved.files.is_empty());
         assert_eq!(
             unresolved.readiness_reason,
-            i32::from(openshell_core::proto::ProviderReadinessReason::CredentialInstallFailed)
+            i32::from(ProviderReadinessReason::CredentialInstallFailed)
         );
     }
 
@@ -1445,11 +1244,7 @@ mod tests {
         // The change commits after the session read its bootstrap, and its
         // publication runs before the session registers.
         change_policy(&state, "sandbox", 1).await;
-        assert!(
-            !state
-                .config_delivery
-                .publish_sandbox("sandbox", ConfigComponents::SANDBOX_CONFIG)
-        );
+        assert!(!state.config_delivery.publish_sandbox("sandbox"));
 
         let mut session =
             register_test_apply_session_after(&state, &sandbox, "session-1", captured_seq);
@@ -1476,6 +1271,7 @@ mod tests {
                     session_id: "session".into(),
                     workspace: "ws".into(),
                     providers: HashSet::new(),
+                    provider_environment: None,
                     captured_seq: 0,
                 }))
             })
@@ -1486,7 +1282,7 @@ mod tests {
                 .map(|record| (record.sandbox_id.clone(), Arc::clone(record))),
         );
         for _ in 0..3 {
-            delivery.publish_fanout(&FanoutScope::AllConnected, ConfigComponents::SANDBOX_CONFIG);
+            delivery.publish_fanout(&FanoutScope::AllConnected);
         }
         assert_eq!(delivery.publications(), 3);
         assert!(
@@ -1508,27 +1304,18 @@ mod tests {
     }
 
     #[test]
-    fn credential_resolving_builds_get_a_longer_deadline() {
-        assert_eq!(
-            build_timeout(ConfigComponentKind::SandboxConfig),
-            Duration::from_secs(5)
-        );
-        assert_eq!(
-            build_timeout(ConfigComponentKind::ProviderEnvironment),
-            Duration::from_secs(20)
-        );
-    }
-
-    #[test]
     fn configuration_message_debug_output_redacts_payloads() {
-        let message = SupervisorConfigMessage::ProviderEnvironment(ProviderEnvironmentSnapshot {
-            values: vec![openshell_core::proto::ProviderEnvironmentValue {
-                name: "TOKEN".into(),
-                value: "secret-marker".into(),
+        let message = SupervisorConfig {
+            sandbox_config: SandboxConfigSnapshot::default(),
+            provider_environment: ProviderEnvironmentSnapshot {
+                values: vec![openshell_core::proto::ProviderEnvironmentValue {
+                    name: "TOKEN".into(),
+                    value: "secret-marker".into(),
+                    ..Default::default()
+                }],
                 ..Default::default()
-            }],
-            ..Default::default()
-        });
+            },
+        };
         assert!(!format!("{message:?}").contains("secret-marker"));
     }
 
@@ -1540,7 +1327,7 @@ mod tests {
         assert!(has_recipient(&state, "sandbox"));
         change_policy(&state, "sandbox", 1).await;
 
-        publish_sandbox_components(&state, "sandbox", ConfigComponents::SANDBOX_CONFIG);
+        publish_sandbox(&state, "sandbox");
         let update = next_update(&mut harness, Duration::from_secs(5))
             .await
             .expect("configuration update");
@@ -1560,8 +1347,8 @@ mod tests {
             panic!("expected SessionAccepted");
         };
         assert!(accepted.bootstrap.is_none());
-        publish_sandbox_components(&state, "legacy-sandbox", ConfigComponents::SANDBOX_CONFIG);
-        publish_all_connected(&state, ConfigComponents::ALL);
+        publish_sandbox(&state, "legacy-sandbox");
+        publish_all_connected(&state);
         assert!(
             next_update(&mut harness, Duration::from_millis(100))
                 .await
@@ -1729,7 +1516,8 @@ mod tests {
     }
 
     /// Attach a provider whose credential resolves through the credential
-    /// driver, and accept a session for its sandbox.
+    /// driver, and accept a session for its sandbox. The session's record
+    /// holds the provider environment its bootstrap delivered.
     async fn driver_backed_session(
         state: &Arc<ServerState>,
     ) -> (SupervisorStreamHarness, SessionRecord) {
@@ -1746,35 +1534,32 @@ mod tests {
             .unwrap();
         put_driver_provider(state, credential_handles).await;
         put_sandbox(state, "sandbox", &["provider"]).await;
-        let (harness, session_id) = accepted_session(state, "sandbox").await;
+        let (harness, session_id, bootstrap) =
+            accepted_session_with_bootstrap(state, "sandbox").await;
         let record = SessionRecord::new(Registration {
             sandbox_id: "sandbox".into(),
             session_id,
             workspace: "default".into(),
             providers: HashSet::from(["provider".to_string()]),
+            provider_environment: bootstrap.and_then(|bootstrap| bootstrap.provider_environment),
             captured_seq: 0,
         });
         (harness, record)
     }
 
-    fn updated_component(message: &GatewayMessage) -> Option<ConfigComponentKind> {
-        use openshell_core::proto::config_update::Component;
-
+    fn sent_config(message: &GatewayMessage) -> openshell_core::proto::ConfigUpdate {
         let Some(gateway_message::Payload::ConfigUpdate(update)) = &message.payload else {
-            return None;
+            panic!("expected a configuration update");
         };
-        match update.component.as_ref()? {
-            Component::SandboxConfig(_) => Some(ConfigComponentKind::SandboxConfig),
-            Component::ProviderEnvironment(_) => Some(ConfigComponentKind::ProviderEnvironment),
-        }
+        update.clone()
     }
 
     #[tokio::test]
-    async fn provider_failure_keeps_the_built_sandbox_configuration_deliverable() {
+    async fn provider_failure_delivers_the_configuration_with_an_unresolved_environment() {
         let state = push_state().await;
         let (mut harness, record) = driver_backed_session(&state).await;
         // The provider's credential no longer resolves, and a new policy
-        // revision changes the sandbox configuration.
+        // revision changes the provider environment the configuration names.
         put_driver_provider(
             &state,
             HashMap::from([(
@@ -1789,47 +1574,62 @@ mod tests {
         .await;
         change_policy(&state, "sandbox", 1).await;
 
-        let (failed, providers) = Builder(&state)
-            .deliver(&record, ConfigComponents::ALL)
-            .await;
-        assert_eq!(
-            failed,
-            ConfigComponents::only(ConfigComponentKind::ProviderEnvironment)
-        );
+        let (failed, providers) = Builder(&state).deliver(&record).await;
+        assert!(failed, "the session retries the build");
         assert_eq!(providers, Some(HashSet::from(["provider".to_string()])));
-        let update = next_update(&mut harness, Duration::from_secs(5))
-            .await
-            .expect("sandbox configuration update");
+        let update = sent_config(
+            &next_update(&mut harness, Duration::from_secs(5))
+                .await
+                .expect("configuration update"),
+        );
+        let sandbox_config = update.sandbox_config.expect("sandbox configuration");
+        let provider = update.provider_environment.expect("provider environment");
+        assert!(names_provider_environment(&sandbox_config, &provider));
+        assert!(provider.values.is_empty());
         assert_eq!(
-            updated_component(&update),
-            Some(ConfigComponentKind::SandboxConfig)
+            provider.readiness_reason,
+            i32::from(ProviderReadinessReason::CredentialInstallFailed)
         );
     }
 
     #[tokio::test]
-    async fn sandbox_configuration_builds_resolve_no_credentials() {
+    async fn unchanged_provider_environment_resolves_no_credentials() {
         let state = push_state().await;
         let (mut harness, record) = driver_backed_session(&state).await;
         let (mut resolve_hit, _release_resolve) = state.credentials.gate_next_resolve();
-        change_policy(&state, "sandbox", 1).await;
 
-        let (failed, _) = tokio::time::timeout(
-            Duration::from_secs(5),
-            Builder(&state).deliver(&record, ConfigComponents::SANDBOX_CONFIG),
-        )
-        .await
-        .expect("a sandbox configuration build must not wait on credentials");
-        assert!(failed.is_empty());
-        let update = next_update(&mut harness, Duration::from_secs(5))
-            .await
-            .expect("sandbox configuration update");
-        assert_eq!(
-            updated_component(&update),
-            Some(ConfigComponentKind::SandboxConfig)
-        );
+        let (failed, _) =
+            tokio::time::timeout(Duration::from_secs(5), Builder(&state).deliver(&record))
+                .await
+                .expect("an unchanged provider environment must not wait on credentials");
+        assert!(!failed);
         assert_eq!(
             resolve_hit.try_recv(),
             Err(tokio::sync::oneshot::error::TryRecvError::Empty)
         );
+        assert!(
+            next_update(&mut harness, Duration::from_millis(200))
+                .await
+                .is_none(),
+            "the supervisor already has this configuration"
+        );
+    }
+
+    #[tokio::test]
+    async fn changed_provider_environment_is_resolved_and_cached() {
+        let state = push_state().await;
+        let (mut harness, record) = driver_backed_session(&state).await;
+        change_policy(&state, "sandbox", 1).await;
+
+        let (failed, _) = Builder(&state).deliver(&record).await;
+        assert!(!failed);
+        let update = sent_config(
+            &next_update(&mut harness, Duration::from_secs(5))
+                .await
+                .expect("configuration update"),
+        );
+        let provider = update.provider_environment.expect("provider environment");
+        assert!(!provider.values.is_empty());
+        assert_eq!(record.provider_environment(), Some(provider));
     }
 }
