@@ -114,7 +114,7 @@ message MiddlewareBinding {
   // Maximum request body, WebSocket message, or response body unit/replacement.
   // Required for payload-bearing operations. An HTTP binding of a service that
   // requires the HTTP session hooks capability may leave this zero: OpenShell
-  // then offers it no body modes, so it can only continue or reject at
+  // then offers it no body modes, so it can only continue or deny at
   // preflight.
   uint64 max_payload_bytes = 3;
   // Optional binding-specific RPC timeout. Empty uses the operator-configured
@@ -193,7 +193,9 @@ message HttpRequestSessionResult {
 }
 
 // HTTP session hooks. One ordered result in an EvaluateHttpResponseSession
-// stream, under the rules HttpRequestSessionResult describes.
+// stream, under the rules HttpRequestSessionResult describes, with
+// block_delivery instead of reject. Blocking delivery does not undo the
+// request already handled by the external service.
 message HttpResponseSessionResult {
   oneof result {
     HttpPreflightResult preflight_result = 1;
@@ -201,7 +203,7 @@ message HttpResponseSessionResult {
     HttpOutputStart output_start = 3;
     HttpOutputChunk output_chunk = 4;
     HttpFinish finish = 5;
-    HttpReject reject = 6;
+    HttpReject block_delivery = 6;
     HttpCannotInspect cannot_inspect = 7;
   }
 }
@@ -327,8 +329,8 @@ message HttpResponseSessionPreflight {
   // Validated service configuration. Limited to 64 KiB encoded.
   google.protobuf.Struct config = 5;
   // Body modes this response is eligible for. Empty permits only
-  // continue_without_body, reject, or cannot_inspect. The stage selects one
-  // of them, or continues or rejects when none suits it.
+  // continue_without_body, block_delivery, or cannot_inspect. The stage
+  // selects one of them, or continues or blocks delivery when none suits it.
   repeated HttpBodyMode permitted_body_modes = 6;
   // One entry for each body mode that permitted_body_modes omits, with the
   // rule that removed it. A stage can tell a bodyless response, which it may
@@ -500,9 +502,10 @@ message HttpReject {
 }
 
 // Terminal failure: the stage cannot inspect this message, such as a body in
-// a format it does not understand. Valid wherever reject is. Reject denies the
-// content; cannot_inspect is a stage failure, so OpenShell fails the exchange
-// closed and returns the platform-owned failure_code middleware_cannot_inspect
+// a format it does not understand. Valid wherever reject or block_delivery
+// is. Either denial blocks the content; cannot_inspect is a stage failure,
+// so OpenShell fails the exchange closed and returns the platform-owned
+// failure_code middleware_cannot_inspect
 // to the sandbox. For uninspectable traffic, OpenShell refuses the connection.
 message HttpCannotInspect {}
 

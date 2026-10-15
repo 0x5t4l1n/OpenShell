@@ -483,9 +483,9 @@ type StageResults =
     Pin<Box<dyn futures::Stream<Item = Result<Option<StageResult>, tonic::Status>> + Send>>;
 
 /// Conversions between the stage events and results and one RPC's messages,
-/// which differ only in their preflight.
+/// which differ in their preflight and denial variant.
 macro_rules! session_messages {
-    ($event:ident, $result:ident) => {
+    ($event:ident, $result:ident, $denial:ident) => {
         impl From<StageEvent> for openshell_core::proto::$event::Event {
             fn from(event: StageEvent) -> Self {
                 match event {
@@ -507,7 +507,7 @@ macro_rules! session_messages {
                     Wire::OutputStart(start) => Self::OutputStart(start),
                     Wire::OutputChunk(chunk) => Self::OutputChunk(chunk),
                     Wire::Finish(finish) => Self::Finish(finish),
-                    Wire::Reject(reject) => Self::Reject(reject),
+                    Wire::$denial(reject) => Self::Reject(reject),
                     Wire::CannotInspect(_) => Self::CannotInspect,
                 }
             }
@@ -515,8 +515,16 @@ macro_rules! session_messages {
     };
 }
 
-session_messages!(http_request_session_event, http_request_session_result);
-session_messages!(http_response_session_event, http_response_session_result);
+session_messages!(
+    http_request_session_event,
+    http_request_session_result,
+    Reject
+);
+session_messages!(
+    http_response_session_event,
+    http_response_session_result,
+    BlockDelivery
+);
 
 /// Event sender of one open stage exchange, typed by its RPC.
 #[derive(Clone)]

@@ -7416,7 +7416,7 @@ mod tests {
                         Some(http_response_session_event::Event::InputEnd(_)) if reject => {
                             emit_session_result(
                                 &sender,
-                                http_response_session_result::Result::Reject(HttpReject {
+                                http_response_session_result::Result::BlockDelivery(HttpReject {
                                     diagnostics: Some(MiddlewareDiagnostics {
                                         reason_code: "late_match".into(),
                                         ..Default::default()
