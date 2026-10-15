@@ -387,6 +387,64 @@ Secrets and Vault storage backends one at a time:
 mise run e2e:kubernetes:credential-drivers
 ```
 
+### Test plans (`tests/plans/`)
+
+A test plan selects suites and the environments to run them in. The runner
+(`tests/runner`) builds each family's suites for the guest, boots each
+environment in a tmachine VM, runs the suites inside it, and copies the
+results back:
+
+```shell
+nix run .#build-artifacts
+nix run .#test-runner -- test --plan tests/plans/cpu-tests.yaml
+```
+
+```yaml
+matrix:
+  - type: conformance              # family: a workspace under tests/suites/
+    suites: [sandbox-lifecycle]    # omit to run every suite in the family
+    environments: [tmachine.ubuntu2404-arm64.docker-rootful.deb]
+```
+
+Add `--dry-run` to print the resolved jobs and nextest filtersets without
+building or booting anything, `--env` or `--suite` to narrow a plan, and
+`--keep` to leave each VM running after its tests. Results, including JUnit
+reports and gateway logs for failures, go to
+`artifacts/test-results/<plan>/<environment>/<family>/`.
+
+Environments are defined in `tests/environments/*.yaml`. tmachine boots guests
+of the host's architecture only, so the runner reports environments for other
+architectures as unsupported instead of failing.
+
+Conformance suites (`tests/suites/conformance/`) are black-box tests that drive
+the gateway through the Rust SDK. Each suite is one test binary of
+`#[testkit::test]` functions:
+
+```rust
+/// A long-running sandbox becomes ready, runs a command with exec, and is gone
+/// from get and list after delete.
+#[testkit::test]
+async fn long_running_exec_delete(cx: &mut Context) -> testkit::Result {
+    // ...
+}
+```
+
+The function name is the test ID, and the doc comment is its required
+description. Declare capabilities a test needs with
+`#[testkit::test(requires = [service_exposure])]`; the runner excludes the test
+in environments without them and reports it as unsupported. Tests read the
+system under test from the target file named by `OPENSHELL_TEST_TARGET`, so you
+can also run a suite directly against a gateway you already have:
+
+```shell
+OPENSHELL_TEST_TARGET=target.yaml cargo nextest run \
+  --manifest-path tests/suites/conformance/Cargo.toml \
+  -p openshell-conformance-sandbox-lifecycle
+```
+
+`cargo run --manifest-path tests/runner/Cargo.toml --bin openshell-test -- catalog`
+prints every suite and test with its description and requirements.
+
 ### Kubernetes E2E (`e2e/rust/e2e-kubernetes.sh`)
 
 Kubernetes e2e tests deploy an OpenShell gateway into a real Kubernetes cluster

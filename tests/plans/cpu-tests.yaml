@@ -1,0 +1,9 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+matrix:
+  - type: conformance
+    suites: [sandbox-lifecycle]
+    environments:
+      - tmachine.ubuntu2404-amd64.docker-rootful.deb
+      - tmachine.ubuntu2404-arm64.docker-rootful.deb
