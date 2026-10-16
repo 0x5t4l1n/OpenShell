@@ -2121,37 +2121,35 @@ where
     ))
 }
 
-#[tonic::async_trait]
 trait StartupGateway: Send + Sync {
-    async fn snapshot(
+    fn snapshot(
         &self,
         sandbox: &str,
-    ) -> Result<openshell_core::grpc_client::SettingsPollResult>;
-    async fn provider(
+    ) -> impl Future<Output = Result<openshell_core::grpc_client::SettingsPollResult>> + Send;
+    fn provider(
         &self,
         id: &str,
-    ) -> Result<openshell_core::grpc_client::ProviderEnvironmentResult>;
-    async fn sync(
+    ) -> impl Future<Output = Result<openshell_core::grpc_client::ProviderEnvironmentResult>> + Send;
+    fn sync(
         &self,
         sandbox: &str,
         policy: &openshell_core::proto::SandboxPolicy,
         workspace: &str,
-    ) -> Result<openshell_core::grpc_client::SettingsPollResult>;
-    async fn report(
+    ) -> impl Future<Output = Result<openshell_core::grpc_client::SettingsPollResult>> + Send;
+    fn report(
         &self,
         id: &str,
         instance_id: &str,
         snapshot: Option<&openshell_core::grpc_client::SettingsPollResult>,
         state: openshell_core::proto::ConfigurationAdmissionState,
         error: &str,
-    ) -> Result<()>;
+    ) -> impl Future<Output = Result<()>> + Send;
 }
 
 struct RemoteStartupGateway {
     endpoint: String,
 }
 
-#[tonic::async_trait]
 impl StartupGateway for RemoteStartupGateway {
     async fn snapshot(
         &self,
@@ -3536,59 +3534,64 @@ fn initial_provider_credentials(
 /// The channel is FIFO, so a delayed older status can never arrive after a
 /// newer status and move the gateway's active version backward. Delivery uses
 /// the existing bounded retry, but failures never delay policy enforcement.
-#[tonic::async_trait]
 trait PolicyGatewayClient: Clone + Send + Sync + 'static {
     /// Refresh credentials while preserving the activated delivery requirement.
-    async fn fetch_provider_environment(
+    fn fetch_provider_environment(
         &self,
         endpoint: &str,
         sandbox_id: &str,
         requires_stable_placeholders: bool,
-    ) -> Result<openshell_core::grpc_client::ProviderEnvironmentResult> {
-        openshell_core::grpc_client::fetch_provider_environment_with_stable_placeholders(
-            endpoint,
-            sandbox_id,
-            requires_stable_placeholders,
-        )
-        .await
+    ) -> impl Future<Output = Result<openshell_core::grpc_client::ProviderEnvironmentResult>> + Send
+    {
+        async move {
+            openshell_core::grpc_client::fetch_provider_environment_with_stable_placeholders(
+                endpoint,
+                sandbox_id,
+                requires_stable_placeholders,
+            )
+            .await
+        }
     }
 
-    async fn poll_settings(
+    fn poll_settings(
         &self,
         sandbox: &str,
-    ) -> Result<openshell_core::grpc_client::SettingsPollResult>;
+    ) -> impl Future<Output = Result<openshell_core::grpc_client::SettingsPollResult>> + Send;
 
-    async fn report_policy_status(
+    fn report_policy_status(
         &self,
         sandbox_id: &str,
         version: u32,
         loaded: bool,
         error: &str,
-    ) -> Result<()>;
+    ) -> impl Future<Output = Result<()>> + Send;
 
-    async fn report_endpoint_status(
+    fn report_endpoint_status(
         &self,
         _sandbox_id: &str,
         _snapshot: &openshell_core::endpoint_status::EndpointStatusSnapshot,
-    ) -> Result<()> {
-        Ok(())
+    ) -> impl Future<Output = Result<()>> + Send {
+        async move { Ok(()) }
     }
 
-    async fn refresh_installed_extension_credentials(&self) -> Result<()> {
-        Ok(())
+    fn refresh_installed_extension_credentials(&self) -> impl Future<Output = Result<()>> + Send {
+        async move { Ok(()) }
     }
 
-    async fn extension_credentials_for(
+    fn extension_credentials_for(
         &self,
         _services: &[openshell_core::proto::SupervisorMiddlewareService],
-    ) -> Result<std::collections::HashMap<String, openshell_extension_core::BearerTokenSlot>> {
-        Ok(std::collections::HashMap::new())
+    ) -> impl Future<
+        Output = Result<
+            std::collections::HashMap<String, openshell_extension_core::BearerTokenSlot>,
+        >,
+    > + Send {
+        async move { Ok(std::collections::HashMap::new()) }
     }
 
     fn workspace(&self) -> String;
 }
 
-#[tonic::async_trait]
 impl PolicyGatewayClient for openshell_core::grpc_client::CachedOpenShellClient {
     async fn poll_settings(
         &self,
@@ -5782,7 +5785,6 @@ network_policies:
         pending_acceptance: bool,
     }
 
-    #[tonic::async_trait]
     impl StartupGateway for TestStartupGateway {
         async fn snapshot(
             &self,
@@ -6327,7 +6329,6 @@ network_policies:
         calls: UnboundedSender<StartupCall>,
     }
 
-    #[tonic::async_trait]
     impl StartupGateway for WriteRefusingStartupGateway {
         async fn snapshot(
             &self,
@@ -7275,7 +7276,6 @@ network_policies:
         polled_sandboxes: Arc<tokio::sync::Mutex<Vec<String>>>,
     }
 
-    #[tonic::async_trait]
     impl PolicyGatewayClient for ScriptedPolicyGateway {
         async fn poll_settings(
             &self,
@@ -7333,7 +7333,6 @@ network_policies:
         credential_requests: Arc<AtomicUsize>,
     }
 
-    #[tonic::async_trait]
     impl PolicyGatewayClient for CredentialRejectingPolicyGateway {
         async fn poll_settings(
             &self,
@@ -7569,7 +7568,6 @@ network_policies:
         requests: UnboundedSender<ProviderFetchRequest>,
     }
 
-    #[tonic::async_trait]
     impl PolicyGatewayClient for ScriptedProviderGateway {
         async fn poll_settings(
             &self,
@@ -7715,7 +7713,6 @@ network_policies:
         first_poll: Arc<AtomicBool>,
     }
 
-    #[tonic::async_trait]
     impl PolicyGatewayClient for GenerationChangingPolicyGateway {
         async fn poll_settings(
             &self,
