@@ -35,7 +35,7 @@ For response failures, distinguish a deliberate `middleware_denied` decision fro
 The HTTP session hooks (`EvaluateHttpRequestSession` and `EvaluateHttpResponseSession`) always fail closed, and `on_error` does not apply. Map sandbox OCSF failure reasons as follows:
 
 - `middleware_hook_versions_mixed`: one request or response chain selected both v1 HTTP hook and HTTP session hook entries. The gateway rejects such policies, so look for a policy stored before a service changed hook version, and separate the selectors.
-- `middleware_cannot_inspect`: the service returned `cannot_inspect`, usually because no body mode was offered (encoded request or response, or a partial, no-transform, or oversized response). A gRPC status that ends the stream is `middleware_unavailable` instead.
+- `middleware_cannot_inspect`: OpenShell could not provide the message head to the stage, for example because it exceeded capacity. A service that cannot inspect a message, usually because no body mode was offered (encoded request or response, or a partial, no-transform, or oversized response), denies it with its own `reason_code` instead. A gRPC status that ends the stream is `middleware_unavailable`.
 - `middleware_unimplemented`: the service declared HTTP session hook bindings but does not implement the matching `EvaluateHttpRequestSession` or `EvaluateHttpResponseSession` RPC.
 - `middleware_body_timeout` or `middleware_stall_timeout`: a BUFFERED stage exceeded the 2-minute whole-body deadline, or a STREAM stage stalled for 30 seconds.
 - `408 Request Timeout` with `error: request_timeout`: the sandbox stopped sending a request body for 30 seconds while a STREAM stage held it. This is a client problem, not a middleware failure.

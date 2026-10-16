@@ -34,13 +34,13 @@ use tokio::time::Instant;
 
 use openshell_core::proto::{
     Decision, HeaderMutation, HttpBegin, HttpBodyLimits, HttpBodyMode, HttpBodyModeUnavailable,
-    HttpBodyUnavailableReason, HttpBufferedBody, HttpBufferedResult, HttpCannotInspect, HttpFinish,
-    HttpHeader, HttpInputChunk, HttpInputEnd, HttpOutputChunk, HttpOutputStart,
-    HttpPreflightResult, HttpReject, HttpRequestSessionEvent, HttpRequestSessionPreflight,
-    HttpResponsePreflightHead, HttpResponseSessionEvent, HttpResponseSessionPreflight,
-    MiddlewareDiagnostics, MiddlewareSessionEnd, MiddlewareSessionEndReason, RequestContext,
-    SupervisorMiddlewarePhase, http_buffered_result, http_inspect, http_preflight_result,
-    http_request_session_event, http_request_session_preflight, http_response_session_event,
+    HttpBodyUnavailableReason, HttpBufferedBody, HttpBufferedResult, HttpFinish, HttpHeader,
+    HttpInputChunk, HttpInputEnd, HttpOutputChunk, HttpOutputStart, HttpPreflightResult,
+    HttpReject, HttpRequestSessionEvent, HttpRequestSessionPreflight, HttpResponsePreflightHead,
+    HttpResponseSessionEvent, HttpResponseSessionPreflight, MiddlewareDiagnostics,
+    MiddlewareSessionEnd, MiddlewareSessionEndReason, RequestContext, SupervisorMiddlewarePhase,
+    http_buffered_result, http_inspect, http_preflight_result, http_request_session_event,
+    http_request_session_preflight, http_response_session_event,
 };
 
 use crate::headers::{self, HeaderAuthority};
@@ -67,7 +67,8 @@ pub const HTTP_BUFFERED_BODY_TIMEOUT: Duration = Duration::from_mins(2);
 /// Messages each link and stage queue holds.
 pub const STAGE_QUEUE_MESSAGES: usize = 4;
 const SESSION_END_TIMEOUT: Duration = Duration::from_millis(10);
-/// Failure reason for an HTTP session hook stage that returns `cannot_inspect`.
+/// Failure reason when a message cannot be shown to an HTTP session hook
+/// stage, such as a head over capacity.
 pub const MIDDLEWARE_CANNOT_INSPECT: &str = "middleware_cannot_inspect";
 /// Failure reason for a chain that selects v1 and HTTP session hook stages for the
 /// same HTTP message.
@@ -81,8 +82,7 @@ pub const MIDDLEWARE_HOOK_VERSIONS_MIXED: &str = "middleware_hook_versions_mixed
 /// is safe to return to the sandbox and to record.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HttpFailureCode {
-    /// The stage returned `cannot_inspect`, or the message head cannot be
-    /// shown to middleware.
+    /// The message head cannot be shown to middleware.
     CannotInspect,
     /// A stage missed its binding timeout, the chain deadline, or the
     /// BUFFERED whole-body deadline.
@@ -461,7 +461,6 @@ pub(super) enum StageResult {
     OutputChunk(HttpOutputChunk),
     Finish(HttpFinish),
     Reject(HttpReject),
-    CannotInspect(HttpCannotInspect),
 }
 
 /// Results of one stage exchange. `None` is an unset or unknown result.
@@ -494,7 +493,6 @@ macro_rules! session_messages {
                     Wire::OutputChunk(chunk) => Self::OutputChunk(chunk),
                     Wire::Finish(finish) => Self::Finish(finish),
                     Wire::$denial(reject) => Self::Reject(reject),
-                    Wire::CannotInspect(result) => Self::CannotInspect(result),
                 }
             }
         }
@@ -1692,9 +1690,6 @@ fn closed_stream_failure(entry: &DescribedChainEntry, next: FirstResult) -> Http
         Some(Ok(Some(StageResult::Reject(reject)))) => {
             rejection(entry, reject.diagnostics.as_ref())
         }
-        Some(Ok(Some(StageResult::CannotInspect(result)))) => {
-            cannot_inspect(entry, result.diagnostics.as_ref())
-        }
         Some(Err(status)) => status_failure(entry, &status),
         _ => entry_failure(entry, "middleware_stream_closed"),
     }
@@ -2099,16 +2094,12 @@ async fn drive_stream(
     Ok(done)
 }
 
-/// Unwrap one stage result. An unset or unknown result fails the exchange,
-/// and so does `cannot_inspect`, wherever the stage returns it.
+/// Unwrap one stage result. An unset or unknown result fails the exchange.
 pub(super) fn classify_result(
     entry: &DescribedChainEntry,
     next: FirstResult,
 ) -> Result<StageResult, HttpMiddlewareFailure> {
     match next {
-        Some(Ok(Some(StageResult::CannotInspect(result)))) => {
-            Err(cannot_inspect(entry, result.diagnostics.as_ref()))
-        }
         Some(Ok(Some(result))) => Ok(result),
         Some(Ok(None)) => Err(entry_failure(entry, "result_unknown")),
         Some(Err(status)) => Err(status_failure(entry, &status)),
@@ -2307,26 +2298,6 @@ pub(super) fn rejection(
         end_reason: MiddlewareSessionEndReason::MiddlewareDenial,
         diagnostics: Box::new(retained),
     }
-}
-
-/// The stage cannot inspect the message, and the exchange fails closed. Its
-/// diagnostics are recorded like a rejection's, but the sandbox sees only
-/// `middleware_cannot_inspect`.
-fn cannot_inspect(
-    entry: &DescribedChainEntry,
-    diagnostics: Option<&MiddlewareDiagnostics>,
-) -> HttpMiddlewareFailure {
-    let diagnostics = match validate_diagnostics(entry, diagnostics) {
-        Ok(diagnostics) => diagnostics,
-        Err(failure) => return failure,
-    };
-    let mut failure = entry_failure(entry, MIDDLEWARE_CANNOT_INSPECT);
-    let reason_code = nonempty(&diagnostics.reason_code);
-    for invocation in &mut failure.diagnostics.invocations {
-        invocation.reason_code.clone_from(&reason_code);
-    }
-    collect_diagnostics(entry, diagnostics, &mut failure.diagnostics);
-    failure
 }
 
 /// The stage failed and the exchange fails closed.

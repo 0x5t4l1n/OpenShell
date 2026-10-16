@@ -11,8 +11,8 @@ use openshell_core::extension_protocol::{
 };
 use openshell_core::proto::{
     ExistingHeaderAction, HeaderMutation, HttpBodyMode, HttpBufferedMode, HttpBufferedResult,
-    HttpCannotInspect, HttpContinue, HttpFinish, HttpHeader, HttpInspect, HttpOutputChunk,
-    HttpOutputStart, HttpPreflightResult, HttpReject, HttpRequestResult, HttpRequestSessionEvent,
+    HttpContinue, HttpFinish, HttpHeader, HttpInspect, HttpOutputChunk, HttpOutputStart,
+    HttpPreflightResult, HttpReject, HttpRequestResult, HttpRequestSessionEvent,
     HttpRequestSessionPreflight, HttpRequestSessionResult, HttpRequestTarget, HttpStreamMode,
     MiddlewareBinding, MiddlewareDiagnostics, MiddlewareManifest, RequestContext,
     SupervisorMiddlewareOperation, SupervisorMiddlewarePhase, WriteHeader, header_mutation,
@@ -143,7 +143,6 @@ enum Preflight {
     Continue,
     Inspect(HttpBodyMode),
     Reject(&'static str),
-    CannotInspect,
     Fail(tonic::Code),
 }
 
@@ -153,8 +152,6 @@ enum Body {
     Unchanged,
     Replace(&'static [u8]),
     Uppercase,
-    /// `cannot_inspect` once the body arrives.
-    CannotInspect,
 }
 
 /// In-memory HTTP session hook stage with a fixed script.
@@ -304,22 +301,6 @@ impl InProcessMiddleware for ScriptedStage {
                                     }),
                                 }))
                             }
-                            Preflight::CannotInspect => {
-                                result(http_request_session_result::Result::CannotInspect(
-                                    HttpCannotInspect {
-                                        diagnostics: Some(MiddlewareDiagnostics {
-                                            reason: "unknown archive format".into(),
-                                            reason_code: "format_unknown".into(),
-                                            findings: vec![openshell_core::proto::Finding {
-                                                r#type: "example.format".into(),
-                                                count: 1,
-                                                ..Default::default()
-                                            }],
-                                            ..Default::default()
-                                        }),
-                                    },
-                                ))
-                            }
                             Preflight::Fail(code) => Err(tonic::Status::new(*code, "scripted")),
                         }
                     }
@@ -336,13 +317,6 @@ impl InProcessMiddleware for ScriptedStage {
                             continue;
                         }
                     }
-                    Some(http_request_session_event::Event::BufferedBody(_))
-                        if matches!(body, Body::CannotInspect) =>
-                    {
-                        result(http_request_session_result::Result::CannotInspect(
-                            HttpCannotInspect::default(),
-                        ))
-                    }
                     Some(http_request_session_event::Event::BufferedBody(buffered)) => result(
                         http_request_session_result::Result::BufferedResult(HttpBufferedResult {
                             body: Some(match body {
@@ -352,11 +326,9 @@ impl InProcessMiddleware for ScriptedStage {
                                 Body::Uppercase => http_buffered_result::Body::Replacement(
                                     buffered.data.to_ascii_uppercase(),
                                 ),
-                                Body::Unchanged | Body::CannotInspect => {
-                                    http_buffered_result::Body::Unchanged(
-                                        openshell_core::proto::HttpUnchanged {},
-                                    )
-                                }
+                                Body::Unchanged => http_buffered_result::Body::Unchanged(
+                                    openshell_core::proto::HttpUnchanged {},
+                                ),
                             }),
                             header_mutations: late_mutations.clone(),
                             ..Default::default()
@@ -630,34 +602,6 @@ async fn request_stages_follow_the_protocol_2_state_machine() {
                 late_mutations: Vec::new(),
                 body: b"hello world".to_vec(),
                 outcomes: vec![Outcome::FailClosed],
-            },
-        },
-        Case {
-            name: "cannot_inspect fails the chain closed",
-            stages: vec![stage("example/a", Preflight::CannotInspect, Body::Unchanged)],
-            expected: Run {
-                allowed: false,
-                reason: "middleware_failed: middleware_cannot_inspect".into(),
-                preflight_mutations: Vec::new(),
-                late_mutations: Vec::new(),
-                body: b"hello world".to_vec(),
-                outcomes: vec![Outcome::FailClosed],
-            },
-        },
-        Case {
-            name: "cannot_inspect after the body arrives fails the chain closed",
-            stages: vec![stage(
-                "example/a",
-                Preflight::Inspect(HttpBodyMode::Buffered),
-                Body::CannotInspect,
-            )],
-            expected: Run {
-                allowed: false,
-                reason: "middleware_failed: middleware_cannot_inspect".into(),
-                preflight_mutations: Vec::new(),
-                late_mutations: Vec::new(),
-                body: Vec::new(),
-                outcomes: vec![Outcome::Buffered, Outcome::FailClosed],
             },
         },
     ];
@@ -1006,13 +950,8 @@ async fn waiting_for_a_stream_slot_does_not_hold_a_preflight_slot() {
 #[tokio::test]
 async fn failures_name_the_failed_stage_and_a_platform_code() {
     for (case, preflight, code) in [
-        (
-            "cannot_inspect result",
-            Preflight::CannotInspect,
-            HttpFailureCode::CannotInspect,
-        ),
-        // Only the result says the stage cannot inspect a message: a proxy
-        // between OpenShell and the service may rewrite status codes.
+        // No status means "cannot inspect": a proxy between OpenShell and the
+        // service may rewrite status codes.
         (
             "FAILED_PRECONDITION",
             Preflight::Fail(tonic::Code::FailedPrecondition),
@@ -1070,47 +1009,6 @@ async fn failures_name_the_failed_stage_and_a_platform_code() {
         .expect("preflight");
     assert!(rejected.denial.is_some());
     assert!(rejected.failure.is_none());
-}
-
-#[tokio::test]
-async fn cannot_inspect_diagnostics_are_recorded_but_not_returned() {
-    let (runner, described) = scripted_chain(vec![scripted(
-        "example/a",
-        Preflight::CannotInspect,
-        Body::Unchanged,
-    )])
-    .await;
-    let failed = runner
-        .preflight_described_http_request(described, request_input(b"hello"))
-        .await
-        .expect("preflight");
-    assert!(!failed.allowed);
-    assert!(failed.denial.is_none());
-    assert_eq!(
-        failed.failure,
-        Some(MiddlewareFailureDetail {
-            config_name: Some("example/a-config".into()),
-            code: HttpFailureCode::CannotInspect,
-        })
-    );
-    assert_eq!(
-        failed.reason,
-        "middleware_failed: middleware_cannot_inspect"
-    );
-    let findings: Vec<_> = failed
-        .diagnostics
-        .findings
-        .iter()
-        .map(|finding| finding.finding.r#type.as_str())
-        .collect();
-    assert_eq!(findings, ["example.format"]);
-    let invocation = &failed.diagnostics.invocations[0];
-    assert!(invocation.failed);
-    assert_eq!(invocation.reason_code.as_deref(), Some("format_unknown"));
-    assert_eq!(
-        invocation.failure_reason.as_deref(),
-        Some("middleware_cannot_inspect")
-    );
 }
 
 #[tokio::test]

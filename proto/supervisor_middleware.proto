@@ -170,16 +170,14 @@ message HttpResponseSessionEvent {
 }
 
 // HTTP session hooks. One ordered result in an EvaluateHttpRequestSession
-// stream. Preflight requires preflight_result, reject, or cannot_inspect.
-// BUFFERED ends with buffered_result, reject, or cannot_inspect. STREAM sends
-// output_start before any output_chunk, even for an empty output, and ends
-// with finish, reject, or cannot_inspect. An unset or unknown result fails the
-// exchange closed.
+// stream. Preflight requires preflight_result or reject. BUFFERED ends with
+// buffered_result or reject. STREAM sends output_start before any
+// output_chunk, even for an empty output, and ends with finish or reject. An
+// unset or unknown result fails the exchange closed.
 //
 // A service may close its result stream right after the result that ends its
-// part in the exchange (continue_without_body, buffered_result, finish,
-// reject, or cannot_inspect), or keep it open until session_end. OpenShell
-// accepts both.
+// part in the exchange (continue_without_body, buffered_result, finish, or
+// reject), or keep it open until session_end. OpenShell accepts both.
 message HttpRequestSessionResult {
   oneof result {
     HttpPreflightResult preflight_result = 1;
@@ -188,7 +186,6 @@ message HttpRequestSessionResult {
     HttpOutputChunk output_chunk = 4;
     HttpFinish finish = 5;
     HttpReject reject = 6;
-    HttpCannotInspect cannot_inspect = 7;
   }
 }
 
@@ -204,7 +201,6 @@ message HttpResponseSessionResult {
     HttpOutputChunk output_chunk = 4;
     HttpFinish finish = 5;
     HttpReject block_delivery = 6;
-    HttpCannotInspect cannot_inspect = 7;
   }
 }
 
@@ -269,9 +265,8 @@ enum UninspectableTrafficReason {
 }
 
 // A connection that selects the stage but that OpenShell cannot show to it as
-// HTTP messages. Such a preflight never permits a body mode: the stage
-// continues without a body, which allows the connection, rejects it, or
-// returns cannot_inspect, which refuses it as a failure.
+// HTTP messages. Such a preflight never permits a body mode: the stage either
+// continues without a body, which allows the connection, or rejects it.
 message UninspectableTraffic {
   // Destination host selected by network policy.
   string host = 1;
@@ -301,8 +296,8 @@ message HttpRequestSessionPreflight {
   // Validated service configuration. Limited to 64 KiB encoded.
   google.protobuf.Struct config = 6;
   // Body modes this request is eligible for. Empty permits only
-  // continue_without_body, reject, or cannot_inspect. When no permitted mode
-  // suits the stage, it continues, rejects, or returns cannot_inspect.
+  // continue_without_body or reject. When no permitted mode suits the stage,
+  // it continues or rejects, with a reason_code saying why.
   repeated HttpBodyMode permitted_body_modes = 7;
   // One entry for each body mode that permitted_body_modes omits, with the
   // rule that removed it. Empty when the binding's max_payload_bytes is 0,
@@ -330,9 +325,8 @@ message HttpResponseSessionPreflight {
   // Validated service configuration. Limited to 64 KiB encoded.
   google.protobuf.Struct config = 5;
   // Body modes this response is eligible for. Empty permits only
-  // continue_without_body, block_delivery, or cannot_inspect. When no
-  // permitted mode suits the stage, it continues, blocks delivery, or returns
-  // cannot_inspect.
+  // continue_without_body or block_delivery. When no permitted mode suits the
+  // stage, it continues or blocks delivery, with a reason_code saying why.
   repeated HttpBodyMode permitted_body_modes = 6;
   // One entry for each body mode that permitted_body_modes omits, with the
   // rule that removed it. A stage can tell a bodyless response, which it may
@@ -386,8 +380,7 @@ message HttpBodyLimits {
 }
 
 // Preflight decision. To deny, return reject (requests) or block_delivery
-// (responses) instead; to fail closed because the stage cannot inspect the
-// message, return cannot_inspect.
+// (responses) instead, including when the stage cannot inspect the message.
 message HttpPreflightResult {
   oneof decision {
     // Let the message continue without this stage seeing its body. For
@@ -502,20 +495,10 @@ message HttpFinish {
 // 403 middleware denial with the validated reason_code. A message already
 // partly delivered stays incomplete: OpenShell withholds its terminating chunk
 // or final byte, trailers, and any error body, and closes that connection.
-// For uninspectable traffic, OpenShell refuses the connection.
+// For uninspectable traffic, OpenShell refuses the connection. A stage that
+// cannot inspect a message, such as a body in a format it does not
+// understand, denies it with a reason_code that says so.
 message HttpReject {
-  MiddlewareDiagnostics diagnostics = 1;
-}
-
-// Terminal failure: the stage cannot inspect this message, such as a body in
-// a format it does not understand. Valid wherever reject or block_delivery
-// is. Either denial blocks the content; cannot_inspect is a stage failure,
-// so OpenShell fails the exchange closed and returns the platform-owned
-// failure_code middleware_cannot_inspect
-// to the sandbox. For uninspectable traffic, OpenShell refuses the connection.
-message HttpCannotInspect {
-  // Recorded for operators only. The reason and reason_code are never
-  // returned to the sandbox, which sees only middleware_cannot_inspect.
   MiddlewareDiagnostics diagnostics = 1;
 }
 

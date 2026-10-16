@@ -8,9 +8,8 @@
 //! The guard selects its configured body mode, BUFFERED by default, and falls
 //! back to the other mode when OpenShell offers only that one. A message
 //! without a body continues. A message the guard cannot inspect, such as an
-//! encoded body, gets `cannot_inspect`, which OpenShell reports to the sandbox
-//! as `middleware_cannot_inspect` and fails closed. Uninspectable connections
-//! are rejected unless the config sets `uninspectable: allow`.
+//! encoded body, is rejected with reason code `cannot_inspect`. Uninspectable
+//! connections are rejected unless the config sets `uninspectable: allow`.
 //!
 //! OpenShell leaves integrity headers such as `ETag` and `Content-Digest`
 //! alone. When the guard may change a body, it removes them itself.
@@ -21,13 +20,13 @@ use openshell_core::middleware::{HttpRequestSessionResultStream, HttpResponseSes
 use openshell_core::proto::{
     HeaderMutation, HttpBodyLimits, HttpBodyMode, HttpBodyModeUnavailable,
     HttpBodyUnavailableReason, HttpBufferedBody, HttpBufferedMode, HttpBufferedResult,
-    HttpCannotInspect, HttpContinue, HttpFinish, HttpInputChunk, HttpInspect, HttpOutputChunk,
-    HttpOutputStart, HttpPreflightResult, HttpReject, HttpRequestPreflightHead,
-    HttpRequestSessionEvent, HttpRequestSessionResult, HttpResponseSessionEvent,
-    HttpResponseSessionResult, HttpStreamMode, HttpUnchanged, MiddlewareDiagnostics, RemoveHeader,
-    header_mutation, http_buffered_result, http_inspect, http_preflight_result,
-    http_request_session_event, http_request_session_preflight, http_request_session_result,
-    http_response_session_event, http_response_session_result,
+    HttpContinue, HttpFinish, HttpInputChunk, HttpInspect, HttpOutputChunk, HttpOutputStart,
+    HttpPreflightResult, HttpReject, HttpRequestPreflightHead, HttpRequestSessionEvent,
+    HttpRequestSessionResult, HttpResponseSessionEvent, HttpResponseSessionResult, HttpStreamMode,
+    HttpUnchanged, MiddlewareDiagnostics, RemoveHeader, header_mutation, http_buffered_result,
+    http_inspect, http_preflight_result, http_request_session_event,
+    http_request_session_preflight, http_request_session_result, http_response_session_event,
+    http_response_session_result,
 };
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
@@ -188,7 +187,6 @@ enum Reply {
     OutputChunk(HttpOutputChunk),
     Finish(HttpFinish),
     Reject(HttpReject),
-    CannotInspect,
 }
 
 impl From<Reply> for http_request_session_result::Result {
@@ -200,7 +198,6 @@ impl From<Reply> for http_request_session_result::Result {
             Reply::OutputChunk(chunk) => Self::OutputChunk(chunk),
             Reply::Finish(finish) => Self::Finish(finish),
             Reply::Reject(reject) => Self::Reject(reject),
-            Reply::CannotInspect => Self::CannotInspect(HttpCannotInspect::default()),
         }
     }
 }
@@ -214,7 +211,6 @@ impl From<Reply> for http_response_session_result::Result {
             Reply::OutputChunk(chunk) => Self::OutputChunk(chunk),
             Reply::Finish(finish) => Self::Finish(finish),
             Reply::Reject(reject) => Self::BlockDelivery(reject),
-            Reply::CannotInspect => Self::CannotInspect(HttpCannotInspect::default()),
         }
     }
 }
@@ -243,7 +239,6 @@ impl Stage {
                     Decision::Reject(diagnostics) => Ok(vec![Reply::Reject(HttpReject {
                         diagnostics: Some(diagnostics),
                     })]),
-                    Decision::CannotInspect => Ok(vec![Reply::CannotInspect]),
                     Decision::Inspect(config, selected) => {
                         let mode = match selected {
                             Selected::Buffered(max_body_bytes) => {
@@ -326,7 +321,6 @@ enum Selected {
 enum Decision {
     Continue,
     Reject(MiddlewareDiagnostics),
-    CannotInspect,
     Inspect(GuardConfig, Selected),
 }
 
@@ -396,7 +390,11 @@ fn preflight_decision(preflight: Preflight) -> Result<Decision, Status> {
         // A message without a body has nothing to guard. The guard never
         // passes a body it could not inspect.
         None if bodyless(&preflight) => Ok(Decision::Continue),
-        None => Ok(Decision::CannotInspect),
+        None => Ok(Decision::Reject(MiddlewareDiagnostics {
+            reason: "content guard cannot inspect this body".into(),
+            reason_code: "cannot_inspect".into(),
+            ..Default::default()
+        })),
     }
 }
 
@@ -709,7 +707,7 @@ mod tests {
     }
 
     #[test]
-    fn preflight_cannot_inspect_a_body_it_is_not_offered() {
+    fn preflight_rejects_a_body_it_is_not_offered() {
         // OpenShell offers no body mode for an encoded request or response.
         for subject in [request, || Subject::Response] {
             let mut encoded = preflight(subject(), "redact", &[], &[]);
@@ -723,10 +721,10 @@ mod tests {
                     reason: HttpBodyUnavailableReason::Encoded as i32,
                 })
                 .collect();
-            assert!(matches!(
-                only(Stage::Preflight.handle(encoded).unwrap()),
-                Reply::CannotInspect
-            ));
+            let Reply::Reject(reject) = only(Stage::Preflight.handle(encoded).unwrap()) else {
+                panic!("reject")
+            };
+            assert_eq!(reject.diagnostics.unwrap().reason_code, "cannot_inspect");
         }
     }
 
