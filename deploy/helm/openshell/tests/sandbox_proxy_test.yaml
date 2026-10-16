@@ -55,3 +55,38 @@ tests:
             items:
               - key: ca.crt
                 path: ca.crt
+
+  - it: mounts only the client certificate pair for mTLS discovery
+    set:
+      sandboxProxy.enabled: true
+      sandboxProxy.gatewayEndpoint: https://gateway.example.com
+      sandboxProxy.discoveryClientTlsSecret: proxy-client-tls
+      sandboxProxy.gatewayCaSecret: gateway-ca
+    documentIndex: 0
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].args
+          content: --discovery-client-cert=/discovery/tls.crt
+      - contains:
+          path: spec.template.spec.containers[0].args
+          content: --discovery-client-key=/discovery/tls.key
+      - notContains:
+          path: spec.template.spec.containers[0].args
+          content: --discovery-token-file=/discovery/token
+      - equal:
+          path: spec.template.spec.volumes[0].secret
+          value:
+            secretName: proxy-client-tls
+            items:
+              - key: tls.crt
+                path: tls.crt
+              - key: tls.key
+                path: tls.key
+  - it: rejects ambiguous bearer and certificate identities
+    set:
+      sandboxProxy.enabled: true
+      sandboxProxy.discoveryTokenSecret: token
+      sandboxProxy.discoveryClientTlsSecret: client-tls
+    asserts:
+      - failedTemplate:
+          errorMessage: sandboxProxy discoveryTokenSecret and discoveryClientTlsSecret are mutually exclusive

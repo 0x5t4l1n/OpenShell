@@ -482,6 +482,24 @@ discovery endpoint or its TLS CA.
 | sandbox.image.pullPolicy | string | `nil` | Sandbox image pull policy. Leave unset to use the Kubernetes image default. |
 | sandbox.image.repository | string | `"nvcr.io/nvidia/base/ubuntu"` | Default standalone sandbox image repository. |
 | sandbox.image.tag | string | `"24.04"` | Sandbox image tag. Defaults to latest when empty. |
+| sandboxProxy.allowPlaintextDevelopment | bool | `false` |  |
+| sandboxProxy.discoveryClientTlsSecret | string | `""` | Dedicated client identity Secret (tls.crt/tls.key), exclusive with discoveryTokenSecret. |
+| sandboxProxy.discoveryTokenSecret | string | `""` |  |
+| sandboxProxy.enabled | bool | `false` |  |
+| sandboxProxy.gatewayCaSecret | string | `""` |  |
+| sandboxProxy.gatewayEndpoint | string | `""` |  |
+| sandboxProxy.image.pullPolicy | string | `"IfNotPresent"` |  |
+| sandboxProxy.image.repository | string | `"openshell/sandbox-proxy"` |  |
+| sandboxProxy.image.tag | string | `""` |  |
+| sandboxProxy.listenerPort | int | `8443` |  |
+| sandboxProxy.maxConnections | int | `256` |  |
+| sandboxProxy.replicas | int | `1` |  |
+| sandboxProxy.resources.limits.cpu | string | `"1"` |  |
+| sandboxProxy.resources.limits.memory | string | `"128Mi"` |  |
+| sandboxProxy.resources.requests.cpu | string | `"100m"` |  |
+| sandboxProxy.resources.requests.memory | string | `"64Mi"` |  |
+| sandboxProxy.supervisorAppPort | int | `8443` |  |
+| sandboxProxy.workspaces[0] | string | `"default"` |  |
 | sandboxRuntime.image.digest | string | `""` | Sandbox runtime image digest. When set, this takes precedence over tag. |
 | sandboxRuntime.image.pullPolicy | string | `nil` | Sandbox runtime image pull policy. Empty uses global.image.pullPolicy. |
 | sandboxRuntime.image.registry | string | `""` | Sandbox runtime image registry. Empty uses global.image.registry. |
@@ -569,8 +587,9 @@ discovery endpoint or its TLS CA.
 | server.telemetryEnabled | bool | `true` | Enable anonymous OpenShell telemetry from the gateway and the sandbox supervisors it launches. |
 | server.tls.certSecretName | string | `"openshell-server-tls"` | K8s secret (type kubernetes.io/tls) with tls.crt and tls.key for the server. |
 | server.tls.clientCaSecretName | string | `"openshell-server-client-ca"` | K8s secret with ca.crt for client certificate verification (mTLS). Only used when enableMtls is true. Set to "" to disable client certificate verification for HTTPS-only mode. |
-| server.tls.clientTlsSecretName | string | `"openshell-client-tls"` | K8s secret mounted into sandbox pods for mTLS to the server. |
-| server.tls.enableMtls | bool | `true` | Enable mTLS client certificate authentication. When false, the gateway runs HTTPS-only without requiring client certificates (use OIDC for auth instead). Must be false when using BackendTLSPolicy because ingress proxies cannot present client certificates to the backend. |
+| server.tls.clientTlsSecretName | string | `"openshell-client-tls"` | TLS Secret providing the gateway CA to supervisors and the default peer client identity. Supervisors receive only ca.crt. |
+| server.tls.enableMtls | bool | `true` | Verify presented client certificates against the client CA. Bearer-only connections remain allowed; authentication follows the gateway mTLS/OIDC policy. Can be combined with BackendTLSPolicy. |
+| server.tls.peerClientTlsSecretName | string | `""` | Optional separate peer client identity; defaults to clientTlsSecretName. |
 | server.workspaceDefaultStorageSize | string | `""` | Default storage size for the workspace PVC in sandbox pods. Uses Kubernetes quantity syntax (e.g. "2Gi", "10Gi", "500Mi"). Empty = built-in default (2Gi). |
 | server.workspaceStorageClass | string | `""` | Kubernetes StorageClass for the workspace PVC in sandbox pods. Empty (default) = omit storageClassName, using the cluster's default StorageClass. Set this on clusters with no default StorageClass, otherwise the workspace PVC stays Pending and the sandbox never starts. |
 | service.healthPort | int | `8081` | Gateway health service port. |

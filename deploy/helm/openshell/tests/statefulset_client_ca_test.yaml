@@ -128,3 +128,23 @@ tests:
             name: tls-client-ca
             mountPath: /etc/openshell-tls/client-ca
             readOnly: true
+
+  - it: honors a custom client CA and separate peer identity with built-in PKI
+    template: templates/statefulset.yaml
+    set:
+      pkiInitJob.enabled: true
+      server.tls.clientCaSecretName: discovery-client-ca
+      server.tls.peerClientTlsSecretName: discovery-peer-tls
+    asserts:
+      - contains:
+          path: spec.template.spec.volumes
+          content:
+            name: tls-client-ca
+            secret:
+              secretName: discovery-client-ca
+      - contains:
+          path: spec.template.spec.volumes
+          content:
+            name: peer-client-tls
+            secret:
+              secretName: discovery-peer-tls

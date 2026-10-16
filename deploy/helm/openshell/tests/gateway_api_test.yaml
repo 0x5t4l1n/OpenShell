@@ -5,6 +5,7 @@ suite: Gateway API resources
 templates:
   - templates/gateway.yaml
   - templates/grpcroute.yaml
+  - templates/backend-tls-policy.yaml
 release:
   name: openshell
   namespace: openshell
@@ -114,3 +115,17 @@ tests:
     asserts:
       - hasDocuments:
           count: 0
+
+  - it: allows backend TLS alongside optional client certificates and OIDC
+    template: templates/backend-tls-policy.yaml
+    set:
+      server.disableTls: false
+      server.tls.enableMtls: true
+      server.oidc.issuer: https://issuer.example.com
+      grpcRoute.backendTLSPolicy.enabled: true
+    asserts:
+      - isKind:
+          of: BackendTLSPolicy
+      - equal:
+          path: spec.validation.hostname
+          value: openshell.openshell.svc.cluster.local

@@ -2,6 +2,12 @@
 # SPDX-License-Identifier: Apache-2.0
 {{- if .Values.sandboxProxy.enabled }}
 {{- $proxy := .Values.sandboxProxy }}
+{{- if and $proxy.discoveryTokenSecret $proxy.discoveryClientTlsSecret }}
+{{- fail "sandboxProxy discoveryTokenSecret and discoveryClientTlsSecret are mutually exclusive" }}
+{{- end }}
+{{- if and $proxy.allowPlaintextDevelopment (or $proxy.discoveryTokenSecret $proxy.discoveryClientTlsSecret) }}
+{{- fail "plaintext development cannot use discovery credentials" }}
+{{- end }}
 {{- $name := printf "%s-sandbox-proxy" (include "openshell.fullname" .) }}
 apiVersion: apps/v1
 kind: Deployment
@@ -39,6 +45,9 @@ spec:
             {{- end }}
             {{- if $proxy.allowPlaintextDevelopment }}
             - --allow-plaintext-development
+            {{- else if $proxy.discoveryClientTlsSecret }}
+            - --discovery-client-cert=/discovery/tls.crt
+            - --discovery-client-key=/discovery/tls.key
             {{- else }}
             - --discovery-token-file=/discovery/token
             {{- end }}
@@ -76,10 +85,19 @@ spec:
         {{- if not $proxy.allowPlaintextDevelopment }}
         - name: discovery
           secret:
-            secretName: {{ required "sandboxProxy.discoveryTokenSecret is required" $proxy.discoveryTokenSecret }}
+            {{- if $proxy.discoveryClientTlsSecret }}
+            secretName: {{ $proxy.discoveryClientTlsSecret | quote }}
+            items:
+              - key: tls.crt
+                path: tls.crt
+              - key: tls.key
+                path: tls.key
+            {{- else }}
+            secretName: {{ required "sandboxProxy.discoveryTokenSecret or discoveryClientTlsSecret is required" $proxy.discoveryTokenSecret }}
             items:
               - key: token
                 path: token
+            {{- end }}
         {{- end }}
         {{- if $proxy.gatewayCaSecret }}
         - name: gateway-ca

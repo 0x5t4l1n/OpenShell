@@ -310,6 +310,18 @@ namespace = "openshell"
 
 Set `[openshell.gateway.mtls_auth] enabled = true` to map a verified client certificate to a CLI user identity. This gateway policy is independent of the compute driver and defaults on when a client CA is configured without OIDC. The listener allows bearer-only clients and validates any client certificate presented against the configured CA. Supervisors use `guest_tls_ca` to authenticate the gateway and sandbox bearer tokens to authenticate their RPCs.
 
+For certificate-authenticated sandbox proxy discovery, set
+`sandboxProxy.discoveryClientTlsSecret` to a Secret containing `tls.crt` and
+`tls.key`, and leave `discoveryTokenSecret` empty. The proxy reloads the files
+on each watch reconnect, allowing certificate renewal without a restart.
+Configure `server.tls.enableMtls` and `server.tls.clientCaSecretName` for the
+trusted client CA. An explicit CA Secret takes precedence over the generated
+PKI CA. If gateway peers use a different client identity, set
+`server.tls.peerClientTlsSecretName`; `clientTlsSecretName` continues to provide
+the gateway server CA to supervisors. Use a peer certificate without the
+operator organizational unit. Public OIDC clients can continue using bearer
+authentication without presenting a certificate.
+
 Set `[openshell.gateway.mtls_auth] operator_enabled = true`,
 `--enable-operator-auth true`, or `OPENSHELL_ENABLE_OPERATOR_AUTH=true` to enable
 direct mTLS operators. The default is false. TLS and a client CA are required.

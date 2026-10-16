@@ -264,10 +264,10 @@ spec:
     {{- if eq (include "openshell.gatewayClientCaEnabled" .) "true" }}
     - name: peer-client-tls
       secret:
-        secretName: {{ .Values.server.tls.clientTlsSecretName }}
+        secretName: {{ .Values.server.tls.peerClientTlsSecretName | default .Values.server.tls.clientTlsSecretName }}
     - name: tls-client-ca
       secret:
-        {{- if or (and .Values.pkiInitJob.enabled (not .Values.certManager.enabled)) (and .Values.certManager.enabled .Values.certManager.clientCaFromServerTlsSecret) }}
+        {{- if and (eq .Values.server.tls.clientCaSecretName "openshell-server-client-ca") (or (and .Values.pkiInitJob.enabled (not .Values.certManager.enabled)) (and .Values.certManager.enabled .Values.certManager.clientCaFromServerTlsSecret)) }}
         secretName: {{ .Values.server.tls.certSecretName }}
         items:
           - key: ca.crt

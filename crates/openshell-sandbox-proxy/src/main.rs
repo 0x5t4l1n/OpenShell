@@ -5,13 +5,14 @@ use anyhow::{Context, Result, bail};
 use clap::Parser;
 use openshell_core::proto::{WatchServiceRoutesRequest, WorkspaceSelector, workspace_selector};
 use openshell_sandbox_proxy::RouteCache;
-use openshell_sdk::{AuthConfig, ClientConfig, OpenShellClient};
+use openshell_sdk::{AuthConfig, ClientConfig, EdgeAuthInterceptor, OpenShellClient};
 use std::collections::BTreeSet;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex;
+use tonic::transport::{Certificate, ClientTlsConfig, Endpoint, Identity};
 
 #[derive(Clone, Parser)]
 #[command(
@@ -33,6 +34,19 @@ struct Args {
     /// Bearer credential file, reread on each watch reconnect. Never sent to applications.
     #[arg(long, env = "OPENSHELL_PROXY_DISCOVERY_TOKEN_FILE")]
     discovery_token_file: Option<PathBuf>,
+    /// Client certificate and key, reread on every discovery reconnect.
+    #[arg(
+        long,
+        requires = "discovery_client_key",
+        conflicts_with = "discovery_token_file"
+    )]
+    discovery_client_cert: Option<PathBuf>,
+    #[arg(
+        long,
+        requires = "discovery_client_cert",
+        conflicts_with = "discovery_token_file"
+    )]
+    discovery_client_key: Option<PathBuf>,
     /// Public gateway CA certificate. Application TLS stays on supervisors.
     #[arg(long)]
     gateway_ca: Option<PathBuf>,
@@ -77,19 +91,60 @@ fn validate(args: &Args) -> Result<()> {
         bail!("discovery workspaces must be nonempty and unique");
     }
     if args.allow_plaintext_development {
-        if !args.gateway_endpoint.starts_with("http://") || args.discovery_token_file.is_some() {
-            bail!("plaintext development requires an HTTP gateway without bearer credentials");
+        if !args.gateway_endpoint.starts_with("http://")
+            || args.discovery_token_file.is_some()
+            || args.discovery_client_cert.is_some()
+            || args.discovery_client_key.is_some()
+        {
+            bail!("plaintext development requires an HTTP gateway without discovery credentials");
         }
-    } else if !args.gateway_endpoint.starts_with("https://") || args.discovery_token_file.is_none()
-    {
-        bail!(
-            "discovery requires HTTPS and --discovery-token-file; use --allow-plaintext-development only for local testing"
-        );
+    } else {
+        let certificate =
+            args.discovery_client_cert.is_some() && args.discovery_client_key.is_some();
+        let incomplete =
+            args.discovery_client_cert.is_some() != args.discovery_client_key.is_some();
+        if !args.gateway_endpoint.starts_with("https://")
+            || incomplete
+            || (args.discovery_token_file.is_some() == certificate)
+        {
+            bail!(
+                "discovery requires HTTPS and exactly one credential: a bearer token file or a client certificate/key pair"
+            );
+        }
     }
     Ok(())
 }
 
 async fn client(args: &Args) -> Result<OpenShellClient> {
+    if let (Some(cert), Some(key)) = (&args.discovery_client_cert, &args.discovery_client_key) {
+        let cert = tokio::fs::read(cert)
+            .await
+            .context("read discovery client certificate")?;
+        let key = tokio::fs::read(key)
+            .await
+            .context("read discovery client key")?;
+        let mut tls = ClientTlsConfig::new().identity(Identity::from_pem(cert, key));
+        tls = if let Some(path) = &args.gateway_ca {
+            tls.ca_certificate(Certificate::from_pem(
+                tokio::fs::read(path).await.context("read gateway CA")?,
+            ))
+        } else {
+            tls.with_enabled_roots()
+        };
+        let channel = Endpoint::from_shared(args.gateway_endpoint.clone())?
+            .connect_timeout(Duration::from_secs(10))
+            .http2_adaptive_window(true)
+            .http2_keep_alive_interval(Duration::from_secs(10))
+            .keep_alive_while_idle(true)
+            .tls_config(tls)?
+            .connect()
+            .await
+            .map_err(|_| anyhow::anyhow!("gateway mTLS discovery connection failed"))?;
+        return Ok(OpenShellClient::from_parts(
+            channel,
+            EdgeAuthInterceptor::noop(),
+        ));
+    }
     let mut config = ClientConfig::new(&args.gateway_endpoint);
     if let Some(path) = &args.discovery_token_file {
         let token = tokio::fs::read_to_string(path)
@@ -155,4 +210,71 @@ async fn watch_once(args: &Args, workspace: &str, cache: &Arc<Mutex<RouteCache>>
         tracing::debug!(%workspace, routes = count, "discovery snapshot installed");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(credentials: &[&str]) -> Result<Args> {
+        let mut command_line = vec![
+            "sandbox-proxy",
+            "--gateway-endpoint",
+            "https://gateway.example.com",
+            "--workspace",
+            "default",
+        ];
+        command_line.extend_from_slice(credentials);
+        let args = Args::try_parse_from(command_line)?;
+        validate(&args)?;
+        Ok(args)
+    }
+
+    #[test]
+    fn production_requires_one_complete_credential() {
+        assert!(parse(&[]).is_err());
+        assert!(parse(&["--discovery-client-cert", "cert.pem"]).is_err());
+        assert!(parse(&["--discovery-client-key", "key.pem"]).is_err());
+        assert!(
+            parse(&[
+                "--discovery-token-file",
+                "token",
+                "--discovery-client-cert",
+                "cert.pem",
+                "--discovery-client-key",
+                "key.pem"
+            ])
+            .is_err()
+        );
+        assert!(parse(&["--discovery-token-file", "token"]).is_ok());
+        assert!(
+            parse(&[
+                "--discovery-client-cert",
+                "cert.pem",
+                "--discovery-client-key",
+                "key.pem"
+            ])
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn plaintext_never_accepts_credentials() {
+        let mut args = parse(&[
+            "--discovery-client-cert",
+            "cert.pem",
+            "--discovery-client-key",
+            "key.pem",
+        ])
+        .unwrap();
+        args.gateway_endpoint = "http://gateway.example.com".into();
+        assert!(validate(&args).is_err());
+        args.allow_plaintext_development = true;
+        assert!(validate(&args).is_err());
+        args.discovery_client_cert = None;
+        args.discovery_client_key = None;
+        assert!(validate(&args).is_ok());
+        args.discovery_token_file = Some("token".into());
+        assert!(validate(&args).is_err());
+    }
 }

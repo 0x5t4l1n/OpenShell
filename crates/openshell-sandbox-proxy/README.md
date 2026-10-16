@@ -19,3 +19,19 @@ Unknown or expired SNI never opens a backend connection. Withdrawal, declaration
 The POC bounds TLS ClientHello input to 64 KiB, setup operations to 10 seconds, and the route cache to 4,096 entries. It defaults to 256 connections. TLS ClientHello bytes, HTTP, and WebSockets pass unchanged to supervisors. Connection tasks are separate from discovery tasks. Remaining production work includes metrics, differentiated quotas, retry backoff, certificate lifecycle, and stronger readiness reporting.
 
 For the Helm fixture and multiple sandbox services, see the [proxy smoke test](../../e2e/kubernetes/app-listener/README.md#test-through-the-sandbox-proxy).
+
+## Certificate-authenticated discovery
+
+Use HTTPS with `--discovery-client-cert` and `--discovery-client-key` instead
+of `--discovery-token-file`. Optionally pin the gateway CA with `--gateway-ca`.
+The proxy reads the certificate, key, and CA on every discovery reconnect and
+sends no Authorization header in certificate mode. The gateway must trust the
+client CA and enable operator authentication for an `OU=operator` certificate.
+Operator identities have gateway-wide privileges, including provider credential
+retrieval. Keep the client key confined to the proxy and automate renewal.
+
+Helm selects this mode with `sandboxProxy.discoveryClientTlsSecret`, referencing
+only `tls.crt` and `tls.key`. It is mutually exclusive with
+`sandboxProxy.discoveryTokenSecret` and plaintext development mode. Application
+TLS still terminates at the supervisor; the discovery identity is never sent
+to applications.

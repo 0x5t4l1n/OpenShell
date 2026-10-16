@@ -84,6 +84,8 @@ sandboxProxy:
   gatewayEndpoint: ""
   workspaces: [default]
   discoveryTokenSecret: ""
+  # -- Dedicated client identity Secret (tls.crt/tls.key), exclusive with discoveryTokenSecret.
+  discoveryClientTlsSecret: ""
   gatewayCaSecret: ""
   allowPlaintextDevelopment: false
   listenerPort: 8443
@@ -557,17 +559,19 @@ server:
   tls:
     # -- K8s secret (type kubernetes.io/tls) with tls.crt and tls.key for the server.
     certSecretName: openshell-server-tls
-    # -- Enable mTLS client certificate authentication. When false, the gateway
-    # runs HTTPS-only without requiring client certificates (use OIDC for auth
-    # instead). Must be false when using BackendTLSPolicy because ingress
-    # proxies cannot present client certificates to the backend.
+    # -- Verify presented client certificates against the client CA. Bearer-only
+    # connections remain allowed; authentication follows the gateway mTLS/OIDC
+    # policy. Can be combined with BackendTLSPolicy.
     enableMtls: true
     # -- K8s secret with ca.crt for client certificate verification (mTLS).
     # Only used when enableMtls is true. Set to "" to disable client certificate
     # verification for HTTPS-only mode.
     clientCaSecretName: openshell-server-client-ca
-    # -- K8s secret mounted into sandbox pods for mTLS to the server.
+    # -- TLS Secret providing the gateway CA to supervisors and the default peer
+    # client identity. Supervisors receive only ca.crt.
     clientTlsSecretName: openshell-client-tls
+    # -- Optional separate peer client identity; defaults to clientTlsSecretName.
+    peerClientTlsSecretName: ""
   # Gateway-minted sandbox JWT signing keys. The certgen hook generates an
   # Ed25519 keypair and writes it to a secret containing signing.pem (PKCS#8),
   # public.pem (SPKI), and kid (plain text). The hook runs in full PKI mode when
