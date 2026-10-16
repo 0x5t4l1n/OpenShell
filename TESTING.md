@@ -456,8 +456,18 @@ suggests a fresh one. IDs must be unique across all families, which the runner
 checks, and the runner adds each test's ID to its JUnit test case as the
 `test_id` property.
 
-The function name is the nextest test name and is what `--suite` and nextest
-filters select. Rename it when a clearer name helps; the ID keeps the history.
+A conformance test asserts only what the public contract promises: the
+comments in `proto/` and the published docs, such as the sandbox lifecycle in
+`docs/how-it-works/sandboxes/overview.mdx`. Do not encode current gateway
+behavior the contract doesn't state; file an issue to document it instead.
+Assert on a sandbox's `phase` and `exit_code` rather than condition reasons,
+which the API leaves to the platform. Check that something did not happen
+(for example, `restart_count` is 0 and a second read shows the same phase)
+instead of sleeping and watching. Behavior the docs leave to the compute
+driver needs a capability in `requires`.
+
+The function name is the nextest test name and is what nextest filters
+select. Rename it when a clearer name helps; the ID keeps the history.
 The doc comment is the required description. Declare capabilities a test needs with
 `#[testkit::test(requires = [service_exposure])]`; the runner excludes the test
 in environments without them and reports it as unsupported. Tests read the
