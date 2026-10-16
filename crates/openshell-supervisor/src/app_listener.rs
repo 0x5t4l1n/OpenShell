@@ -578,6 +578,9 @@ async fn proxy(
     if !authority_matches(&req, &sni) {
         return Ok(error(StatusCode::MISDIRECTED_REQUEST));
     }
+    // Keep the public authority after validating it against SNI. The dial target
+    // is loopback, but rewriting Host would break application same-origin checks.
+    let authority = req.headers()[header::HOST].clone();
     let websocket = req
         .headers()
         .get(header::UPGRADE)
@@ -610,12 +613,7 @@ async fn proxy(
         .map_or("/", |path| path.as_str())
         .parse()
         .expect("valid path");
-    parts.headers.insert(
-        header::HOST,
-        format!("127.0.0.1:{}", route.target_port)
-            .parse()
-            .expect("valid host"),
-    );
+    parts.headers.insert(header::HOST, authority);
     let response = sender.send_request(Request::from_parts(parts, body)).await;
     let Ok(mut response) = response else {
         upstream_task.abort();
@@ -651,6 +649,7 @@ mod tests {
     use openshell_isolation_interface::contract::{BackendError, BoundaryDuplexStream};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest as _;
 
     const HOST: &str = "default--sandbox-a--web.svc.openshell.internal";
 
@@ -717,18 +716,30 @@ mod tests {
                                 .header("connection", "upgrade")
                                 .header("upgrade", "websocket")
                                 .header("sec-websocket-accept", accept)
+                                .header("x-test-upstream-host", req.headers()[header::HOST].clone())
+                                .header(
+                                    "x-test-upstream-origin",
+                                    req.headers()
+                                        .get(header::ORIGIN)
+                                        .cloned()
+                                        .unwrap_or_else(|| "absent".parse().unwrap()),
+                                )
                                 .body(Body::empty())
                                 .unwrap(),
                         );
                     }
                     let body = format!(
-                        "{} {} {}",
+                        "{} {} {} {}",
                         req.uri(),
                         req.headers()[header::HOST].to_str().unwrap(),
                         req.headers()
                             .get(header::AUTHORIZATION)
                             .and_then(|v| v.to_str().ok())
-                            .unwrap_or("stripped")
+                            .unwrap_or("stripped"),
+                        req.headers()
+                            .get(header::ORIGIN)
+                            .and_then(|v| v.to_str().ok())
+                            .unwrap_or("absent")
                     );
                     Ok::<_, std::convert::Infallible>(Response::new(Body::from(body)))
                 });
@@ -809,6 +820,16 @@ mod tests {
     }
 
     async fn request(f: &Fixture, sni: &str, host: &str, extra: &str) -> String {
+        request_method(f, "GET", sni, host, extra).await
+    }
+
+    async fn request_method(
+        f: &Fixture,
+        method: &str,
+        sni: &str,
+        host: &str,
+        extra: &str,
+    ) -> String {
         let stream = openshell_core::net::connect_tcp_nodelay_best_effort(&[f.address])
             .await
             .unwrap();
@@ -820,7 +841,7 @@ mod tests {
         let _ = tls
             .write_all(
                 format!(
-                    "GET /hello?x=1 HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n{extra}\r\n"
+                    "{method} /hello?x=1 HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n{extra}\r\n"
                 )
                 .as_bytes(),
             )
@@ -831,6 +852,26 @@ mod tests {
             .await
             .unwrap();
         String::from_utf8(response).unwrap()
+    }
+
+    #[tokio::test]
+    async fn browser_post_preserves_public_authority_and_origin() {
+        let f = fixture().await;
+        let authority = format!("{HOST}:18443");
+        let origin = format!("https://{authority}");
+        let response = request_method(
+            &f,
+            "POST",
+            HOST,
+            &authority,
+            &format!("Origin: {origin}\r\nContent-Length: 0\r\n"),
+        )
+        .await;
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        assert!(
+            response.contains(&format!("/hello?x=1 {authority} stripped {origin}")),
+            "{response}"
+        );
     }
 
     #[tokio::test]
@@ -845,7 +886,7 @@ mod tests {
         .await;
         assert!(response.starts_with("HTTP/1.1 200"), "{response}");
         assert!(
-            response.contains("/hello?x=1 127.0.0.1:8080 stripped"),
+            response.contains(&format!("/hello?x=1 {HOST}:18443 stripped")),
             "{response}"
         );
         let mismatch = request(
@@ -933,9 +974,16 @@ mod tests {
             .connect(name, stream)
             .await
             .unwrap();
-        let (mut ws, _) = tokio_tungstenite::client_async(format!("wss://{HOST}/echo"), tls)
-            .await
-            .unwrap();
+        let mut request = format!("wss://{HOST}/echo").into_client_request().unwrap();
+        request
+            .headers_mut()
+            .insert(header::ORIGIN, format!("https://{HOST}").parse().unwrap());
+        let (mut ws, response) = tokio_tungstenite::client_async(request, tls).await.unwrap();
+        assert_eq!(response.headers()["x-test-upstream-host"], HOST);
+        assert_eq!(
+            response.headers()["x-test-upstream-origin"],
+            format!("https://{HOST}")
+        );
         ws.send(tokio_tungstenite::tungstenite::Message::Text(
             "hello".into(),
         ))

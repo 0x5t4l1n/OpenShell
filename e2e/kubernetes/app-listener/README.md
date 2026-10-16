@@ -93,6 +93,8 @@ curl --noproxy '*' --cacert "$app_tls_dir/tls.crt" \
 
 Expected: HTTP 200 from the sandbox server. Repeat with `-H 'Host: default--app-b--web.svc.openshell.internal'`: expect HTTP 421 and no sandbox connection. An unknown service or sandbox in SNI closes the connection even though the wildcard certificate matches. No-SNI clients are also rejected.
 
+The app listener preserves the validated public `Host` (including its public port) and browser `Origin` for HTTP and WebSocket requests while connecting to the declared loopback port. For browser-facing applications, verify cookie login with an `Origin` header and verify WebSocket upgrades; bearer API access alone does not test browser same-origin checks.
+
 The app listener preserves existing `Authorization` stripping and opt-in bearer passthrough. Bearer passthrough rejects duplicate or malformed credentials. Service deletion/updates revoke that service's connections on the next accepted configuration poll; other services stay connected. If configuration stops refreshing, the 30-second route lease closes ingress connections. A stopped workload closes the listener.
 
 Port-forwarding verifies routing and a selected backend, but bypasses normal Service/network-policy forwarding. Also send the same request from an in-cluster client, using the Service DNS name as the connection target while preserving the public SNI/Host with curl's `--connect-to`:
