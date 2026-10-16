@@ -994,6 +994,13 @@ async fn run_sandbox_with_backend(
     // the entrypoint process's /proc/net/tcp for identity binding.
     let entrypoint_pid = Arc::new(AtomicU32::new(0));
 
+    // The agent trace relay must exist before networking starts so the
+    // handler is installed when the first staged connection arrives, and
+    // before attach so the agent spec can tell the boundary whether to point
+    // workload SDKs at it.
+    let (mut otlp_relay, otlp_reserved_destination) =
+        otlp_relay::activate(otlp_endpoint, sandbox_id.clone());
+
     // Construct the selected client only after shared policy and credential
     // setup has completed. Keep live credentials and later CA publication in
     // supervisor-owned handles shared with the backend.
@@ -1013,6 +1020,7 @@ async fn run_sandbox_with_backend(
                 workdir: workspace,
                 timeout_secs,
                 interactive,
+                otlp_relay_active: otlp_relay.is_some(),
             },
         )
         .instrument(tracing::info_span!(parent: &startup, "supervisor.boundary.attach"))
@@ -1097,11 +1105,6 @@ async fn run_sandbox_with_backend(
         info!(backend = %backend_name, "Isolation boundary enforcement confirmed");
         (ready, backend_name, ca_file_paths)
     };
-
-    // The agent trace relay must exist before networking starts so the
-    // handler is installed when the first staged connection arrives.
-    let (mut otlp_relay, otlp_reserved_destination) =
-        otlp_relay::activate(otlp_endpoint, sandbox_id.clone());
 
     let mut networking = Some(
         openshell_supervisor_network::run::run_networking(
