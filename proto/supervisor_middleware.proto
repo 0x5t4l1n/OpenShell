@@ -396,11 +396,12 @@ message HttpPreflightResult {
   }
   // Ordered head mutations, validated before the next stage sees the head.
   // Only visible end-to-end headers may change. Credential, routing, framing,
-  // and hop-by-hop headers are protected. Request and response
-  // Content-Encoding, and response Content-Range, are protected; response
-  // integrity headers may only be removed. Not
-  // allowed for uninspectable traffic. Limited to 64 operations, 32 KiB of
-  // name/value data, and 64 KiB encoded.
+  // and hop-by-hop headers are protected, as are Content-Encoding and
+  // response Content-Range. OpenShell does not update integrity headers such
+  // as ETag, Content-MD5, or Content-Digest when a body changes: a stage that
+  // changes the body removes them or writes new values, typically in its late
+  // head mutations. Not allowed for uninspectable traffic. Limited to 64
+  // operations, 32 KiB of name/value data, and 64 KiB encoded.
   repeated HeaderMutation header_mutations = 3;
   MiddlewareDiagnostics diagnostics = 4;
 }

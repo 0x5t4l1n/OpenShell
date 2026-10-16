@@ -21,6 +21,11 @@ pub enum HeaderAuthority {
     SessionRequest,
     RequestTrailers,
     Response,
+    /// An HTTP session hook response head. Unlike legacy response hooks,
+    /// a stage may write integrity headers such as `ETag` and
+    /// `Content-Digest`. They are not stripped when a body changes: the stage
+    /// that changes the body owns them.
+    SessionResponse,
     ResponseTrailers,
 }
 
@@ -294,7 +299,9 @@ fn validate_authority(
             is_response_protected(normalized_name)
                 || (kind == MutationKind::Write && is_response_remove_only(normalized_name))
         }
-        HeaderAuthority::ResponseTrailers => is_response_protected(normalized_name),
+        HeaderAuthority::SessionResponse | HeaderAuthority::ResponseTrailers => {
+            is_response_protected(normalized_name)
+        }
     };
     if protected {
         return Err(HeaderMutationError::Protected {
@@ -698,6 +705,50 @@ mod tests {
         ] {
             let error = apply(HeaderAuthority::Response, &[], &[], &[mutation])
                 .expect_err("protected response mutation");
+            assert!(matches!(error, HeaderMutationError::Protected { .. }));
+        }
+    }
+
+    #[test]
+    fn session_response_authority_lets_stages_own_integrity_headers() {
+        let existing = [
+            header("etag", "\"upstream\""),
+            header("content-length", "5"),
+        ];
+        let updated = apply(
+            HeaderAuthority::SessionResponse,
+            &existing,
+            &[],
+            &[
+                write("ETag", "\"rewritten\"", ExistingHeaderAction::Overwrite),
+                write(
+                    "Content-Digest",
+                    "sha-256=:abc=:",
+                    ExistingHeaderAction::Overwrite,
+                ),
+            ],
+        )
+        .expect("session stages may write integrity headers");
+        assert_eq!(
+            updated,
+            vec![
+                header("content-length", "5"),
+                header("etag", "\"rewritten\""),
+                header("content-digest", "sha-256=:abc=:"),
+            ]
+        );
+        // Framing and coding headers stay protected.
+        for mutation in [
+            remove("Content-Length"),
+            write("Content-Encoding", "gzip", ExistingHeaderAction::Overwrite),
+        ] {
+            let error = apply(
+                HeaderAuthority::SessionResponse,
+                &existing,
+                &[],
+                &[mutation],
+            )
+            .expect_err("protected session response mutation");
             assert!(matches!(error, HeaderMutationError::Protected { .. }));
         }
     }

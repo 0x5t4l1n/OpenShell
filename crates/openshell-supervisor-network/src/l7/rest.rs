@@ -7275,11 +7275,14 @@ mod tests {
     /// HTTP session hook response stage that streams its input back and
     /// declares `declared` output bytes. A stage that declares an empty output
     /// emits nothing. With `gate`, it waits after the first byte of each input
-    /// chunk. It rejects at `input_end` when `reject` is set.
+    /// chunk. It rejects at `input_end` when `reject` is set. `output_start`
+    /// carries `late_mutations`.
+    #[derive(Default)]
     struct SessionEchoStage {
         declared: Option<u64>,
         reject: bool,
         gate: Option<ResponseBodyGate>,
+        late_mutations: Vec<HeaderMutation>,
     }
 
     async fn emit_session_result(
@@ -7346,6 +7349,7 @@ mod tests {
                 http_preflight_result, http_response_session_event, http_response_session_result,
             };
             let (declared, reject, gate) = (self.declared, self.reject, self.gate.clone());
+            let late_mutations = self.late_mutations.clone();
             let (sender, receiver) = mpsc::channel(4);
             tokio::spawn(async move {
                 while let Some(event) = events.recv().await {
@@ -7373,7 +7377,7 @@ mod tests {
                                 &sender,
                                 http_response_session_result::Result::OutputStart(
                                     HttpOutputStart {
-                                        header_mutations: Vec::new(),
+                                        header_mutations: late_mutations.clone(),
                                         output_body_bytes: declared,
                                     },
                                 ),
@@ -7474,7 +7478,7 @@ mod tests {
             let (runner, chain) = session_echo_fixture(SessionEchoStage {
                 declared,
                 reject,
-                gate: None,
+                ..Default::default()
             });
             let mut upstream = response.as_slice();
             let mut delivered = Vec::new();
@@ -7497,13 +7501,63 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn session_response_stages_own_integrity_headers() {
+        let response = b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nETag: \"v1\"\r\nContent-MD5: md5\r\n\r\nhello";
+        for (name, late_mutations, kept, absent) in [
+            // A STREAM stage that passes the body through keeps the
+            // upstream's validators.
+            (
+                "pass-through",
+                Vec::new(),
+                vec!["etag: \"v1\"\r\n", "content-md5: md5\r\n"],
+                vec![],
+            ),
+            // A stage that changes the body replaces or removes them itself.
+            (
+                "rewritten",
+                vec![
+                    write_header("ETag", "\"v2\"", ExistingHeaderAction::Overwrite),
+                    remove_header("Content-MD5"),
+                ],
+                vec!["etag: \"v2\"\r\n"],
+                vec!["content-md5", "\"v1\""],
+            ),
+        ] {
+            let (runner, chain) = session_echo_fixture(SessionEchoStage {
+                declared: Some(5),
+                late_mutations,
+                ..Default::default()
+            });
+            let mut upstream = response.as_slice();
+            let mut delivered = Vec::new();
+            let outcome = relay_response(
+                "GET",
+                &mut upstream,
+                &mut delivered,
+                RelayResponseOptions::default(),
+                Some(response_middleware_context(&runner, &chain, "GET")),
+            )
+            .await;
+            assert!(outcome.is_ok(), "{name}: {outcome:?}");
+            let delivered = String::from_utf8(delivered).unwrap().to_ascii_lowercase();
+            for header in kept {
+                assert!(delivered.contains(header), "{name}: {delivered}");
+            }
+            for text in absent {
+                assert!(!delivered.contains(text), "{name}: {delivered}");
+            }
+            assert!(delivered.ends_with("\r\n\r\nhello"), "{name}: {delivered}");
+        }
+    }
+
+    #[tokio::test]
     async fn session_response_holds_the_head_of_an_empty_declared_body() {
         let response = b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello";
         for reject in [false, true] {
             let (runner, chain) = session_echo_fixture(SessionEchoStage {
                 declared: Some(0),
                 reject,
-                gate: None,
+                ..Default::default()
             });
             let mut upstream = response.as_slice();
             let mut delivered = Vec::new();
@@ -7544,6 +7598,7 @@ mod tests {
                 entered: Arc::clone(&entered),
                 release: Arc::clone(&release),
             }),
+            ..Default::default()
         });
         let engine = OpaEngine::from_strings(TEST_POLICY, "network_policies: {}\n").unwrap();
         let guard = engine

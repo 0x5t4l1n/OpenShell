@@ -108,6 +108,8 @@ A result can include an ordered list of header changes. A `write` change sets ho
 
 A `remove` change removes all values for the name. OpenShell protects credential, routing, framing, connection, and content coding headers. For responses, it also protects status, authentication challenge, range, and security policy headers. Header values cannot contain control characters. Request values cannot contain OpenShell credential placeholders.
 
+OpenShell does not update integrity headers, such as `ETag`, `Content-MD5`, `Digest`, `Content-Digest`, and `Signature`, when a stage changes a body. If your stage changes the body, remove these headers or write new values in `buffered_result` or `output_start`. A STREAM stage can read all input before it sends `output_start` if it needs the complete body to compute a value.
+
 OpenShell applies all preflight changes in chain order, then late changes from `buffered_result` or `output_start` in chain order. `begin` carries the head after all preflight changes and earlier stages' late changes. Trailer changes can modify or remove existing trailers but cannot add new names.
 
 OpenShell applies each stage's changes as a unit. If one change is invalid, it discards all of them and fails the stage.

@@ -11,17 +11,21 @@
 //! encoded body, gets `cannot_inspect`, which OpenShell reports to the sandbox
 //! as `middleware_cannot_inspect` and fails closed. Uninspectable connections
 //! are rejected unless the config sets `uninspectable: allow`.
+//!
+//! OpenShell leaves integrity headers such as `ETag` and `Content-Digest`
+//! alone. When the guard may change a body, it removes them itself.
 
 use std::pin::Pin;
 
 use openshell_core::middleware::{HttpRequestSessionResultStream, HttpResponseSessionResultStream};
 use openshell_core::proto::{
-    HttpBodyLimits, HttpBodyMode, HttpBodyModeUnavailable, HttpBodyUnavailableReason,
-    HttpBufferedBody, HttpBufferedMode, HttpBufferedResult, HttpCannotInspect, HttpContinue,
-    HttpFinish, HttpInputChunk, HttpInspect, HttpOutputChunk, HttpOutputStart, HttpPreflightResult,
-    HttpReject, HttpRequestPreflightHead, HttpRequestSessionEvent, HttpRequestSessionResult,
-    HttpResponseSessionEvent, HttpResponseSessionResult, HttpStreamMode, HttpUnchanged,
-    MiddlewareDiagnostics, http_buffered_result, http_inspect, http_preflight_result,
+    HeaderMutation, HttpBodyLimits, HttpBodyMode, HttpBodyModeUnavailable,
+    HttpBodyUnavailableReason, HttpBufferedBody, HttpBufferedMode, HttpBufferedResult,
+    HttpCannotInspect, HttpContinue, HttpFinish, HttpInputChunk, HttpInspect, HttpOutputChunk,
+    HttpOutputStart, HttpPreflightResult, HttpReject, HttpRequestPreflightHead,
+    HttpRequestSessionEvent, HttpRequestSessionResult, HttpResponseSessionEvent,
+    HttpResponseSessionResult, HttpStreamMode, HttpUnchanged, MiddlewareDiagnostics, RemoveHeader,
+    header_mutation, http_buffered_result, http_inspect, http_preflight_result,
     http_request_session_event, http_request_session_preflight, http_request_session_result,
     http_response_session_event, http_response_session_result,
 };
@@ -263,8 +267,18 @@ impl Stage {
             }
             (Self::Begin(config, Selected::Stream(max_chunk_bytes)), Event::Begin) => {
                 let scanner = StreamScanner::new(&config);
+                // The head goes out before the guard knows whether it will
+                // redact anything. Deny mode passes the body through unchanged.
+                let header_mutations = if config.mode == Mode::Redact {
+                    remove_integrity_headers()
+                } else {
+                    Vec::new()
+                };
                 *self = Self::Stream(config, scanner, max_chunk_bytes);
-                Ok(vec![Reply::OutputStart(HttpOutputStart::default())])
+                Ok(vec![Reply::OutputStart(HttpOutputStart {
+                    header_mutations,
+                    output_body_bytes: None,
+                })])
             }
             (Self::Buffered(config), Event::BufferedBody(body)) => {
                 Ok(vec![buffered_result(inspect(&config, &body.data))])
@@ -409,16 +423,47 @@ fn buffered_result(outcome: GuardOutcome) -> Reply {
         });
     }
     let mut outcome = outcome;
-    let body = outcome.replacement.take().map_or(
-        http_buffered_result::Body::Unchanged(HttpUnchanged {}),
-        http_buffered_result::Body::Replacement,
-    );
+    let (body, header_mutations) = match outcome.replacement.take() {
+        Some(replacement) => (
+            http_buffered_result::Body::Replacement(replacement),
+            remove_integrity_headers(),
+        ),
+        None => (
+            http_buffered_result::Body::Unchanged(HttpUnchanged {}),
+            Vec::new(),
+        ),
+    };
     let diagnostics = (!outcome.findings.is_empty()).then(|| diagnostics(outcome));
     Reply::Buffered(HttpBufferedResult {
         body: Some(body),
+        header_mutations,
         diagnostics,
         ..Default::default()
     })
+}
+
+/// Headers that describe the exact body bytes and go stale when the guard
+/// changes them. A service that can compute new values may write them instead.
+const INTEGRITY_HEADERS: [&str; 8] = [
+    "accept-ranges",
+    "content-digest",
+    "content-md5",
+    "digest",
+    "etag",
+    "repr-digest",
+    "signature",
+    "signature-input",
+];
+
+fn remove_integrity_headers() -> Vec<HeaderMutation> {
+    INTEGRITY_HEADERS
+        .iter()
+        .map(|name| HeaderMutation {
+            operation: Some(header_mutation::Operation::Remove(RemoveHeader {
+                name: (*name).to_string(),
+            })),
+        })
+        .collect()
 }
 
 /// Output results for `data`, each within OpenShell's chunk limit: redacting
@@ -527,16 +572,22 @@ mod tests {
                         assert_eq!(diagnostics.reason_code, "content_match");
                         assert!(!diagnostics.reason.contains("prototype-secret"));
                     }
-                    (_, Some(expected), Reply::Buffered(result)) => assert_eq!(
-                        result.body,
-                        Some(http_buffered_result::Body::Replacement(
-                            expected.as_bytes().to_vec()
-                        ))
-                    ),
-                    (_, None, Reply::Buffered(result)) => assert_eq!(
-                        result.body,
-                        Some(http_buffered_result::Body::Unchanged(HttpUnchanged {}))
-                    ),
+                    (_, Some(expected), Reply::Buffered(result)) => {
+                        assert_eq!(
+                            result.body,
+                            Some(http_buffered_result::Body::Replacement(
+                                expected.as_bytes().to_vec()
+                            ))
+                        );
+                        assert_eq!(result.header_mutations, remove_integrity_headers());
+                    }
+                    (_, None, Reply::Buffered(result)) => {
+                        assert_eq!(
+                            result.body,
+                            Some(http_buffered_result::Body::Unchanged(HttpUnchanged {}))
+                        );
+                        assert!(result.header_mutations.is_empty());
+                    }
                     (_, _, reply) => panic!("unexpected {mode} reply: {reply:?}"),
                 }
             }
@@ -565,10 +616,11 @@ mod tests {
                 ..
             })
         ));
-        assert!(matches!(
-            only(stage.handle(Event::Begin).unwrap()),
-            Reply::OutputStart(_)
-        ));
+        let Reply::OutputStart(start) = only(stage.handle(Event::Begin).unwrap()) else {
+            panic!("output start")
+        };
+        // Redaction may change the body, so the head drops integrity headers.
+        assert_eq!(start.header_mutations, remove_integrity_headers());
         let mut output = Vec::new();
         for chunk in [&b"data: prototype-"[..], b"secret\n\n"] {
             for reply in stage

@@ -574,13 +574,9 @@ impl<C: AsyncWrite + Unpin> ResponseWriter<'_, '_, C> {
                 HttpBodyOutput::Start {
                     header_mutations,
                     output_body_bytes,
-                    body_transformed,
                 },
                 None,
-            ) => {
-                self.commit(&header_mutations, output_body_bytes, body_transformed)
-                    .await
-            }
+            ) => self.commit(&header_mutations, output_body_bytes).await,
             (HttpBodyOutput::Chunk(data), Some(framing)) => self.chunk(framing, &data).await,
             (HttpBodyOutput::End { trailers }, Some(framing)) => match framing {
                 OutputFraming::ContentLength { remaining: 0 } => {
@@ -612,21 +608,13 @@ impl<C: AsyncWrite + Unpin> ResponseWriter<'_, '_, C> {
         &mut self,
         late_mutations: &[HeaderMutation],
         output_body_bytes: Option<u64>,
-        body_transformed: bool,
     ) -> std::result::Result<(), BodyRelayError> {
-        // A changed body makes the upstream's representation validators
-        // stale.
-        let mut headers = self.headers.to_vec();
-        let mut declared_trailers = self.parsed.declared_trailers.clone();
-        if body_transformed {
-            strip_response_integrity_headers(&mut headers);
-            declared_trailers.retain(|name| {
-                !openshell_supervisor_middleware::is_stale_http_response_integrity_header(name)
-            });
-        }
+        // Stages own representation validators such as ETag and
+        // Content-Digest: one that changes the body removes or rewrites them.
+        let declared_trailers = &self.parsed.declared_trailers;
         let headers = openshell_supervisor_middleware::headers::apply_accumulated(
-            openshell_supervisor_middleware::headers::HeaderAuthority::Response,
-            &headers,
+            openshell_supervisor_middleware::headers::HeaderAuthority::SessionResponse,
+            self.headers,
             &self.parsed.connection_nominated,
             late_mutations,
         )
@@ -649,7 +637,7 @@ impl<C: AsyncWrite + Unpin> ResponseWriter<'_, '_, C> {
             },
             self.connection_close || framing == OutputFraming::CloseDelimited,
             if framing == OutputFraming::Chunked {
-                &declared_trailers
+                declared_trailers
             } else {
                 &[]
             },

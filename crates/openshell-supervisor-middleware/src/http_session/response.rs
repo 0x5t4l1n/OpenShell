@@ -32,7 +32,7 @@ use tokio::sync::mpsc;
 use tokio::time::Instant;
 
 use super::pipeline::{
-    self, BodyModeOffer, HTTP_BUFFERED_BODY_TIMEOUT, HttpBodyInput, HttpBodyOutput, HttpDirection,
+    self, BodyModeOffer, HTTP_BUFFERED_BODY_TIMEOUT, HttpBodyInput, HttpBodyOutput,
     HttpFailureCode, HttpMiddlewareFailure, HttpPipelineFinish, HttpStageDiagnostics,
     MiddlewareFailureDetail, Pipeline, PipelineSpec, PipelineTimeouts, PreflightFields, StageHead,
     StagePreflight,
@@ -306,8 +306,7 @@ impl ChainRunner {
             None
         };
         let spec = PipelineSpec {
-            direction: HttpDirection::Response,
-            head_authority: HeaderAuthority::Response,
+            head_authority: HeaderAuthority::SessionResponse,
             trailer_authority: HeaderAuthority::ResponseTrailers,
             connection_nominated: input.connection_nominated_headers.clone(),
             timeouts: PipelineTimeouts {

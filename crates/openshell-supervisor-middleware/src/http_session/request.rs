@@ -15,9 +15,9 @@ use tokio::sync::mpsc;
 use tokio::time::Instant;
 
 use super::pipeline::{
-    self, BodyModeOffer, HttpBodyInput, HttpBodyOutput, HttpDirection, HttpMiddlewareFailure,
-    HttpPipelineFinish, HttpStageDiagnostics, MiddlewareFailureDetail, Pipeline, PipelineSpec,
-    PipelineTimeouts, PreflightFields, StageHead, StagePreflight,
+    self, BodyModeOffer, HttpBodyInput, HttpBodyOutput, HttpMiddlewareFailure, HttpPipelineFinish,
+    HttpStageDiagnostics, MiddlewareFailureDetail, Pipeline, PipelineSpec, PipelineTimeouts,
+    PreflightFields, StageHead, StagePreflight,
 };
 use super::{has_content_coding, validate_head_input};
 use crate::headers::HeaderAuthority;
@@ -165,7 +165,6 @@ impl StageHead for RequestHead<'_> {
 
 fn request_spec(input: &HttpRequestPreflightInput) -> PipelineSpec {
     PipelineSpec {
-        direction: HttpDirection::Request,
         head_authority: HeaderAuthority::SessionRequest,
         trailer_authority: HeaderAuthority::RequestTrailers,
         connection_nominated: input.connection_nominated_headers.clone(),

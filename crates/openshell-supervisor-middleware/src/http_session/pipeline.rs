@@ -39,9 +39,8 @@ use openshell_core::proto::{
     HttpPreflightResult, HttpReject, HttpRequestSessionEvent, HttpRequestSessionPreflight,
     HttpResponsePreflightHead, HttpResponseSessionEvent, HttpResponseSessionPreflight,
     MiddlewareDiagnostics, MiddlewareSessionEnd, MiddlewareSessionEndReason, RequestContext,
-    SupervisorMiddlewarePhase, header_mutation, http_buffered_result, http_inspect,
-    http_preflight_result, http_request_session_event, http_request_session_preflight,
-    http_response_session_event,
+    SupervisorMiddlewarePhase, http_buffered_result, http_inspect, http_preflight_result,
+    http_request_session_event, http_request_session_preflight, http_response_session_event,
 };
 
 use crate::headers::{self, HeaderAuthority};
@@ -51,8 +50,7 @@ use crate::{
     MAX_MIDDLEWARE_METADATA_ENTRIES, MAX_MIDDLEWARE_PAYLOAD_BYTES, MAX_MIDDLEWARE_REASON_BYTES,
     MAX_MIDDLEWARE_REASON_CODE_BYTES, MiddlewareDenial, MiddlewareDiagnosticPolicy,
     MiddlewareInvocation, MiddlewareSessionPermit, NamespacedFinding, OnError,
-    TransformedBodyPolicy, is_stable_reason_code, is_stale_http_response_integrity_header,
-    middleware_denial_reason, safe_reason,
+    TransformedBodyPolicy, is_stable_reason_code, middleware_denial_reason, safe_reason,
 };
 
 /// Largest normalized body chunk a stage sends or receives.
@@ -166,12 +164,9 @@ pub enum HttpBodyOutput {
     /// Commit the outgoing head. Apply `header_mutations`, every stage's late
     /// mutations in chain order, after the preflight mutations. When
     /// `output_body_bytes` is present, the body has exactly that length.
-    /// `body_transformed` is true when a stage streamed or replaced the body,
-    /// so representation validators in the head and trailers are stale.
     Start {
         header_mutations: Vec<HeaderMutation>,
         output_body_bytes: Option<u64>,
-        body_transformed: bool,
     },
     Chunk(Vec<u8>),
     End {
@@ -323,8 +318,6 @@ impl std::error::Error for HttpMiddlewareFailure {}
 pub struct HttpPipelineFinish {
     /// Final trailers after every stage's trailer mutations.
     pub trailers: Vec<HttpHeader>,
-    /// True when a stage replaced or streamed the body.
-    pub body_transformed: bool,
     pub diagnostics: HttpStageDiagnostics,
 }
 
@@ -344,17 +337,9 @@ impl Default for PipelineTimeouts {
     }
 }
 
-/// Direction of one HTTP message.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum HttpDirection {
-    Request,
-    Response,
-}
-
 /// Direction-specific rules for one exchange.
 #[derive(Clone)]
 pub struct PipelineSpec {
-    pub direction: HttpDirection,
     pub head_authority: HeaderAuthority,
     pub trailer_authority: HeaderAuthority,
     /// Lowercased names nominated by the original message's `Connection`
@@ -1261,9 +1246,7 @@ impl Pipeline {
         drop(tasks);
 
         let mut diagnostics = HttpStageDiagnostics::default();
-        let mut body_transformed = false;
         for stage in done.into_iter().flatten() {
-            body_transformed |= stage.transformed;
             diagnostics.extend(stage.diagnostics);
         }
         match (failure, trailers) {
@@ -1278,7 +1261,6 @@ impl Pipeline {
             }),
             (None, Some(trailers)) => Ok(HttpPipelineFinish {
                 trailers,
-                body_transformed,
                 diagnostics,
             }),
         }
@@ -1313,7 +1295,6 @@ enum Frame {
     Start {
         header_mutations: Vec<HeaderMutation>,
         output_body_bytes: Option<u64>,
-        body_transformed: bool,
     },
     Chunk(Vec<u8>),
     End(Vec<HttpHeader>),
@@ -1326,18 +1307,9 @@ struct Shared {
     head: Vec<HttpHeader>,
 }
 
+#[derive(Default)]
 struct StageDone {
     diagnostics: HttpStageDiagnostics,
-    transformed: bool,
-}
-
-impl StageDone {
-    fn new(transformed: bool) -> Self {
-        Self {
-            diagnostics: HttpStageDiagnostics::default(),
-            transformed,
-        }
-    }
 }
 
 enum TaskDone {
@@ -1395,7 +1367,6 @@ async fn run_source(
         link.send(Frame::Start {
             header_mutations: Vec::new(),
             output_body_bytes: declared_input_bytes,
-            body_transformed: false,
         })
         .await
         .map_err(|_| TaskError::Aborted)?;
@@ -1474,9 +1445,8 @@ async fn run_checkpoint(
                 Some(Frame::Start {
                     header_mutations,
                     output_body_bytes,
-                    body_transformed,
                 }) if start.is_none() => {
-                    start = Some((header_mutations, output_body_bytes, body_transformed));
+                    start = Some((header_mutations, output_body_bytes));
                 }
                 Some(Frame::Chunk(data)) if start.is_some() => {
                     if body.len().saturating_add(data.len()) > MAX_MIDDLEWARE_PAYLOAD_BYTES {
@@ -1510,15 +1480,13 @@ async fn run_checkpoint(
                 diagnostics: Box::default(),
             }));
         }
-        let (header_mutations, output_body_bytes, body_transformed) =
-            start.expect("a started stage output");
+        let (header_mutations, output_body_bytes) = start.expect("a started stage output");
         let release = async {
             send_frame(
                 &output,
                 Frame::Start {
                     header_mutations,
                     output_body_bytes,
-                    body_transformed,
                 },
             )
             .await?;
@@ -1548,13 +1516,11 @@ async fn run_sink(
                 Some(Frame::Start {
                     header_mutations,
                     output_body_bytes,
-                    body_transformed,
                 }) if !started => {
                     started = true;
                     HttpBodyOutput::Start {
                         header_mutations,
                         output_body_bytes,
-                        body_transformed,
                     }
                 }
                 Some(Frame::Chunk(data)) if started => HttpBodyOutput::Chunk(data),
@@ -1635,7 +1601,6 @@ async fn run_stage(
 /// `Start` received from the previous link.
 struct UpstreamStart {
     header_mutations: Vec<HeaderMutation>,
-    body_transformed: bool,
 }
 
 async fn drive_stage(
@@ -1651,13 +1616,8 @@ async fn drive_stage(
     let output_limit = *output_limit;
     let upstream = match input.recv().await {
         Some(Frame::Start {
-            header_mutations,
-            body_transformed,
-            ..
-        }) => UpstreamStart {
-            header_mutations,
-            body_transformed,
-        },
+            header_mutations, ..
+        }) => UpstreamStart { header_mutations },
         Some(_) => return Err(entry_failure(&stage.entry, "stage_input_order_invalid").into()),
         None => return Err(StageError::LinkClosed),
     };
@@ -1844,7 +1804,7 @@ async fn drive_buffered(
         &result.header_mutations,
     )
     .map_err(|error| mutation_failure(entry, &error))?;
-    let mut trailers = headers::apply(
+    let trailers = headers::apply(
         shared.spec.trailer_authority,
         &trailers,
         &shared.spec.connection_nominated,
@@ -1863,9 +1823,6 @@ async fn drive_buffered(
     };
     let head_changed = late_head != begin_head;
     let transformed = outcome == HttpStageOutcome::Replacement;
-    if transformed {
-        strip_stale_trailers(&shared.spec, &mut trailers, &result.trailer_mutations);
-    }
     let mut header_mutations = upstream.header_mutations;
     header_mutations.extend(result.header_mutations);
     let delivery = async {
@@ -1876,7 +1833,6 @@ async fn drive_buffered(
                 // Content-Length framing cannot carry trailers.
                 output_body_bytes: (trailers.is_empty() || !shared.spec.output_trailers)
                     .then_some(body.len() as u64),
-                body_transformed: upstream.body_transformed || transformed,
             },
         )
         .await?;
@@ -1886,7 +1842,7 @@ async fn drive_buffered(
     tokio::time::timeout_at(body_deadline, delivery)
         .await
         .map_err(|_| entry_failure(entry, "middleware_body_timeout"))??;
-    let mut done = StageDone::new(transformed);
+    let mut done = StageDone::default();
     let reason_code = nonempty(&diagnostics.reason_code);
     collect_diagnostics(entry, diagnostics, &mut done.diagnostics);
     done.diagnostics.invocations.push(HttpStageInvocation {
@@ -1896,29 +1852,6 @@ async fn drive_buffered(
         ..invocation(entry, outcome, reason_code)
     });
     Ok(done)
-}
-
-/// A stage that changed a response body makes the representation validators
-/// in its input trailers stale. Drop the ones its own trailer mutations did not
-/// write.
-fn strip_stale_trailers(
-    spec: &PipelineSpec,
-    trailers: &mut Vec<HttpHeader>,
-    mutations: &[HeaderMutation],
-) {
-    if spec.direction != HttpDirection::Response {
-        return;
-    }
-    trailers.retain(|trailer| {
-        !is_stale_http_response_integrity_header(&trailer.name)
-            || mutations.iter().any(|mutation| {
-                matches!(
-                    &mutation.operation,
-                    Some(header_mutation::Operation::Write(write))
-                        if write.name.eq_ignore_ascii_case(&trailer.name)
-                )
-            })
-    });
 }
 
 /// The body policy's verdict on a replaced body, or `None` when it passes.
@@ -2089,7 +2022,6 @@ async fn drive_stream(
                         Frame::Start {
                             header_mutations: header_mutations.clone(),
                             output_body_bytes: declared,
-                            body_transformed: true,
                         },
                     )
                     .await?;
@@ -2115,14 +2047,13 @@ async fn drive_stream(
                         return Err(entry_failure(entry, "stream_output_length_mismatch").into());
                     }
                     let diagnostics = validate_diagnostics(entry, finish.diagnostics.as_ref())?;
-                    let mut trailers = headers::apply(
+                    let trailers = headers::apply(
                         shared.spec.trailer_authority,
                         &trailers,
                         &shared.spec.connection_nominated,
                         &finish.trailer_mutations,
                     )
                     .map_err(|error| mutation_failure(entry, &error))?;
-                    strip_stale_trailers(&shared.spec, &mut trailers, &finish.trailer_mutations);
                     send_frame(output, Frame::End(trailers)).await?;
                     return Ok::<_, StageError>((diagnostics, output_bytes));
                 }
@@ -2156,7 +2087,7 @@ async fn drive_stream(
             }
         }
     };
-    let mut done = StageDone::new(true);
+    let mut done = StageDone::default();
     let reason_code = nonempty(&diagnostics.reason_code);
     collect_diagnostics(entry, diagnostics, &mut done.diagnostics);
     done.diagnostics.invocations.push(HttpStageInvocation {
