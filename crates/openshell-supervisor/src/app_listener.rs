@@ -18,11 +18,11 @@ use miette::{IntoDiagnostic, Result};
 use openshell_core::grpc_client::SettingsPollResult;
 use openshell_core::proto::{SandboxServiceRoute, SupervisorServiceAdvertisement};
 use openshell_isolation_interface::contract::LoopbackTarget;
-use openshell_sandbox_backend::BoundaryLoopbackConnector;
 use openshell_ocsf::{
     ActionId, ActivityId, AppLifecycleBuilder, ConfigStateChangeBuilder, DispositionId,
     NetworkActivityBuilder, SeverityId, StatusId, ocsf_emit,
 };
+use openshell_sandbox_backend::BoundaryLoopbackConnector;
 use tokio::sync::{Semaphore, watch};
 use tokio::task::JoinSet;
 use tokio::time::Instant;
@@ -644,9 +644,9 @@ async fn proxy(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use openshell_sandbox_backend::test_support as rpc_test;
     use futures::{SinkExt as _, StreamExt as _};
     use openshell_isolation_interface::contract::{BackendError, BoundaryDuplexStream};
+    use openshell_sandbox_backend::test_support as rpc_test;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
     use tokio_tungstenite::tungstenite::client::IntoClientRequest as _;
