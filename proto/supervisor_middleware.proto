@@ -269,8 +269,9 @@ enum UninspectableTrafficReason {
 }
 
 // A connection that selects the stage but that OpenShell cannot show to it as
-// HTTP messages. Such a preflight never permits a body mode: the stage either
-// continues without a body, which allows the connection, or rejects it.
+// HTTP messages. Such a preflight never permits a body mode: the stage
+// continues without a body, which allows the connection, rejects it, or
+// returns cannot_inspect, which refuses it as a failure.
 message UninspectableTraffic {
   // Destination host selected by network policy.
   string host = 1;
@@ -300,8 +301,8 @@ message HttpRequestSessionPreflight {
   // Validated service configuration. Limited to 64 KiB encoded.
   google.protobuf.Struct config = 6;
   // Body modes this request is eligible for. Empty permits only
-  // continue_without_body, reject, or cannot_inspect. The stage selects one
-  // of them, or continues or rejects when none suits it.
+  // continue_without_body, reject, or cannot_inspect. When no permitted mode
+  // suits the stage, it continues, rejects, or returns cannot_inspect.
   repeated HttpBodyMode permitted_body_modes = 7;
   // One entry for each body mode that permitted_body_modes omits, with the
   // rule that removed it. Empty when the binding's max_payload_bytes is 0,
@@ -329,8 +330,9 @@ message HttpResponseSessionPreflight {
   // Validated service configuration. Limited to 64 KiB encoded.
   google.protobuf.Struct config = 5;
   // Body modes this response is eligible for. Empty permits only
-  // continue_without_body, block_delivery, or cannot_inspect. The stage
-  // selects one of them, or continues or blocks delivery when none suits it.
+  // continue_without_body, block_delivery, or cannot_inspect. When no
+  // permitted mode suits the stage, it continues, blocks delivery, or returns
+  // cannot_inspect.
   repeated HttpBodyMode permitted_body_modes = 6;
   // One entry for each body mode that permitted_body_modes omits, with the
   // rule that removed it. A stage can tell a bodyless response, which it may
