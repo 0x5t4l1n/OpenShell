@@ -16,7 +16,14 @@ crates/*/tests/        # Rust integration tests
 python/openshell/      # Python unit tests (*_test.py suffix)
 e2e/python/            # Python E2E tests (test_*.py prefix)
 e2e/rust/              # Rust CLI E2E tests
+tests/suites/          # End-to-end suites, run by test plans
+tests/testkit/         # Shared support for the suites
+tests/runner/          # Test plan runner, with tests/{plans,environments}
+tests/tmachine/        # VM environments, provisioned with tests/ansible
 ```
+
+New end-to-end tests go under `tests/`. The suites in `e2e/` are being
+migrated there; `e2e/` only takes fixes until it is empty.
 
 ## Rust Tests
 
