@@ -110,16 +110,21 @@ impl GatewayRegistration {
 
     /// Host that both the gateway process and the host-networked Docker
     /// supervisor use to reach this machine: the host of the driver's
-    /// gateway endpoint.
+    /// gateway endpoint. Without one, the driver discovers the gateway on
+    /// loopback, which the host-networked supervisor shares.
     fn shared_host(config: &str) -> String {
         let driver = config
             .find("[openshell.drivers.docker]")
             .expect("gateway config has a Docker driver table");
-        let endpoint = config[driver..]
+        let Some(endpoint) = config[driver..]
             .lines()
+            .skip(1)
+            .take_while(|line| !line.trim_start().starts_with('['))
             .find_map(|line| line.trim().strip_prefix("grpc_endpoint = "))
-            .expect("Docker driver grpc_endpoint")
-            .trim_matches('"');
+        else {
+            return "127.0.0.1".to_string();
+        };
+        let endpoint = endpoint.trim_matches('"');
         let authority = endpoint
             .split_once("://")
             .map_or(endpoint, |(_, rest)| rest);
