@@ -16,8 +16,10 @@ on:
         type: string
       matrix:
         description: >-
-          JSON array of {"plan", "runner"} entries. A plan is a file stem in
-          tests/plans/ that selects the suites and environments to run.
+          JSON array of {"plan", "runner"} entries, each with an optional
+          "environment". A plan is a file stem in tests/plans/ that selects
+          the suites and environments to run; "environment" narrows an entry
+          to one of them, so environments run as parallel jobs.
         required: true
         type: string
 
@@ -34,7 +36,7 @@ concurrency:
 
 jobs:
   e2e-suites:
-    name: E2E suites (${{ matrix.plan }}, ${{ matrix.runner }})
+    name: E2E suites (${{ matrix.plan }}, ${{ matrix.environment || matrix.runner }})
     strategy:
       fail-fast: false
       matrix:
@@ -75,17 +77,22 @@ jobs:
       - name: Run suites
         env:
           PLAN: ${{ matrix.plan }}
+          ENVIRONMENT: ${{ matrix.environment || '' }}
         run: |
           # Retry dependency preparation, then run the plan once. The runner
           # builds the suites for the guest, so it needs no prepared archives.
           nix build --no-link .#test-runner || nix build --no-link .#test-runner
-          nix run .#test-runner -- test --plan "tests/plans/${PLAN}.yaml" --results artifacts/test-results
+          args=(test --plan "tests/plans/${PLAN}.yaml" --results artifacts/test-results)
+          if [[ -n "${ENVIRONMENT}" ]]; then
+            args+=(--env "${ENVIRONMENT}")
+          fi
+          nix run .#test-runner -- "${args[@]}"
 
       - name: Upload results
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
-          name: e2e-results-${{ matrix.plan }}-${{ matrix.runner }}
+          name: e2e-results-${{ matrix.plan }}-${{ matrix.environment || matrix.runner }}
           path: artifacts/test-results
           if-no-files-found: ignore
           retention-days: 7
