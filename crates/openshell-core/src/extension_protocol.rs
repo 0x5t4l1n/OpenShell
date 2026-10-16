@@ -400,6 +400,23 @@ fn valid_capability(value: &str) -> bool {
 mod tests {
     use super::*;
 
+    #[test]
+    fn compute_gateway_advertises_both_optional_extensions() {
+        let gateway = gateway_metadata(ExtensionFamily::Compute);
+        assert!(
+            gateway
+                .supported_capabilities
+                .iter()
+                .any(|c| c == COMPUTE_ISOLATION_BACKEND)
+        );
+        assert!(
+            gateway
+                .supported_capabilities
+                .iter()
+                .any(|c| c == COMPUTE_UPDATE_SANDBOX_IMAGE)
+        );
+    }
+
     fn compatible() -> (PeerMetadata, PeerMetadata) {
         let gateway = gateway_metadata(ExtensionFamily::Compute);
         let extension = extension_metadata(

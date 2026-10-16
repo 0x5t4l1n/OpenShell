@@ -619,7 +619,8 @@ impl openshell_core::compute::ComputeDriver for RemoteComputeDriver {
         tonic::Response<openshell_core::proto::compute::v1::UpdateSandboxImageResponse>,
         Status,
     > {
-        self.verify_admission_policy().await?;
+        // An image-only update does not install an external isolation route.
+        self.verify_admission_policy(false).await?;
         self.image_updates_client
             .clone()
             .update_sandbox_image(request)
@@ -17351,9 +17352,16 @@ endpoint = { kind = "unix", socket_path = "/run/agent-substrate/isolation.sock" 
                 .await
                 .is_err()
         );
+        let status = openshell_core::compute::ComputeDriver::update_sandbox_image(
+            &remote,
+            Request::new(openshell_core::proto::compute::v1::UpdateSandboxImageRequest::default()),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(status.code(), Code::FailedPrecondition);
         assert_eq!(
             driver.calls(),
-            vec![FakeComputeDriverCall::GetCapabilities; 3]
+            vec![FakeComputeDriverCall::GetCapabilities; 4]
         );
     }
 
@@ -17390,6 +17398,16 @@ endpoint = { kind = "unix", socket_path = "/run/agent-substrate/isolation.sock" 
             .await
             .unwrap();
             runtime.image_updates_enabled = true;
+            assert!(
+                !runtime
+                    .driver_info
+                    .negotiated_extension
+                    .supported_capabilities
+                    .iter()
+                    .any(|capability| capability
+                        == openshell_core::extension_protocol::COMPUTE_ISOLATION_BACKEND),
+                "image-only updates do not require external isolation registration"
+            );
             assert_eq!(
                 runtime
                     .driver_info
