@@ -196,7 +196,7 @@ impl From<Reply> for http_request_session_result::Result {
             Reply::OutputChunk(chunk) => Self::OutputChunk(chunk),
             Reply::Finish(finish) => Self::Finish(finish),
             Reply::Reject(reject) => Self::Reject(reject),
-            Reply::CannotInspect => Self::CannotInspect(HttpCannotInspect {}),
+            Reply::CannotInspect => Self::CannotInspect(HttpCannotInspect::default()),
         }
     }
 }
@@ -210,7 +210,7 @@ impl From<Reply> for http_response_session_result::Result {
             Reply::OutputChunk(chunk) => Self::OutputChunk(chunk),
             Reply::Finish(finish) => Self::Finish(finish),
             Reply::Reject(reject) => Self::BlockDelivery(reject),
-            Reply::CannotInspect => Self::CannotInspect(HttpCannotInspect {}),
+            Reply::CannotInspect => Self::CannotInspect(HttpCannotInspect::default()),
         }
     }
 }

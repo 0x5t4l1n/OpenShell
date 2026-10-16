@@ -34,13 +34,14 @@ use tokio::time::Instant;
 
 use openshell_core::proto::{
     Decision, HeaderMutation, HttpBegin, HttpBodyLimits, HttpBodyMode, HttpBodyModeUnavailable,
-    HttpBodyUnavailableReason, HttpBufferedBody, HttpBufferedResult, HttpFinish, HttpHeader,
-    HttpInputChunk, HttpInputEnd, HttpOutputChunk, HttpOutputStart, HttpPreflightResult,
-    HttpReject, HttpRequestSessionEvent, HttpRequestSessionPreflight, HttpResponsePreflightHead,
-    HttpResponseSessionEvent, HttpResponseSessionPreflight, MiddlewareDiagnostics,
-    MiddlewareSessionEnd, MiddlewareSessionEndReason, RequestContext, SupervisorMiddlewarePhase,
-    header_mutation, http_buffered_result, http_inspect, http_preflight_result,
-    http_request_session_event, http_request_session_preflight, http_response_session_event,
+    HttpBodyUnavailableReason, HttpBufferedBody, HttpBufferedResult, HttpCannotInspect, HttpFinish,
+    HttpHeader, HttpInputChunk, HttpInputEnd, HttpOutputChunk, HttpOutputStart,
+    HttpPreflightResult, HttpReject, HttpRequestSessionEvent, HttpRequestSessionPreflight,
+    HttpResponsePreflightHead, HttpResponseSessionEvent, HttpResponseSessionPreflight,
+    MiddlewareDiagnostics, MiddlewareSessionEnd, MiddlewareSessionEndReason, RequestContext,
+    SupervisorMiddlewarePhase, header_mutation, http_buffered_result, http_inspect,
+    http_preflight_result, http_request_session_event, http_request_session_preflight,
+    http_response_session_event,
 };
 
 use crate::headers::{self, HeaderAuthority};
@@ -475,7 +476,7 @@ pub(super) enum StageResult {
     OutputChunk(HttpOutputChunk),
     Finish(HttpFinish),
     Reject(HttpReject),
-    CannotInspect,
+    CannotInspect(HttpCannotInspect),
 }
 
 /// Results of one stage exchange. `None` is an unset or unknown result.
@@ -508,7 +509,7 @@ macro_rules! session_messages {
                     Wire::OutputChunk(chunk) => Self::OutputChunk(chunk),
                     Wire::Finish(finish) => Self::Finish(finish),
                     Wire::$denial(reject) => Self::Reject(reject),
-                    Wire::CannotInspect(_) => Self::CannotInspect,
+                    Wire::CannotInspect(result) => Self::CannotInspect(result),
                 }
             }
         }
@@ -1731,8 +1732,8 @@ fn closed_stream_failure(entry: &DescribedChainEntry, next: FirstResult) -> Http
         Some(Ok(Some(StageResult::Reject(reject)))) => {
             rejection(entry, reject.diagnostics.as_ref())
         }
-        Some(Ok(Some(StageResult::CannotInspect))) => {
-            entry_failure(entry, MIDDLEWARE_CANNOT_INSPECT)
+        Some(Ok(Some(StageResult::CannotInspect(result)))) => {
+            cannot_inspect(entry, result.diagnostics.as_ref())
         }
         Some(Err(status)) => status_failure(entry, &status),
         _ => entry_failure(entry, "middleware_stream_closed"),
@@ -2174,8 +2175,8 @@ pub(super) fn classify_result(
     next: FirstResult,
 ) -> Result<StageResult, HttpMiddlewareFailure> {
     match next {
-        Some(Ok(Some(StageResult::CannotInspect))) => {
-            Err(entry_failure(entry, MIDDLEWARE_CANNOT_INSPECT))
+        Some(Ok(Some(StageResult::CannotInspect(result)))) => {
+            Err(cannot_inspect(entry, result.diagnostics.as_ref()))
         }
         Some(Ok(Some(result))) => Ok(result),
         Some(Ok(None)) => Err(entry_failure(entry, "result_unknown")),
@@ -2375,6 +2376,26 @@ pub(super) fn rejection(
         end_reason: MiddlewareSessionEndReason::MiddlewareDenial,
         diagnostics: Box::new(retained),
     }
+}
+
+/// The stage cannot inspect the message, and the exchange fails closed. Its
+/// diagnostics are recorded like a rejection's, but the sandbox sees only
+/// `middleware_cannot_inspect`.
+fn cannot_inspect(
+    entry: &DescribedChainEntry,
+    diagnostics: Option<&MiddlewareDiagnostics>,
+) -> HttpMiddlewareFailure {
+    let diagnostics = match validate_diagnostics(entry, diagnostics) {
+        Ok(diagnostics) => diagnostics,
+        Err(failure) => return failure,
+    };
+    let mut failure = entry_failure(entry, MIDDLEWARE_CANNOT_INSPECT);
+    let reason_code = nonempty(&diagnostics.reason_code);
+    for invocation in &mut failure.diagnostics.invocations {
+        invocation.reason_code.clone_from(&reason_code);
+    }
+    collect_diagnostics(entry, diagnostics, &mut failure.diagnostics);
+    failure
 }
 
 /// The stage failed and the exchange fails closed.

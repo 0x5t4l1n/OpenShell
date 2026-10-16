@@ -383,7 +383,9 @@ message HttpBodyLimits {
   google.protobuf.Duration idle_timeout = 3;
 }
 
-// Preflight decision. To deny, return HttpReject instead.
+// Preflight decision. To deny, return reject (requests) or block_delivery
+// (responses) instead; to fail closed because the stage cannot inspect the
+// message, return cannot_inspect.
 message HttpPreflightResult {
   oneof decision {
     // Let the message continue without this stage seeing its body. For
@@ -508,7 +510,11 @@ message HttpReject {
 // so OpenShell fails the exchange closed and returns the platform-owned
 // failure_code middleware_cannot_inspect
 // to the sandbox. For uninspectable traffic, OpenShell refuses the connection.
-message HttpCannotInspect {}
+message HttpCannotInspect {
+  // Recorded for operators only. The reason and reason_code are never
+  // returned to the sandbox, which sees only middleware_cannot_inspect.
+  MiddlewareDiagnostics diagnostics = 1;
+}
 
 message MiddlewareDiagnostics {
   // Service text, never copied to denied responses or security logs. Maximum

@@ -306,7 +306,18 @@ impl InProcessMiddleware for ScriptedStage {
                             }
                             Preflight::CannotInspect => {
                                 result(http_request_session_result::Result::CannotInspect(
-                                    HttpCannotInspect {},
+                                    HttpCannotInspect {
+                                        diagnostics: Some(MiddlewareDiagnostics {
+                                            reason: "unknown archive format".into(),
+                                            reason_code: "format_unknown".into(),
+                                            findings: vec![openshell_core::proto::Finding {
+                                                r#type: "example.format".into(),
+                                                count: 1,
+                                                ..Default::default()
+                                            }],
+                                            ..Default::default()
+                                        }),
+                                    },
                                 ))
                             }
                             Preflight::Fail(code) => Err(tonic::Status::new(*code, "scripted")),
@@ -329,7 +340,7 @@ impl InProcessMiddleware for ScriptedStage {
                         if matches!(body, Body::CannotInspect) =>
                     {
                         result(http_request_session_result::Result::CannotInspect(
-                            HttpCannotInspect {},
+                            HttpCannotInspect::default(),
                         ))
                     }
                     Some(http_request_session_event::Event::BufferedBody(buffered)) => result(
@@ -1059,6 +1070,47 @@ async fn failures_name_the_failed_stage_and_a_platform_code() {
         .expect("preflight");
     assert!(rejected.denial.is_some());
     assert!(rejected.failure.is_none());
+}
+
+#[tokio::test]
+async fn cannot_inspect_diagnostics_are_recorded_but_not_returned() {
+    let (runner, described) = scripted_chain(vec![scripted(
+        "example/a",
+        Preflight::CannotInspect,
+        Body::Unchanged,
+    )])
+    .await;
+    let failed = runner
+        .preflight_described_http_request(described, request_input(b"hello"))
+        .await
+        .expect("preflight");
+    assert!(!failed.allowed);
+    assert!(failed.denial.is_none());
+    assert_eq!(
+        failed.failure,
+        Some(MiddlewareFailureDetail {
+            config_name: Some("example/a-config".into()),
+            code: HttpFailureCode::CannotInspect,
+        })
+    );
+    assert_eq!(
+        failed.reason,
+        "middleware_failed: middleware_cannot_inspect"
+    );
+    let findings: Vec<_> = failed
+        .diagnostics
+        .findings
+        .iter()
+        .map(|finding| finding.finding.r#type.as_str())
+        .collect();
+    assert_eq!(findings, ["example.format"]);
+    let invocation = &failed.diagnostics.invocations[0];
+    assert!(invocation.failed);
+    assert_eq!(invocation.reason_code.as_deref(), Some("format_unknown"));
+    assert_eq!(
+        invocation.failure_reason.as_deref(),
+        Some("middleware_cannot_inspect")
+    );
 }
 
 #[tokio::test]
