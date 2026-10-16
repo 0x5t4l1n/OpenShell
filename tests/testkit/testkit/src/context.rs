@@ -14,12 +14,14 @@ use openshell_sdk::{
 use rand::Rng;
 
 use crate::error::{Error, Result, ResultExt};
+use crate::poll::{Poll, poll_until};
 
 /// Sandbox creation includes image pulls on a cold environment.
 pub const READY_TIMEOUT: Duration = Duration::from_mins(10);
 pub const DELETE_TIMEOUT: Duration = Duration::from_mins(2);
 pub const EXEC_TIMEOUT: Duration = Duration::from_mins(2);
 const CLEANUP_TIMEOUT: Duration = Duration::from_mins(2);
+const STATUS_INTERVAL: Duration = Duration::from_secs(1);
 
 /// Names of sandboxes created by a test and not yet confirmed deleted.
 type Registry = Arc<Mutex<BTreeSet<String>>>;
@@ -215,6 +217,33 @@ impl Sandbox {
             snapshot.phase
         );
         Ok(snapshot)
+    }
+
+    /// Wait until the main process has finished: the sandbox is Completed or
+    /// in Error. Returns that snapshot; the test decides which outcome it
+    /// expects. Includes provisioning, so it uses the ready timeout.
+    pub async fn wait_finished(&self) -> Result<SandboxRef> {
+        poll_until(
+            &format!("sandbox {} to finish", self.name),
+            READY_TIMEOUT,
+            STATUS_INTERVAL,
+            async || {
+                let snapshot = self.get().await?;
+                Ok(match snapshot.phase {
+                    SandboxPhase::Completed | SandboxPhase::Error => Poll::Ready(snapshot),
+                    phase => Poll::Pending(format!("phase {phase:?}")),
+                })
+            },
+        )
+        .await
+    }
+
+    /// The sandbox's current state.
+    pub async fn get(&self) -> Result<SandboxRef> {
+        self.client
+            .get_sandbox(&self.name)
+            .await
+            .context(format!("get sandbox {}", self.name))
     }
 
     /// Run a command in the sandbox and buffer its output.
