@@ -430,10 +430,10 @@ building or booting anything, `--env` or `--suite` to narrow a plan, and
 reports and gateway logs for failures, go to
 `artifacts/test-results/<plan>/<environment>/<family>/`.
 
-Before running an environment's suites, the runner waits up to 60 seconds for
-its gateway to report healthy (`testkit-ready`, shipped in each bundle). A
-gateway that never becomes healthy is reported as an environment error, not as
-test failures.
+Before running an environment's suites, the runner waits up to five minutes for
+its gateway to report healthy and for the environment's CLI to reach it
+(`testkit-ready`, shipped in each bundle). Failing either is reported as an
+environment error, not as test failures.
 
 Environments are defined in `tests/environments/*.yaml`. tmachine boots guests
 of the host's architecture only, so the runner reports environments for other
@@ -470,8 +470,10 @@ Waived tests are skipped in every plan and listed in the run summary. Run with
 it has. Use waivers only for bugs: a feature an environment lacks is a missing
 capability, and running less on a given occasion is a choice of plan.
 
-Conformance suites (`tests/suites/conformance/`) are black-box tests that drive
-the gateway through the Rust SDK. Each suite is one test binary of
+Conformance suites (`tests/suites/conformance/`) are black-box tests of the
+public client interfaces: the gateway API through the Rust SDK, and the
+`openshell` CLI the environment installed. The suites are `sandbox-lifecycle`,
+`file-transfer`, and `policy-advisor`. Each suite is one test binary of
 `#[testkit::test]` functions. `testkit` (`tests/testkit/`) is the support
 library shared by every family: it reads the target, connects to the gateway,
 creates and cleans up sandboxes, and provides the attribute. The runner parses
@@ -503,6 +505,19 @@ which the API leaves to the platform. Check that something did not happen
 (for example, `restart_count` is 0 and a second read shows the same phase)
 instead of sleeping and watching. Behavior the docs leave to the compute
 driver needs a capability in `requires`.
+
+Act through the interface that makes the promise. Upload, download, connect,
+and port forwarding exist only in the CLI, so those tests call `cx.cli([...])`
+and assert through the SDK where they can; rely on the CLI's exit code and
+`--output json`, not its table text. For API calls the SDK does not wrap yet,
+such as settings and draft policy, add a testkit helper over the generated gRPC
+client rather than calling it from tests.
+
+Every environment provides its CLI: the installer's `openshell_client` role
+writes a `cli:` section (binary and gateway name) next to `gateway:` in the
+target, and `testkit-ready` checks that `openshell status` reports the gateway
+connected. The CLI is part of the target, not a capability, so CLI-driven tests
+run everywhere.
 
 The function name is the nextest test name and is what nextest filters
 select. Rename it when a clearer name helps; the ID keeps the history.

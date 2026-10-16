@@ -10,11 +10,11 @@ environments:
     runtime: docker-rootful
     installer: deb
     tmachine: { environment: ubuntu-docker-rootful, installer: deb }
-    capabilities: { compute_driver: docker, rootless: false, gpu: false }
+    capabilities: { compute_driver: docker, rootless: false, gpu: false, persistent_workspace: true }
   - id: tmachine.ubuntu2404-arm64.docker-rootful.deb
     backend: tmachine
     machine: { os: ubuntu, version: "24.04", arch: arm64 }
     runtime: docker-rootful
     installer: deb
     tmachine: { environment: ubuntu-docker-rootful, installer: deb }
-    capabilities: { compute_driver: docker, rootless: false, gpu: false }
+    capabilities: { compute_driver: docker, rootless: false, gpu: false, persistent_workspace: true }

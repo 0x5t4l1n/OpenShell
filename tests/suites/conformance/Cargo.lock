@@ -1103,6 +1103,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "openshell-conformance-file-transfer"
+version = "0.0.0"
+dependencies = [
+ "openshell-testkit",
+ "tempfile",
+]
+
+[[package]]
+name = "openshell-conformance-policy-advisor"
+version = "0.0.0"
+dependencies = [
+ "openshell-testkit",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "openshell-conformance-sandbox-lifecycle"
 version = "0.0.0"
 dependencies = [
@@ -1210,6 +1227,7 @@ dependencies = [
  "openshell-testkit-macros",
  "rand 0.9.4",
  "serde",
+ "serde_json",
  "tokio",
  "tonic",
 ]

@@ -241,7 +241,12 @@ mod tests {
                     && !test.description.is_empty())
         );
         // CLI-driven tests in the same workspace are not testkit suites.
-        assert!(family.suites.keys().all(|name| name != "file-transfer"));
+        assert!(
+            family
+                .suites
+                .values()
+                .all(|suite| suite.package != "openshell-test-conformance-cli")
+        );
     }
 
     #[test]

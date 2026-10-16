@@ -51,7 +51,7 @@ where
         .connect()
         .await
         .unwrap_or_else(|error| panic!("[{name}] {error}"));
-    let mut cx = Context::new(client.workspace(&target.workspace));
+    let mut cx = Context::new(&client, &target.workspace, target.cli());
     eprintln!("[{name}] run id {}", cx.run_id());
 
     let outcome = AssertUnwindSafe(body(&mut cx)).catch_unwind().await;

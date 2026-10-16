@@ -3,4 +3,4 @@
 
 [workspace]
 resolver = "2"
-members = ["cli", "sandbox-lifecycle"]
+members = ["cli", "file-transfer", "policy-advisor", "sandbox-lifecycle"]

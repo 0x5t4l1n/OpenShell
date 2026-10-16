@@ -21,7 +21,9 @@ use crate::report::{Outcome, Status, annotate_junit, junit_counts};
 const GATEWAY_SECTION: &str = "/etc/openshell-test/gateway.yaml";
 const GUEST_ROOT: &str = "/var/tmp/openshell-tests";
 /// How long the gateway has to become healthy after the environment is up.
-const READY_TIMEOUT_SECS: u64 = 60;
+// Matches the installers' own wait: an HA k3s gateway booted from a cached
+// disk can take minutes to report healthy.
+const READY_TIMEOUT_SECS: u64 = 300;
 
 pub struct Options<'a> {
     pub tmachine: &'a Config,

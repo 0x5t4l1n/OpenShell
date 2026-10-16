@@ -6,7 +6,7 @@
 //! Usage: `testkit-ready [TIMEOUT_SECS]` (default 60), with the target file
 //! named by `OPENSHELL_TEST_TARGET`. Run it once per environment before the
 //! test binaries; exits non-zero with the last error if the gateway is not
-//! healthy in time.
+//! healthy in time, or if the environment's CLI does not reach it.
 
 use std::process::ExitCode;
 use std::time::Duration;
@@ -25,13 +25,19 @@ async fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    let result = match Target::from_env() {
-        Ok(target) => target.wait_ready(Duration::from_secs(timeout)).await,
-        Err(error) => Err(error),
-    };
+    let result = async {
+        let target = Target::from_env()?;
+        let health = target.wait_ready(Duration::from_secs(timeout)).await?;
+        target.check_cli().await?;
+        testkit::Result::Ok(health)
+    }
+    .await;
     match result {
         Ok(health) => {
-            eprintln!("testkit-ready: gateway {} is healthy", health.version);
+            eprintln!(
+                "testkit-ready: gateway {} is healthy and the CLI reaches it",
+                health.version
+            );
             ExitCode::SUCCESS
         }
         Err(error) => {

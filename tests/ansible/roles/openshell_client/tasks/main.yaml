@@ -26,6 +26,11 @@
     path: "{{ openshell_client_config_dir }}/mtls/tls.crt"
   register: openshell_client_mtls
 
+- name: Find the installed OpenShell CLI
+  ansible.builtin.shell: command -v openshell
+  changed_when: false
+  register: openshell_client_binary
+
 - name: Create test target directory
   become: true
   ansible.builtin.file:
@@ -33,15 +38,18 @@
     state: directory
     mode: "0755"
 
-- name: Write gateway section of the test target
+- name: Write gateway and CLI sections of the test target
   become: true
   ansible.builtin.copy:
     dest: /etc/openshell-test/gateway.yaml
     mode: "0644"
     content: |
       # Written by the openshell_client role.
-      {{ {'gateway': openshell_client_target_gateway} | to_nice_yaml(indent=2) }}
+      {{ {'gateway': openshell_client_target_gateway, 'cli': openshell_client_target_cli} | to_nice_yaml(indent=2) }}
   vars:
+    openshell_client_target_cli:
+      binary: "{{ openshell_client_binary.stdout | trim }}"
+      gateway: "{{ openshell_client_gateway_name | default('tmachine') }}"
     openshell_client_target_tls:
       ca: "{{ openshell_client_config_dir }}/mtls/ca.crt"
       client_cert: "{{ openshell_client_config_dir }}/mtls/tls.crt"

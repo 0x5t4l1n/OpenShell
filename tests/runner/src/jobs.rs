@@ -203,7 +203,12 @@ impl FamilyJob {
             .iter()
             .filter(|suite| !suite.run.is_empty())
             .map(|suite| {
-                let binary = format!("binary(={})", suite.suite.binary);
+                // Name the package too: other packages in the family can have test
+                // binaries with the same name.
+                let binary = format!(
+                    "binary_id(={}::{})",
+                    suite.suite.package, suite.suite.binary
+                );
                 if suite.excluded.is_empty() {
                     binary
                 } else {
@@ -309,7 +314,7 @@ mod tests {
         );
         assert_eq!(
             jobs[0].families[0].filterset(),
-            "(binary(=sandbox_lifecycle) & (test(=long_running)))"
+            "(binary_id(=pkg-sandbox-lifecycle::sandbox_lifecycle) & (test(=long_running)))"
         );
     }
 
@@ -328,7 +333,7 @@ mod tests {
         assert_eq!(suites, ["providers", "sandbox-lifecycle"]);
         assert_eq!(
             jobs[0].families[0].filterset(),
-            "binary(=providers) | (binary(=sandbox_lifecycle) & (test(=long_running)))"
+            "binary_id(=pkg-providers::providers) | (binary_id(=pkg-sandbox-lifecycle::sandbox_lifecycle) & (test(=long_running)))"
         );
     }
 
@@ -363,7 +368,10 @@ mod tests {
         .unwrap();
         assert_eq!(jobs.len(), 1);
         assert_eq!(jobs[0].families[0].suites.len(), 1);
-        assert_eq!(jobs[0].families[0].filterset(), "binary(=providers)");
+        assert_eq!(
+            jobs[0].families[0].filterset(),
+            "binary_id(=pkg-providers::providers)"
+        );
     }
 
     #[test]

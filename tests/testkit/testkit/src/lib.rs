@@ -23,14 +23,17 @@
 //! Tests read the system under test from the target file named by
 //! `OPENSHELL_TEST_TARGET` (see [`target`]).
 
+mod cli;
 mod context;
 mod error;
 mod poll;
 mod run;
 pub mod target;
 
+pub use cli::{CLI_TIMEOUT, Cli, CliOutput};
 pub use context::{
-    Context, DELETE_TIMEOUT, EXEC_TIMEOUT, ExecOutput, READY_TIMEOUT, Sandbox, SandboxBuilder,
+    Context, DELETE_TIMEOUT, EXEC_TIMEOUT, ExecOutput, READY_TIMEOUT, STOP_TIMEOUT, Sandbox,
+    SandboxBuilder,
 };
 pub use error::{Error, Result, ResultExt};
 pub use openshell_sdk as sdk;

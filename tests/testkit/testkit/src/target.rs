@@ -13,6 +13,9 @@
 //!     ca: ca.crt
 //!     client_cert: client.crt
 //!     client_key: client.key
+//! cli:
+//!   binary: /usr/bin/openshell   # default: `openshell` on PATH
+//!   gateway: tmachine            # the name the gateway is registered under
 //! workspace: default
 //! capabilities:
 //!   compute_driver: docker
@@ -28,6 +31,7 @@ use openshell_sdk::{
 use serde::Deserialize;
 use tonic::transport::{Certificate, ClientTlsConfig, Endpoint, Identity};
 
+use crate::cli::Cli;
 use crate::error::{Error, Result, ResultExt};
 
 /// Environment variable naming the target file.
@@ -37,6 +41,11 @@ pub const TARGET_ENV: &str = "OPENSHELL_TEST_TARGET";
 #[serde(deny_unknown_fields)]
 pub struct Target {
     pub gateway: Gateway,
+    /// The CLI the environment installed. Every environment provides one;
+    /// it is optional here only so SDK-only suites can run against a
+    /// hand-written target.
+    #[serde(default)]
+    pub cli: Option<CliTarget>,
     #[serde(default = "default_workspace")]
     pub workspace: String,
     #[serde(default)]
@@ -65,6 +74,22 @@ pub struct Tls {
     pub client_key: Option<PathBuf>,
 }
 
+/// The installed `openshell` CLI, configured for the target's gateway.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CliTarget {
+    /// A path, resolved like other target paths, or a name found on PATH.
+    #[serde(default = "default_cli_binary")]
+    pub binary: PathBuf,
+    /// The gateway name to select. Omit to use the CLI's active gateway.
+    #[serde(default)]
+    pub gateway: Option<String>,
+}
+
+fn default_cli_binary() -> PathBuf {
+    PathBuf::from("openshell")
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Auth {
@@ -83,6 +108,10 @@ pub struct Capabilities {
     pub gpu: bool,
     #[serde(default)]
     pub service_exposure: bool,
+    /// Files in the sandbox workspace survive stop and start. The docs leave
+    /// this to the compute driver.
+    #[serde(default)]
+    pub persistent_workspace: bool,
 }
 
 /// A capability a test can require with `#[testkit::test(requires = [...])]`.
@@ -92,6 +121,7 @@ pub struct Capabilities {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Capability {
     Gpu,
+    PersistentWorkspace,
     ServiceExposure,
 }
 
@@ -99,6 +129,7 @@ impl Capability {
     pub const fn name(self) -> &'static str {
         match self {
             Self::Gpu => "gpu",
+            Self::PersistentWorkspace => "persistent_workspace",
             Self::ServiceExposure => "service_exposure",
         }
     }
@@ -108,6 +139,7 @@ impl Capabilities {
     pub const fn provides(&self, capability: Capability) -> bool {
         match capability {
             Capability::Gpu => self.gpu,
+            Capability::PersistentWorkspace => self.persistent_workspace,
             Capability::ServiceExposure => self.service_exposure,
         }
     }
@@ -173,6 +205,39 @@ impl Target {
 
     fn resolve(&self, path: &Path) -> PathBuf {
         self.base_dir.join(path)
+    }
+
+    /// The target's CLI. Fails if the target file has no `cli` section.
+    pub fn cli(&self) -> Result<Cli> {
+        let cli = self.cli.as_ref().ok_or_else(|| {
+            Error::msg("the target file has no `cli` section; the environment must provide its CLI")
+        })?;
+        // A bare name is looked up on PATH; anything with a separator is a
+        // path relative to the target file.
+        let binary = if cli.binary.components().count() > 1 {
+            self.resolve(&cli.binary)
+        } else {
+            cli.binary.clone()
+        };
+        Ok(Cli::new(cli, binary))
+    }
+
+    /// Check that the target's CLI reaches the gateway: `openshell status`
+    /// must report it connected.
+    pub async fn check_cli(&self) -> Result {
+        let output = self
+            .cli()?
+            .run(["status", "--output", "json"])
+            .await?
+            .success()?;
+        let status: serde_json::Value = output.json()?;
+        crate::ensure!(
+            status["status"] == "connected",
+            "`{}` reports {}",
+            output.command,
+            status
+        );
+        Ok(())
     }
 
     fn read(&self, path: &Path) -> Result<Vec<u8>> {
@@ -305,6 +370,29 @@ mod tests {
         let target = parse("gateway:\n  endpoint: http://127.0.0.1:17670\n").unwrap();
         assert!(target.gateway.tls.is_none());
         assert!(!target.capabilities.provides(Capability::ServiceExposure));
+    }
+
+    #[test]
+    fn parses_cli_section() {
+        let target = parse(
+            "gateway:\n  endpoint: http://x\ncli:\n  binary: bin/openshell\n  gateway: tmachine\n",
+        )
+        .unwrap();
+        let cli = target.cli.as_ref().unwrap();
+        assert_eq!(cli.gateway.as_deref(), Some("tmachine"));
+        assert!(target.cli().is_ok());
+
+        let target = parse("gateway:\n  endpoint: http://x\ncli: {}\n").unwrap();
+        assert_eq!(
+            target.cli.as_ref().unwrap().binary,
+            PathBuf::from("openshell")
+        );
+
+        let err = parse("gateway:\n  endpoint: http://x\n")
+            .unwrap()
+            .cli()
+            .unwrap_err();
+        assert!(err.to_string().contains("no `cli` section"), "{err}");
     }
 
     #[test]
