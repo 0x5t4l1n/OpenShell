@@ -1820,6 +1820,14 @@ impl ChainRunner {
         reserve_until(&self.registry.http_session_admission, deadline).await
     }
 
+    /// Take one HTTP session hook STREAM slot if one is free now.
+    fn try_reserve_http_stream(&self) -> Option<MiddlewareSessionPermit> {
+        Arc::clone(&self.registry.http_stream_admission)
+            .try_acquire_owned()
+            .ok()
+            .map(|permit| MiddlewareSessionPermit { _session: permit })
+    }
+
     /// Wait until `deadline` for one HTTP session hook STREAM slot.
     async fn reserve_http_stream(
         &self,

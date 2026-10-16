@@ -916,6 +916,82 @@ async fn preflight_waits_for_a_session_slot_within_the_chain_deadline() {
     assert!(!admitted.session_capacity_exhausted);
 }
 
+#[tokio::test(start_paused = true)]
+async fn waiting_for_a_stream_slot_does_not_hold_a_preflight_slot() {
+    use HttpBodyMode::{Buffered, Stream};
+    let (runner, described) = scripted_chain(vec![
+        scripted(
+            "example/stream",
+            Preflight::Inspect(Stream),
+            Body::Uppercase,
+        ),
+        scripted(
+            "example/buffered",
+            Preflight::Inspect(Buffered),
+            Body::Unchanged,
+        ),
+    ])
+    .await;
+    let streaming = described[..1].to_vec();
+    let buffered = described[1..].to_vec();
+    let mut held = Arc::clone(&runner.registry.http_stream_admission)
+        .acquire_many_owned(
+            u32::try_from(MAX_CONCURRENT_HTTP_MIDDLEWARE_STREAMS).expect("slot count"),
+        )
+        .await
+        .expect("hold every stream slot");
+
+    // Enough waiting STREAM messages to take every preflight slot if they
+    // kept theirs, plus one that also buffers.
+    let spawn = |described: Vec<DescribedChainEntry>| {
+        let runner = runner.clone();
+        tokio::spawn(async move {
+            runner
+                .preflight_described_http_request(described, request_input(b"hello"))
+                .await
+        })
+    };
+    let waiting: Vec<_> = (0..MAX_CONCURRENT_HTTP_MIDDLEWARE_SESSIONS)
+        .map(|_| spawn(streaming.clone()))
+        .collect();
+    let mixed = spawn(described.clone());
+    tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+    assert!(waiting.iter().all(|message| !message.is_finished()));
+    assert!(!mixed.is_finished());
+    assert_eq!(
+        free_slots(&runner),
+        (MAX_CONCURRENT_HTTP_MIDDLEWARE_SESSIONS, 0),
+        "waiting messages hold no preflight slot",
+    );
+
+    let started = tokio::time::Instant::now();
+    let short = runner
+        .preflight_described_http_request(buffered, request_input(b"hello"))
+        .await
+        .expect("preflight");
+    assert!(short.allowed, "{}", short.reason);
+    assert!(!short.session_capacity_exhausted);
+    assert_eq!(started.elapsed(), std::time::Duration::ZERO);
+    drop(short);
+
+    // A freed stream slot goes to the first waiter; the mixed message takes
+    // a preflight slot back once it has a stream slot.
+    for message in &waiting {
+        message.abort();
+    }
+    for message in waiting {
+        assert!(message.await.is_err_and(|error| error.is_cancelled()));
+    }
+    drop(held.split(1));
+    let mixed = mixed.await.expect("task").expect("preflight");
+    assert!(mixed.allowed, "{}", mixed.reason);
+    assert!(mixed.session.is_some());
+    assert_eq!(
+        free_slots(&runner),
+        (MAX_CONCURRENT_HTTP_MIDDLEWARE_SESSIONS - 1, 0),
+    );
+}
+
 #[tokio::test]
 async fn failures_name_the_failed_stage_and_a_platform_code() {
     for (case, preflight, code) in [

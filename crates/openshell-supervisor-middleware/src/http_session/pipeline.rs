@@ -1003,22 +1003,48 @@ impl ChainRunner {
     /// Move a message whose stages selected body modes from its preflight
     /// `slot` onto the budgets its body runs under. A STREAM stage needs a
     /// stream slot, waited for until `deadline`. The preflight slot stays
-    /// only while a BUFFERED stage runs. When no stream slot frees up in time,
-    /// every stage is cancelled and `None` is returned.
+    /// only while a BUFFERED stage runs. When no slot frees up in time, every
+    /// stage is cancelled and `None` is returned.
+    ///
+    /// A message never waits for a stream slot while holding a preflight
+    /// slot: messages queued behind open streams would otherwise starve every
+    /// preflight. When it has to wait, it releases the preflight slot and,
+    /// if a BUFFERED stage runs, takes one again after the stream slot. No
+    /// message holds a preflight slot while waiting for a stream slot, so the
+    /// two waits cannot deadlock.
     pub(super) async fn admit_body(
         &self,
         mut pipeline: Pipeline,
         slot: MiddlewareSessionPermit,
         deadline: Instant,
     ) -> Option<Pipeline> {
-        if pipeline.streams() {
+        if !pipeline.streams() {
+            if pipeline.buffers() {
+                pipeline.admission.buffered = Some(slot);
+            }
+            return Some(pipeline);
+        }
+        let (stream, slot) = if let Some(stream) = self.try_reserve_http_stream() {
+            (stream, Some(slot))
+        } else {
+            drop(slot);
             let Some(stream) = self.reserve_http_stream(deadline).await else {
                 pipeline.end(MiddlewareSessionEndReason::Cancellation).await;
                 return None;
             };
-            pipeline.admission.stream = Some(stream);
-        }
+            (stream, None)
+        };
+        pipeline.admission.stream = Some(stream);
         if pipeline.buffers() {
+            let slot = if slot.is_some() {
+                slot
+            } else {
+                self.reserve_http_session(deadline).await
+            };
+            let Some(slot) = slot else {
+                pipeline.end(MiddlewareSessionEndReason::Cancellation).await;
+                return None;
+            };
             pipeline.admission.buffered = Some(slot);
         }
         Some(pipeline)
