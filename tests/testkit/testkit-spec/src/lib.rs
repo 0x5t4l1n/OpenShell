@@ -60,13 +60,13 @@ pub fn parse(args: TokenStream, item: &ItemFn) -> syn::Result<TestSpec> {
     if item.sig.asyncness.is_none() {
         return Err(syn::Error::new_spanned(
             item.sig.fn_token,
-            "conformance tests must be `async fn`",
+            "testkit tests must be `async fn`",
         ));
     }
     if item.sig.inputs.len() != 1 {
         return Err(syn::Error::new_spanned(
             &item.sig.inputs,
-            "conformance tests take exactly one argument: `cx: &mut testkit::Context`",
+            "testkit tests take exactly one argument: `cx: &mut testkit::Context`",
         ));
     }
 
@@ -74,7 +74,7 @@ pub fn parse(args: TokenStream, item: &ItemFn) -> syn::Result<TestSpec> {
     if description.is_empty() {
         return Err(syn::Error::new(
             item.sig.ident.span(),
-            "conformance tests need a doc comment describing the behavior they verify",
+            "testkit tests need a doc comment describing the behavior they verify",
         ));
     }
 
@@ -207,7 +207,7 @@ mod tests {
             async fn exposed(cx: &mut Context) -> testkit::Result { Ok(()) }
 
             #[test]
-            fn not_a_conformance_test() {}
+            fn not_a_testkit_test() {}
 
             async fn helper(cx: &mut Context) {}
             ",

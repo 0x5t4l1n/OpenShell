@@ -1,11 +1,11 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Shared support for `OpenShell` conformance tests.
+//! Shared support for `OpenShell` end-to-end test suites.
 //!
-//! Conformance tests are black-box tests of a running `OpenShell` system,
-//! driven through the Rust SDK. Each test is an `async fn` marked
-//! `#[testkit::test]`:
+//! The suites under `tests/suites/` (conformance and the other families) test
+//! a running `OpenShell` system through the Rust SDK. Each test is an
+//! `async fn` marked `#[testkit::test]`:
 //!
 //! ```ignore
 //! use testkit::Context;

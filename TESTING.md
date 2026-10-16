@@ -429,7 +429,10 @@ architectures as unsupported instead of failing.
 
 Conformance suites (`tests/suites/conformance/`) are black-box tests that drive
 the gateway through the Rust SDK. Each suite is one test binary of
-`#[testkit::test]` functions:
+`#[testkit::test]` functions. `testkit` (`tests/testkit/`) is the support
+library shared by every family: it reads the target, connects to the gateway,
+creates and cleans up sandboxes, and provides the attribute. The runner parses
+tests with the same `testkit-spec` crate as the attribute.
 
 ```rust
 /// A long-running sandbox becomes ready, runs a command with exec, and is gone

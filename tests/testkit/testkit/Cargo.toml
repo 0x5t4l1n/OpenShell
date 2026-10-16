@@ -3,7 +3,7 @@
 
 [package]
 name = "openshell-testkit"
-description = "Shared support for OpenShell conformance tests"
+description = "Shared support for OpenShell end-to-end test suites"
 version = "0.0.0"
 edition = "2024"
 rust-version = "1.94"
@@ -15,7 +15,7 @@ publish = false
 name = "testkit"
 
 [dependencies]
-openshell-sdk = { path = "../../../../crates/openshell-sdk" }
+openshell-sdk = { path = "../../../crates/openshell-sdk" }
 openshell-testkit-macros = { path = "../testkit-macros" }
 futures = "0.3"
 rand = "0.9"

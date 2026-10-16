@@ -50,9 +50,9 @@ impl Context {
         &self.client
     }
 
-    /// A resource name unique to this run: `ct-<run-id>-<suffix>`.
+    /// A resource name unique to this run: `test-<run-id>-<suffix>`.
     pub fn name(&self, suffix: &str) -> String {
-        format!("ct-{}-{suffix}", self.run_id)
+        format!("test-{}-{suffix}", self.run_id)
     }
 
     /// Start describing a sandbox named `cx.name(suffix)`.

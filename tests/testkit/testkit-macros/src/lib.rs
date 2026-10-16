@@ -3,7 +3,7 @@
 
 //! The `#[testkit::test]` attribute.
 //!
-//! A conformance test is an `async fn` taking `&mut testkit::Context` and
+//! A test is an `async fn` taking `&mut testkit::Context` and
 //! returning `testkit::Result`. Its doc comment is the test's description and
 //! is required. The function name is the test ID. Requirements are named
 //! after target capabilities:

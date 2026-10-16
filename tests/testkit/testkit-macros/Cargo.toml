@@ -3,7 +3,7 @@
 
 [package]
 name = "openshell-testkit-macros"
-description = "The #[testkit::test] attribute for OpenShell conformance tests"
+description = "The #[testkit::test] attribute for OpenShell end-to-end test suites"
 version = "0.0.0"
 edition = "2024"
 rust-version = "1.94"
