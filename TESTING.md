@@ -432,6 +432,37 @@ Environments are defined in `tests/environments/*.yaml`. tmachine boots guests
 of the host's architecture only, so the runner reports environments for other
 architectures as unsupported instead of failing.
 
+Nobody lists which tests run where. A test is expected in every environment
+whose capabilities include everything the test `requires`; plans only choose
+which of those to run. To see where each test runs, or why it doesn't, run:
+
+```shell
+nix run .#test-runner -- matrix          # add --host to apply this machine's limits
+```
+
+`matrix` and `test` fail if a test runs in no defined environment, or if tests
+require a capability that no environment declares. When you add a capability,
+declare it in every environment that provides it in the same change. If you
+are unsure whether an environment provides it, declare it: a wrong claim shows
+up as a test failure, while a wrong omission silently drops coverage.
+
+To skip a test where it fails because of a known bug, add a waiver to
+`tests/waivers.yaml` with the test's ID, an environment selector, the issue
+tracking the bug, and a reason:
+
+```yaml
+waivers:
+  - test: t-3tfdx240
+    environments: { runtime: podman-rootless }   # fields of the environment; omit for all
+    issue: https://github.com/NVIDIA/OpenShell/issues/NNNN
+    reason: what fails, and where
+```
+
+Waived tests are skipped in every plan and listed in the run summary. Run with
+`--ignore-waivers` to check whether a fix landed, and remove the waiver when
+it has. Use waivers only for bugs: a feature an environment lacks is a missing
+capability, and running less on a given occasion is a choice of plan.
+
 Conformance suites (`tests/suites/conformance/`) are black-box tests that drive
 the gateway through the Rust SDK. Each suite is one test binary of
 `#[testkit::test]` functions. `testkit` (`tests/testkit/`) is the support

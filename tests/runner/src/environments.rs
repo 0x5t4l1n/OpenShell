@@ -71,6 +71,70 @@ pub struct Tmachine {
     pub installer: String,
 }
 
+/// Selects environments by their fields. An omitted field matches any value,
+/// so an empty selector matches every environment.
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct Selector {
+    pub id: Option<String>,
+    pub backend: Option<Backend>,
+    pub os: Option<String>,
+    pub version: Option<String>,
+    pub arch: Option<Arch>,
+    pub runtime: Option<String>,
+    pub installer: Option<String>,
+}
+
+impl Selector {
+    pub fn matches(&self, environment: &Environment) -> bool {
+        self.id.as_ref().is_none_or(|id| *id == environment.id)
+            && self
+                .backend
+                .is_none_or(|backend| backend == environment.backend)
+            && self
+                .os
+                .as_ref()
+                .is_none_or(|os| *os == environment.machine.os)
+            && self
+                .version
+                .as_ref()
+                .is_none_or(|version| *version == environment.machine.version)
+            && self
+                .arch
+                .is_none_or(|arch| arch == environment.machine.arch)
+            && self
+                .runtime
+                .as_ref()
+                .is_none_or(|runtime| *runtime == environment.runtime)
+            && self
+                .installer
+                .as_ref()
+                .is_none_or(|installer| *installer == environment.installer)
+    }
+}
+
+impl fmt::Display for Selector {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let fields: Vec<String> = [
+            ("id", self.id.clone()),
+            ("backend", self.backend.map(|backend| backend.to_string())),
+            ("os", self.os.clone()),
+            ("version", self.version.clone()),
+            ("arch", self.arch.map(|arch| arch.to_string())),
+            ("runtime", self.runtime.clone()),
+            ("installer", self.installer.clone()),
+        ]
+        .into_iter()
+        .filter_map(|(name, value)| value.map(|value| format!("{name}={value}")))
+        .collect();
+        if fields.is_empty() {
+            f.write_str("all environments")
+        } else {
+            f.write_str(&fields.join(", "))
+        }
+    }
+}
+
 impl fmt::Display for Backend {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
@@ -273,6 +337,25 @@ environments:
             .unwrap();
         assert_eq!(env.unsupported_reason(Some(Arch::Amd64)), None);
         assert!(env.unsupported_reason(Some(Arch::Arm64)).is_some());
+    }
+
+    #[test]
+    fn selectors_match_by_field() {
+        let catalog = catalog(UBUNTU_DOCKER).unwrap();
+        let env = catalog
+            .get("tmachine.ubuntu2404-amd64.docker-rootful.deb")
+            .unwrap();
+        let select = |yaml: &str| serde_yml::from_str::<Selector>(yaml).unwrap();
+        assert!(select("{}").matches(env));
+        assert!(select("{ runtime: docker-rootful, arch: amd64 }").matches(env));
+        assert!(!select("{ runtime: docker-rootful, arch: arm64 }").matches(env));
+        assert!(!select("{ installer: rpm }").matches(env));
+        assert_eq!(select("{}").to_string(), "all environments");
+        assert_eq!(
+            select("{ arch: amd64, runtime: docker-rootful }").to_string(),
+            "arch=amd64, runtime=docker-rootful"
+        );
+        assert!(serde_yml::from_str::<Selector>("{ runtme: x }").is_err());
     }
 
     #[test]

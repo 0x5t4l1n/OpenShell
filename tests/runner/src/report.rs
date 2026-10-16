@@ -14,6 +14,8 @@ pub struct Outcome {
     pub status: Status,
     /// Tests excluded because the environment lacks a capability.
     pub unsupported_tests: usize,
+    /// Tests a waiver skips in this environment.
+    pub waived_tests: usize,
 }
 
 #[derive(Debug)]
@@ -124,10 +126,17 @@ pub fn summary(outcomes: &[Outcome]) -> String {
             }
             Status::Error(error) => format!("ERROR       {error}"),
         };
-        let unsupported = if outcome.unsupported_tests > 0 {
-            format!(" ({} tests unsupported)", outcome.unsupported_tests)
-        } else {
+        let mut excluded = Vec::new();
+        if outcome.unsupported_tests > 0 {
+            excluded.push(format!("{} tests unsupported", outcome.unsupported_tests));
+        }
+        if outcome.waived_tests > 0 {
+            excluded.push(format!("{} waived", outcome.waived_tests));
+        }
+        let unsupported = if excluded.is_empty() {
             String::new()
+        } else {
+            format!(" ({})", excluded.join(", "))
         };
         let _ = writeln!(
             out,
@@ -194,16 +203,20 @@ mod tests {
                 family: "conformance".to_string(),
                 status: Status::Passed { tests: 2 },
                 unsupported_tests: 1,
+                waived_tests: 1,
             },
             Outcome {
                 environment: "env-b".to_string(),
                 family: "conformance".to_string(),
                 status: Status::Unsupported("arch".to_string()),
                 unsupported_tests: 0,
+                waived_tests: 0,
             },
         ]);
         assert!(
-            text.contains("env-a / conformance: PASS        2 passed (1 tests unsupported)"),
+            text.contains(
+                "env-a / conformance: PASS        2 passed (1 tests unsupported, 1 waived)"
+            ),
             "{text}"
         );
         assert!(

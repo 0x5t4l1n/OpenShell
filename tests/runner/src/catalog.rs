@@ -66,6 +66,16 @@ impl Catalog {
         Ok(catalog)
     }
 
+    /// Every test, with its family and suite.
+    pub fn tests(&self) -> impl Iterator<Item = (&Family, &Suite, &Test)> {
+        self.families.values().flat_map(|family| {
+            family
+                .suites
+                .values()
+                .flat_map(move |suite| suite.tests.iter().map(move |test| (family, suite, test)))
+        })
+    }
+
     /// Fail if two tests anywhere in the catalog share an ID.
     fn check_unique_ids(&self) -> Result<()> {
         let mut seen: BTreeMap<&str, String> = BTreeMap::new();

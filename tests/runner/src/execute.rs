@@ -14,6 +14,7 @@ use tmachine::config::Config;
 
 use crate::bundle::{Bundle, PROFILE, READY_BINARY};
 use crate::jobs::{FamilyJob, Job};
+use crate::matrix::Exclusion;
 use crate::report::{Outcome, Status, annotate_junit, junit_counts};
 
 /// Where the installer describes the gateway in the guest.
@@ -29,6 +30,15 @@ pub struct Options<'a> {
     pub keep: bool,
 }
 
+fn count(family: &FamilyJob, kind: impl Fn(&Exclusion) -> bool) -> usize {
+    family
+        .suites
+        .iter()
+        .flat_map(|suite| &suite.excluded)
+        .filter(|test| kind(&test.reason))
+        .count()
+}
+
 /// Run one job. Every family gets an outcome, even when provisioning fails.
 pub async fn run(job: &Job, options: &Options<'_>) -> Vec<Outcome> {
     let env_id = &job.environment.id;
@@ -36,11 +46,8 @@ pub async fn run(job: &Job, options: &Options<'_>) -> Vec<Outcome> {
         environment: env_id.clone(),
         family: family.family.clone(),
         status,
-        unsupported_tests: family
-            .suites
-            .iter()
-            .map(|suite| suite.unsupported.len())
-            .sum(),
+        unsupported_tests: count(family, |reason| matches!(reason, Exclusion::Missing(_))),
+        waived_tests: count(family, |reason| matches!(reason, Exclusion::Waived(_))),
     };
 
     if let Some(reason) = &job.unsupported {

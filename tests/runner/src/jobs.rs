@@ -5,9 +5,9 @@
 //!
 //! Jobs are grouped by environment so each environment is provisioned once
 //! and runs every family and suite the plan selects for it. Tests whose
-//! requirements the environment lacks are excluded by exact name and
-//! reported as unsupported; libtest has no runtime skip, so this is the only
-//! place they can be skipped honestly.
+//! requirements the environment lacks, or that a waiver skips there, are
+//! excluded by exact name and reported with the reason; libtest has no
+//! runtime skip, so this is the only place they can be skipped honestly.
 
 use std::collections::BTreeMap;
 
@@ -15,7 +15,9 @@ use anyhow::{Result, bail};
 
 use crate::catalog::{Catalog, Suite};
 use crate::environments::{Arch, Catalog as Environments, Environment};
+use crate::matrix::{Exclusion, exclusion};
 use crate::plan::Plan;
+use crate::waivers::Waivers;
 
 /// Everything the plan runs in one environment.
 #[derive(Debug)]
@@ -38,14 +40,14 @@ pub struct SuiteJob {
     pub suite: Suite,
     /// Names of the tests to run.
     pub run: Vec<String>,
-    /// Tests excluded because the environment lacks a capability they need.
-    pub unsupported: Vec<UnsupportedTest>,
+    /// Tests excluded in this environment, with the reason.
+    pub excluded: Vec<ExcludedTest>,
 }
 
 #[derive(Debug)]
-pub struct UnsupportedTest {
+pub struct ExcludedTest {
     pub name: String,
-    pub missing: Vec<String>,
+    pub reason: Exclusion,
 }
 
 /// Filters applied on top of the plan, from the command line.
@@ -60,6 +62,7 @@ pub fn expand(
     plan: &Plan,
     catalog: &Catalog,
     environments: &Environments,
+    waivers: &Waivers,
     host: Option<Arch>,
     narrowing: &Narrowing,
 ) -> Result<Vec<Job>> {
@@ -128,7 +131,13 @@ pub fn expand(
             let suites: Vec<SuiteJob> = suites
                 .iter()
                 .filter(|suite| narrowing.suites.is_empty() || narrowing.suites.contains(suite))
-                .map(|suite| suite_job(family.suite(suite).expect("validated above"), &environment))
+                .map(|suite| {
+                    suite_job(
+                        family.suite(suite).expect("validated above"),
+                        &environment,
+                        waivers,
+                    )
+                })
                 .collect();
             if !suites.is_empty() {
                 family_jobs.push(FamilyJob {
@@ -149,35 +158,23 @@ pub fn expand(
     Ok(jobs)
 }
 
-fn suite_job(suite: &Suite, environment: &Environment) -> SuiteJob {
+fn suite_job(suite: &Suite, environment: &Environment, waivers: &Waivers) -> SuiteJob {
     let mut run = Vec::new();
-    let mut unsupported = Vec::new();
+    let mut excluded = Vec::new();
     for test in &suite.tests {
-        let missing: Vec<String> = test
-            .requires
-            .iter()
-            .filter(|capability| !provides(environment, capability))
-            .cloned()
-            .collect();
-        if missing.is_empty() {
-            run.push(test.name.clone());
-        } else {
-            unsupported.push(UnsupportedTest {
+        match exclusion(test, environment, waivers) {
+            None => run.push(test.name.clone()),
+            Some(reason) => excluded.push(ExcludedTest {
                 name: test.name.clone(),
-                missing,
-            });
+                reason,
+            }),
         }
     }
     SuiteJob {
         suite: suite.clone(),
         run,
-        unsupported,
+        excluded,
     }
-}
-
-/// Requirements name boolean capabilities.
-fn provides(environment: &Environment, capability: &str) -> bool {
-    environment.capabilities.get(capability) == Some(&serde_yml::Value::Bool(true))
 }
 
 impl FamilyJob {
@@ -207,7 +204,7 @@ impl FamilyJob {
             .filter(|suite| !suite.run.is_empty())
             .map(|suite| {
                 let binary = format!("binary(={})", suite.suite.binary);
-                if suite.unsupported.is_empty() {
+                if suite.excluded.is_empty() {
                     binary
                 } else {
                     let tests = suite
@@ -289,6 +286,7 @@ mod tests {
             &Plan::parse(yaml).unwrap(),
             &catalog(),
             &environments(),
+            &Waivers::default(),
             Some(Arch::Amd64),
             narrowing,
         )
@@ -304,8 +302,11 @@ mod tests {
         assert_eq!(jobs.len(), 1);
         let suite = &jobs[0].families[0].suites[0];
         assert_eq!(suite.run, ["long_running"]);
-        assert_eq!(suite.unsupported[0].name, "expose");
-        assert_eq!(suite.unsupported[0].missing, ["service_exposure"]);
+        assert_eq!(suite.excluded[0].name, "expose");
+        assert_eq!(
+            suite.excluded[0].reason,
+            Exclusion::Missing(vec!["service_exposure".to_string()])
+        );
         assert_eq!(
             jobs[0].families[0].filterset(),
             "(binary(=sandbox_lifecycle) & (test(=long_running)))"

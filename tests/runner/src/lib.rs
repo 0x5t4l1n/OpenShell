@@ -10,5 +10,7 @@ pub mod catalog;
 pub mod environments;
 pub mod execute;
 pub mod jobs;
+pub mod matrix;
 pub mod plan;
 pub mod report;
+pub mod waivers;

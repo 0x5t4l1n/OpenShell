@@ -11,15 +11,17 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use openshell_test_runner::bundle::{self, Bundle};
 use openshell_test_runner::catalog::Catalog;
 use openshell_test_runner::environments::{Arch, Catalog as Environments};
 use openshell_test_runner::execute::{self, Options};
 use openshell_test_runner::jobs::{self, Job, Narrowing};
+use openshell_test_runner::matrix::{self, Exclusion, Matrix};
 use openshell_test_runner::plan::Plan;
 use openshell_test_runner::report;
+use openshell_test_runner::waivers::Waivers;
 
 #[derive(Parser)]
 #[command(name = "openshell-test", about = "Run OpenShell test plans")]
@@ -50,6 +52,21 @@ enum Command {
         /// Results directory [default: artifacts/test-results/<plan name>].
         #[arg(long)]
         results: Option<PathBuf>,
+        /// Run waived tests too, e.g. to check whether a fix landed.
+        #[arg(long)]
+        ignore_waivers: bool,
+    },
+    /// Print every test against every environment: where it runs, or why not.
+    Matrix {
+        /// Also exclude environments this machine can't provision.
+        #[arg(long)]
+        host: bool,
+        /// Ignore tests/waivers.yaml.
+        #[arg(long)]
+        ignore_waivers: bool,
+        /// Print JSON instead of text.
+        #[arg(long)]
+        json: bool,
     },
     /// Print the test catalog as JSON.
     Catalog,
@@ -69,11 +86,49 @@ async fn main() -> ExitCode {
 async fn run(cli: Cli) -> Result<ExitCode> {
     let root = repo_root()?;
     let catalog = Catalog::load(&root)?;
+    let environments_catalog = Environments::load_dir(&root.join("tests/environments"))?;
+    let load_waivers = |ignore: bool| -> Result<Waivers> {
+        if ignore {
+            return Ok(Waivers::default());
+        }
+        Waivers::load(
+            &root.join("tests/waivers.yaml"),
+            &catalog,
+            &environments_catalog,
+        )
+    };
 
     match cli.command {
         Command::Catalog => {
             println!("{}", serde_json::to_string_pretty(&catalog)?);
             Ok(ExitCode::SUCCESS)
+        }
+        Command::Matrix {
+            host,
+            ignore_waivers,
+            json,
+        } => {
+            let waivers = load_waivers(ignore_waivers)?;
+            let matrix = Matrix::build(
+                &catalog,
+                &environments_catalog,
+                &waivers,
+                host.then(Arch::host),
+            );
+            if json {
+                println!("{}", serde_json::to_string_pretty(&matrix)?);
+            } else {
+                print!("{}", matrix.render());
+            }
+            let problems = matrix::problems(&catalog, &environments_catalog);
+            for problem in &problems {
+                eprintln!("error: {problem}");
+            }
+            Ok(if problems.is_empty() {
+                ExitCode::SUCCESS
+            } else {
+                ExitCode::FAILURE
+            })
         }
         Command::Test {
             plan,
@@ -82,16 +137,31 @@ async fn run(cli: Cli) -> Result<ExitCode> {
             environments,
             suites,
             results,
+            ignore_waivers,
         } => {
+            let problems = matrix::problems(&catalog, &environments_catalog);
+            if !problems.is_empty() {
+                bail!(
+                    "the test matrix is inconsistent; see `matrix`:\n  {}",
+                    problems.join("\n  ")
+                );
+            }
+            let waivers = load_waivers(ignore_waivers)?;
             let plan_path = plan;
             let plan = Plan::load(&plan_path)?;
-            let environments_catalog = Environments::load_dir(&root.join("tests/environments"))?;
             let host = Arch::host();
             let narrowing = Narrowing {
                 environments,
                 suites,
             };
-            let jobs = jobs::expand(&plan, &catalog, &environments_catalog, host, &narrowing)?;
+            let jobs = jobs::expand(
+                &plan,
+                &catalog,
+                &environments_catalog,
+                &waivers,
+                host,
+                &narrowing,
+            )?;
             print_jobs(&jobs);
             if dry_run {
                 return Ok(ExitCode::SUCCESS);
@@ -128,6 +198,7 @@ async fn run(cli: Cli) -> Result<ExitCode> {
             }
 
             eprintln!("{}", report::summary(&outcomes));
+            print_waived(&jobs);
             eprintln!("Results: {}", results.display());
             Ok(
                 if outcomes.iter().any(|outcome| outcome.status.is_failure()) {
@@ -150,16 +221,45 @@ fn print_jobs(jobs: &[Job]) {
             eprintln!("  {}: -E '{}'", family.family, family.filterset());
             for suite in &family.suites {
                 eprintln!("    {}: {}", suite.suite.suite, suite.run.join(", "));
-                for test in &suite.unsupported {
+                for test in &suite.excluded {
                     eprintln!(
-                        "    {}: {} unsupported (needs {})",
-                        suite.suite.suite,
-                        test.name,
-                        test.missing.join(", ")
+                        "    {}: {} excluded ({})",
+                        suite.suite.suite, test.name, test.reason
                     );
                 }
             }
         }
+    }
+}
+
+/// List the waivers that skipped tests, so they stay in view.
+fn print_waived(jobs: &[Job]) {
+    let waived: Vec<String> = jobs
+        .iter()
+        .filter(|job| job.unsupported.is_none())
+        .flat_map(|job| {
+            job.families.iter().flat_map(move |family| {
+                family.suites.iter().flat_map(move |suite| {
+                    suite
+                        .excluded
+                        .iter()
+                        .filter_map(move |test| match &test.reason {
+                            Exclusion::Waived(waiver) => Some(format!(
+                                "  {} / {}: {} ({})",
+                                job.environment.id, test.name, waiver.reason, waiver.issue
+                            )),
+                            _ => None,
+                        })
+                })
+            })
+        })
+        .collect();
+    if !waived.is_empty() {
+        eprintln!("Waived (skipped; run with --ignore-waivers to check fixes):");
+        for line in waived {
+            eprintln!("{line}");
+        }
+        eprintln!();
     }
 }
 
