@@ -114,7 +114,7 @@ async fn run(cli: Cli) -> Result<ExitCode> {
                 serde_json::to_string_pretty(&catalog)?,
             )?;
 
-            let bundles = build_bundles(&jobs, &catalog, host)?;
+            let bundles = build_bundles(&root, &jobs, &catalog, host)?;
             let tmachine = load_tmachine(&root)?;
             let options = Options {
                 tmachine: &tmachine,
@@ -165,6 +165,7 @@ fn print_jobs(jobs: &[Job]) {
 
 /// Build one bundle per family, covering every suite that will run.
 fn build_bundles(
+    root: &Path,
     jobs: &[Job],
     catalog: &Catalog,
     host: Option<Arch>,
@@ -186,6 +187,8 @@ fn build_bundles(
         return Ok(bundles);
     }
     let target = bundle::guest_target(host.context("the host architecture is not supported")?);
+    eprintln!("==> building {} for {target}", bundle::READY_BINARY);
+    let ready = bundle::build_ready(root, target)?;
     for (family_name, suite_names) in suites {
         let family = catalog.family(family_name)?;
         let binaries = suite_names
@@ -198,6 +201,7 @@ fn build_bundles(
             &family.packages(suite_names.iter().copied()),
             &binaries,
             target,
+            &ready,
         )?;
         bundles.insert(family_name.to_string(), bundle);
     }

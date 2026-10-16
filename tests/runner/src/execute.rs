@@ -12,13 +12,15 @@ use anyhow::{Context, Result, bail, ensure};
 use tmachine::Session;
 use tmachine::config::Config;
 
-use crate::bundle::{Bundle, PROFILE};
+use crate::bundle::{Bundle, PROFILE, READY_BINARY};
 use crate::jobs::{FamilyJob, Job};
 use crate::report::{Outcome, Status, junit_counts};
 
 /// Where the installer describes the gateway in the guest.
 const GATEWAY_SECTION: &str = "/etc/openshell-test/gateway.yaml";
 const GUEST_ROOT: &str = "/var/tmp/openshell-tests";
+/// How long the gateway has to become healthy after the environment is up.
+const READY_TIMEOUT_SECS: u64 = 60;
 
 pub struct Options<'a> {
     pub tmachine: &'a Config,
@@ -189,11 +191,27 @@ async fn run_family(
             .await?,
     )?;
 
+    // A booted guest restarts its gateway, so wait for it once here rather
+    // than in every test. Failing here is an environment error, not a test
+    // failure.
+    let target_env = format!("OPENSHELL_TEST_TARGET={guest}/target.yaml");
+    checked(
+        "wait for the gateway",
+        session
+            .exec(&[
+                "env",
+                &target_env,
+                &format!("{guest}/{READY_BINARY}"),
+                &READY_TIMEOUT_SECS.to_string(),
+            ])
+            .await?,
+    )?;
+
     let filterset = family.filterset();
     let output = session
         .exec(&[
             "env",
-            &format!("OPENSHELL_TEST_TARGET={guest}/target.yaml"),
+            &target_env,
             "cargo-nextest",
             "nextest",
             "run",

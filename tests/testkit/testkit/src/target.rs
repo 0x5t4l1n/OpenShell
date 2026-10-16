@@ -20,9 +20,11 @@
 //! ```
 
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use openshell_sdk::{AuthConfig, ClientConfig, EdgeAuthInterceptor, OpenShellClient};
+use openshell_sdk::{
+    AuthConfig, ClientConfig, EdgeAuthInterceptor, Health, OpenShellClient, ServiceStatus,
+};
 use serde::Deserialize;
 use tonic::transport::{Certificate, ClientTlsConfig, Endpoint, Identity};
 
@@ -118,6 +120,7 @@ fn default_workspace() -> String {
 // Mirrors the SDK's endpoint settings for channels testkit builds itself.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(10);
+const READY_INTERVAL: Duration = Duration::from_secs(1);
 
 impl Target {
     /// Load the target named by [`TARGET_ENV`].
@@ -219,19 +222,53 @@ impl Target {
             |ca| ClientTlsConfig::new().ca_certificate(Certificate::from_pem(ca)),
         );
         let channel = Endpoint::from_shared(gateway.endpoint.clone())
-            .map_err(Error::from_display)?
+            .map_err(|error| Error::from_error(&error))?
             .connect_timeout(CONNECT_TIMEOUT)
             .http2_adaptive_window(true)
             .http2_keep_alive_interval(KEEP_ALIVE_INTERVAL)
             .keep_alive_while_idle(true)
             .tls_config(tls_config.identity(identity))
-            .map_err(Error::from_display)?
+            .map_err(|error| Error::from_error(&error))
+            .context("configure mTLS")?
             .connect()
             .await
-            .map_err(Error::from_display)
+            .map_err(|error| Error::from_error(&error))
             .context(format!("connect to {} with mTLS", gateway.endpoint))?;
         let interceptor = EdgeAuthInterceptor::new(token.as_deref(), None)?;
         Ok(OpenShellClient::from_parts(channel, interceptor))
+    }
+
+    /// Wait until the gateway accepts a connection and reports itself
+    /// healthy, retrying until `timeout`.
+    ///
+    /// This is a readiness check for whoever brings the environment up, run
+    /// once before its tests. Tests themselves connect once and fail fast.
+    pub async fn wait_ready(&self, timeout: Duration) -> Result<Health> {
+        let started = Instant::now();
+        loop {
+            let error = match self.check_health().await {
+                Ok(health) => return Ok(health),
+                Err(error) => error,
+            };
+            if started.elapsed() >= timeout {
+                return Err(error.context(format!(
+                    "gateway at {} not ready after {}s",
+                    self.gateway.endpoint,
+                    timeout.as_secs()
+                )));
+            }
+            tokio::time::sleep(READY_INTERVAL).await;
+        }
+    }
+
+    async fn check_health(&self) -> Result<Health> {
+        let health = self.connect().await?.health().await.context("health")?;
+        crate::ensure!(
+            health.status == ServiceStatus::Healthy,
+            "gateway reports {:?}",
+            health.status
+        );
+        Ok(health)
     }
 }
 
@@ -287,5 +324,24 @@ mod tests {
     fn rejects_tls_on_plaintext_endpoint() {
         let err = parse("gateway:\n  endpoint: http://x\n  tls:\n    ca: ca.crt\n").unwrap_err();
         assert!(err.to_string().contains("not https"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn wait_ready_reports_the_last_error_after_timeout() {
+        // Nothing listens on a port bound and then released.
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let target = parse(&format!("gateway:\n  endpoint: http://127.0.0.1:{port}\n")).unwrap();
+        let err = target.wait_ready(Duration::ZERO).await.unwrap_err();
+        let message = err.to_string();
+        assert!(
+            message.starts_with(&format!(
+                "gateway at http://127.0.0.1:{port} not ready after 0s: "
+            )),
+            "{message}"
+        );
     }
 }

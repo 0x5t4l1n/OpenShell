@@ -27,6 +27,22 @@ impl Error {
         Self::msg(error.to_string())
     }
 
+    /// An error with its sources, so a wrapper such as tonic's
+    /// "transport error" still says what went wrong underneath.
+    pub fn from_error(error: &(dyn std::error::Error + 'static)) -> Self {
+        let mut message = error.to_string();
+        let mut source = error.source();
+        while let Some(cause) = source {
+            let cause_message = cause.to_string();
+            // Some errors repeat their source's message in their own.
+            if !message.ends_with(&cause_message) {
+                message = format!("{message}: {cause_message}");
+            }
+            source = cause.source();
+        }
+        Self::msg(message)
+    }
+
     #[must_use]
     pub fn context(self, context: impl fmt::Display) -> Self {
         Self::msg(format!("{context}: {}", self.message))
@@ -43,7 +59,7 @@ impl std::error::Error for Error {}
 
 impl From<SdkError> for Error {
     fn from(error: SdkError) -> Self {
-        Self::from_display(error)
+        Self::from_error(&error)
     }
 }
 
@@ -86,6 +102,38 @@ mod tests {
         let result: Result = Err(Error::msg("boom"));
         let err = result.context("step two").context("test").unwrap_err();
         assert_eq!(err.to_string(), "test: step two: boom");
+    }
+
+    #[derive(Debug)]
+    struct Wrapper(Option<Box<dyn std::error::Error + 'static>>, &'static str);
+
+    impl fmt::Display for Wrapper {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str(self.1)
+        }
+    }
+
+    impl std::error::Error for Wrapper {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+            self.0.as_deref()
+        }
+    }
+
+    #[test]
+    fn from_error_includes_sources() {
+        let refused = Wrapper(None, "connection refused");
+        let transport = Wrapper(Some(Box::new(refused)), "transport error");
+        assert_eq!(
+            Error::from_error(&transport).to_string(),
+            "transport error: connection refused"
+        );
+    }
+
+    #[test]
+    fn from_error_skips_repeated_source_messages() {
+        let inner = Wrapper(None, "refused");
+        let outer = Wrapper(Some(Box::new(inner)), "connect: refused");
+        assert_eq!(Error::from_error(&outer).to_string(), "connect: refused");
     }
 
     #[test]

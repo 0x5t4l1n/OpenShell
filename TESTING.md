@@ -423,6 +423,11 @@ building or booting anything, `--env` or `--suite` to narrow a plan, and
 reports and gateway logs for failures, go to
 `artifacts/test-results/<plan>/<environment>/<family>/`.
 
+Before running an environment's suites, the runner waits up to 60 seconds for
+its gateway to report healthy (`testkit-ready`, shipped in each bundle). A
+gateway that never becomes healthy is reported as an environment error, not as
+test failures.
+
 Environments are defined in `tests/environments/*.yaml`. tmachine boots guests
 of the host's architecture only, so the runner reports environments for other
 architectures as unsupported instead of failing.

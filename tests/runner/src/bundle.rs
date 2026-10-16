@@ -4,8 +4,9 @@
 //! Building a family's test bundle for the guest.
 //!
 //! A bundle is a tar holding a nextest archive built for the guest target,
-//! the family workspace's `Cargo.toml` files (for `--workspace-remap`), and a
-//! `nextest` config with the runner's `JUnit` profile. The guest needs only the
+//! the family workspace's `Cargo.toml` files (for `--workspace-remap`), a
+//! `nextest` config with the runner's `JUnit` profile, and `testkit-ready`,
+//! which waits for the gateway before the tests run. The guest needs only the
 //! `cargo-nextest` binary to run it.
 
 use std::collections::BTreeSet;
@@ -21,6 +22,9 @@ use crate::environments::Arch;
 
 /// The nextest profile the runner uses in the guest.
 pub const PROFILE: &str = "openshell";
+
+/// The readiness check every bundle carries, at the bundle root.
+pub const READY_BINARY: &str = "testkit-ready";
 
 const NEXTEST_CONFIG: &str = r#"# Written by the OpenShell test runner.
 [profile.openshell]
@@ -44,13 +48,65 @@ pub const fn guest_target(arch: Arch) -> &'static str {
     }
 }
 
+/// Build `testkit-ready` for the guest and return its path.
+pub fn build_ready(root: &Path, target: &str) -> Result<PathBuf> {
+    let output = Command::new("cargo")
+        .args(["build", "--locked", "--manifest-path"])
+        .arg(root.join("tests/testkit/Cargo.toml"))
+        .args(["-p", "openshell-testkit", "--bin", READY_BINARY])
+        .args([
+            "--target",
+            target,
+            "--message-format",
+            "json-render-diagnostics",
+        ])
+        .stderr(std::process::Stdio::inherit())
+        .output()
+        .context("run cargo build")?;
+    ensure!(
+        output.status.success(),
+        "build {READY_BINARY} exited with {}",
+        output.status
+    );
+    built_executable(&output.stdout, READY_BINARY)
+        .with_context(|| format!("cargo build did not report a {READY_BINARY} executable"))
+}
+
+/// The executable cargo reports building for the binary target `name`.
+fn built_executable(messages: &[u8], name: &str) -> Option<PathBuf> {
+    #[derive(Deserialize)]
+    struct Message {
+        reason: String,
+        target: Option<Target>,
+        executable: Option<PathBuf>,
+    }
+    #[derive(Deserialize)]
+    struct Target {
+        name: String,
+    }
+
+    serde_json::Deserializer::from_slice(messages)
+        .into_iter::<Message>()
+        .filter_map(std::result::Result::ok)
+        .filter(|message| message.reason == "compiler-artifact")
+        .filter(|message| {
+            message
+                .target
+                .as_ref()
+                .is_some_and(|target| target.name == name)
+        })
+        .find_map(|message| message.executable)
+}
+
 /// Build the bundle for `packages`, and check that the archive contains a
-/// binary for every suite in `binaries`.
+/// binary for every suite in `binaries`. `ready` is the guest's
+/// `testkit-ready`.
 pub fn build(
     family: &Family,
     packages: &BTreeSet<String>,
     binaries: &BTreeSet<String>,
     target: &str,
+    ready: &Path,
 ) -> Result<Bundle> {
     let dir = tempfile::tempdir().context("create bundle directory")?;
     let stage = dir.path().join("stage");
@@ -79,6 +135,8 @@ pub fn build(
 
     copy_manifests(&family.workspace, &stage)?;
     std::fs::write(stage.join("nextest.toml"), NEXTEST_CONFIG)?;
+    std::fs::copy(ready, stage.join(READY_BINARY))
+        .with_context(|| format!("copy {}", ready.display()))?;
 
     let path = dir.path().join(format!("{}-tests.tar", family.name));
     run(Command::new("tar")
@@ -160,4 +218,22 @@ fn run(command: &mut Command) -> Result<()> {
         bail!("{command:?} exited with {status}");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn built_executable_finds_the_named_binary() {
+        let messages = br#"{"reason":"compiler-artifact","target":{"name":"testkit"},"executable":null}
+{"reason":"compiler-artifact","target":{"name":"testkit-ready"},"executable":"/t/debug/testkit-ready"}
+{"reason":"build-finished","success":true}
+"#;
+        assert_eq!(
+            built_executable(messages, "testkit-ready"),
+            Some(PathBuf::from("/t/debug/testkit-ready"))
+        );
+        assert_eq!(built_executable(messages, "other"), None);
+    }
 }
