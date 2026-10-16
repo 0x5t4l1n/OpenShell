@@ -582,8 +582,11 @@ that scan, then logs
 the `sandbox_id` and exits with
 `tool server endpoint-status startup reconciliation failed`. A pod that
 restarts with that error during a rollout or scale-out is waiting behind a
-long holder: find it as above. Those startup timeouts appear in the gateway log
-only, because the metrics endpoint starts after the scan.
+long holder: find it as above. When the scan finishes, its waits and timeouts
+are already in the lock metrics at the pod's first scrape, so read the counter
+and `_count` values on the new pod: `rate()` and `increase()` take that first
+scrape as their baseline and do not show them. A scan that fails exits before
+the metrics endpoint starts, so its timeouts appear in the gateway log only.
 
 A lock connection that PostgreSQL does not open, although at least a second of
 the 10-second limit remained, is not a lock timeout. The request fails with
