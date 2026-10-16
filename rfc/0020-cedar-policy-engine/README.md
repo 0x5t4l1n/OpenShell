@@ -883,7 +883,6 @@ Remaining steps:
   state to `review`, and open the RFC pull request.
 - Keep `ai-openshell/cedar` moving with the Cedar team: track delimited
   `like` upstream (cedar-policy/rfcs#115) and bump the pin as features land.
-- Pass the first CI run of the `cedar` E2E matrix entry.
 - Rename the Rust input types of `openshell-policy-cedar` after the schema
   actions (`NetworkRequest` to a `NetworkConnect` request type, `L7Request`
   to an `HttpRequest` one), so the code stops inviting the question answered
@@ -905,10 +904,11 @@ its 26 checks against a Docker gateway; the parity harness passes (2,909
 cases on Linux, 2,904 agreeing, 5 recorded differences; the 13 symlink cases
 are ignored on macOS);
 the example parity module passes (166 tests); and the quickstart, content
-guard, and MCP conformance examples run end to end in both formats. Not yet
-verified against a live gateway: native TCP, WebSocket, address ranges,
-symlinked binaries, and token grants; the Windows path beyond a
-cross-compile; and the first CI run.
+guard, and MCP conformance examples run end to end in both formats. On the pull request, CI ran the `cedar` and `mcp-cedar` end-to-end suites,
+the Docker, Podman, and VM matrices, and the Windows MSVC lane, all passing.
+Not yet verified against a live gateway: native TCP, WebSocket, address
+ranges, symlinked binaries, and token grants beyond what the Cedar e2e suite
+and the parity harness cover.
 
 ## Risks
 
