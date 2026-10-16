@@ -164,7 +164,6 @@ fn command(image: &QemuImage, qmp_socket: &Path, firmware_vars: Option<&Path>) -
 /// A firmware path from the runtime environment, falling back to the value
 /// compiled in. The fallback lets library users built outside Nix (such as
 /// the test runner) supply firmware at runtime.
-#[cfg(target_arch = "aarch64")]
 fn firmware_path(name: &str, compiled: Option<&'static str>) -> String {
     std::env::var(name)
         .ok()

@@ -97,8 +97,10 @@ async fn run(cli: Cli) -> Result<ExitCode> {
                 return Ok(ExitCode::SUCCESS);
             }
 
+            // Absolute, because `load_tmachine` changes the working directory.
             let results = match results {
-                Some(results) => results,
+                Some(results) => std::path::absolute(&results)
+                    .with_context(|| format!("resolve {}", results.display()))?,
                 None => root.join("artifacts/test-results").join(
                     plan_path
                         .file_stem()
