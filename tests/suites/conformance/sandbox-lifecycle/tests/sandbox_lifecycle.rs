@@ -8,7 +8,7 @@ use testkit::sdk::{SandboxPhase, SandboxRestartPolicy};
 
 /// A long-running sandbox becomes ready, runs a command with exec, and is gone
 /// from get and list after delete.
-#[testkit::test]
+#[testkit::test(id = "t-3tfdx240")]
 async fn long_running_exec_delete(cx: &mut Context) -> testkit::Result {
     let sandbox = cx
         .sandbox("lr")
@@ -39,7 +39,7 @@ async fn long_running_exec_delete(cx: &mut Context) -> testkit::Result {
 /// A sandbox whose main command exits 0, with restart policy Never, reaches
 /// Completed with exit code 0 and is not restarted. It is gone from get and
 /// list after delete.
-#[testkit::test]
+#[testkit::test(id = "t-nyiaw3g8")]
 async fn run_to_completion_exit_delete(cx: &mut Context) -> testkit::Result {
     let sandbox = cx
         .sandbox("rtc")

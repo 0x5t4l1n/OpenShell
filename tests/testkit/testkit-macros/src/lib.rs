@@ -5,17 +5,18 @@
 //!
 //! A test is an `async fn` taking `&mut testkit::Context` and
 //! returning `testkit::Result`. Its doc comment is the test's description and
-//! is required. The function name is the test ID. Requirements are named
-//! after target capabilities:
+//! is required. `id` is the required stable test ID: random, never changed,
+//! and kept when the test is renamed or moved. A missing ID's compile error
+//! suggests a fresh one. Requirements are named after target capabilities:
 //!
 //! ```ignore
 //! /// An exposed loopback HTTP service is reachable and goes away after delete.
-//! #[testkit::test(requires = [service_exposure])]
+//! #[testkit::test(id = "t-4f8k2m0q", requires = [service_exposure])]
 //! async fn expose_service(cx: &mut Context) -> testkit::Result { /* ... */ }
 //! ```
 //!
 //! The attribute expands to a `#[tokio::test]` wrapper with the same name, so
-//! the nextest test name is the test ID. The original function is nested in
+//! the nextest test name is the function name. The original function is nested in
 //! the wrapper and passed to `testkit::run`. Parsing lives in `testkit-spec`,
 //! which the test runner's catalog also uses.
 
@@ -35,9 +36,10 @@ fn expand(attr: TokenStream2, item: TokenStream2) -> syn::Result<TokenStream2> {
     let mut body: ItemFn = syn::parse2(item)?;
     let spec = testkit_spec::parse(attr, &body)?;
 
-    let id = spec.id;
-    let id_str = LitStr::new(&id.to_string(), id.span());
-    let description = LitStr::new(&spec.description, id.span());
+    let name = spec.name;
+    let name_str = LitStr::new(&name.to_string(), name.span());
+    let id = LitStr::new(&spec.id, name.span());
+    let description = LitStr::new(&spec.description, name.span());
     let requires = spec.requires.iter().map(|capability| {
         let variant = Ident::new(&to_camel_case(&capability.to_string()), capability.span());
         quote!(::testkit::Capability::#variant)
@@ -57,11 +59,12 @@ fn expand(attr: TokenStream2, item: TokenStream2) -> syn::Result<TokenStream2> {
     Ok(quote! {
         #(#doc_attrs)*
         #[::testkit::__private::tokio::test(crate = "::testkit::__private::tokio")]
-        #vis async fn #id() {
+        #vis async fn #name() {
             #body
             ::testkit::run(
                 ::testkit::TestInfo {
-                    id: #id_str,
+                    id: #id,
+                    name: #name_str,
                     description: #description,
                     requires: &[#(#requires),*],
                 },
@@ -95,20 +98,21 @@ mod tests {
     #[test]
     fn expands_to_wrapper_with_same_name() {
         let out = expand_str(
-            "",
+            "id = \"t-0123abcd\"",
             "/// Does a thing.\nasync fn does_a_thing(cx: &mut Context) -> testkit::Result { Ok(()) }",
         )
         .unwrap();
         assert!(out.contains("async fn does_a_thing ()"), "{out}");
         assert!(out.contains("async fn body (cx : & mut Context)"), "{out}");
-        assert!(out.contains("id : \"does_a_thing\""), "{out}");
+        assert!(out.contains("id : \"t-0123abcd\""), "{out}");
+        assert!(out.contains("name : \"does_a_thing\""), "{out}");
         assert!(out.contains("description : \"Does a thing.\""), "{out}");
     }
 
     #[test]
     fn maps_requirements_to_capabilities() {
         let out = expand_str(
-            "requires = [service_exposure, gpu]",
+            "id = \"t-0123abcd\", requires = [service_exposure, gpu]",
             "/// Doc.\nasync fn t(cx: &mut Context) -> testkit::Result { Ok(()) }",
         )
         .unwrap();

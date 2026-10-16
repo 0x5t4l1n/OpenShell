@@ -154,7 +154,7 @@ fn print_jobs(jobs: &[Job]) {
                     eprintln!(
                         "    {}: {} unsupported (needs {})",
                         suite.suite.suite,
-                        test.id,
+                        test.name,
                         test.missing.join(", ")
                     );
                 }

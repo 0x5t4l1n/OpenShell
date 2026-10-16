@@ -8,6 +8,8 @@
 //! functions; the suite name is the binary name with `_` replaced by `-`.
 //! Tests are parsed with `testkit-spec`, the same parser the macro uses, so
 //! the runner never executes test binaries on the host to learn about them.
+//! Test IDs are unique across every family, so a test can move between
+//! suites and families without changing its ID.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -37,7 +39,10 @@ pub struct Suite {
 
 #[derive(Clone, Debug, Serialize)]
 pub struct Test {
+    /// The stable test ID.
     pub id: String,
+    /// The function name, which is also the nextest test name.
+    pub name: String,
     pub description: String,
     pub requires: Vec<String>,
 }
@@ -56,7 +61,25 @@ impl Catalog {
                 .with_context(|| format!("load {name} test catalog"))?;
             families.insert((*name).to_string(), family);
         }
-        Ok(Self { families })
+        let catalog = Self { families };
+        catalog.check_unique_ids()?;
+        Ok(catalog)
+    }
+
+    /// Fail if two tests anywhere in the catalog share an ID.
+    fn check_unique_ids(&self) -> Result<()> {
+        let mut seen: BTreeMap<&str, String> = BTreeMap::new();
+        for family in self.families.values() {
+            for suite in family.suites.values() {
+                for test in &suite.tests {
+                    let location = format!("{}/{}/{}", family.name, suite.suite, test.name);
+                    if let Some(first) = seen.insert(&test.id, location.clone()) {
+                        bail!("test ID {} is used by both {first} and {location}", test.id);
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 
     pub fn family(&self, name: &str) -> Result<&Family> {
@@ -168,7 +191,8 @@ fn member_suites(member_dir: &Path) -> Result<Vec<Suite>> {
             tests: specs
                 .into_iter()
                 .map(|spec| Test {
-                    id: spec.id.to_string(),
+                    id: spec.id,
+                    name: spec.name.to_string(),
                     description: spec.description,
                     requires: spec.requires.iter().map(ToString::to_string).collect(),
                 })
@@ -202,10 +226,46 @@ mod tests {
             suite
                 .tests
                 .iter()
-                .any(|test| test.id == "long_running_exec_delete" && !test.description.is_empty())
+                .any(|test| test.name == "long_running_exec_delete"
+                    && testkit_spec::is_valid_id(&test.id)
+                    && !test.description.is_empty())
         );
         // CLI-driven tests in the same workspace are not testkit suites.
         assert!(family.suites.keys().all(|name| name != "file-transfer"));
+    }
+
+    #[test]
+    fn duplicate_ids_are_rejected_across_families() {
+        let test = |name: &str| Test {
+            id: "t-00000001".to_string(),
+            name: name.to_string(),
+            description: "d".to_string(),
+            requires: Vec::new(),
+        };
+        let family = |name: &str, test_name: &str| Family {
+            name: name.to_string(),
+            workspace: PathBuf::new(),
+            suites: BTreeMap::from([(
+                "s".to_string(),
+                Suite {
+                    suite: "s".to_string(),
+                    binary: "s".to_string(),
+                    package: "p".to_string(),
+                    tests: vec![test(test_name)],
+                },
+            )]),
+        };
+        let catalog = Catalog {
+            families: BTreeMap::from([
+                ("a".to_string(), family("a", "first")),
+                ("b".to_string(), family("b", "second")),
+            ]),
+        };
+        let err = catalog.check_unique_ids().unwrap_err().to_string();
+        assert!(
+            err.contains("a/s/first") && err.contains("b/s/second"),
+            "{err}"
+        );
     }
 
     #[test]

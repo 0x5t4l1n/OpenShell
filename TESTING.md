@@ -442,14 +442,23 @@ tests with the same `testkit-spec` crate as the attribute.
 ```rust
 /// A long-running sandbox becomes ready, runs a command with exec, and is gone
 /// from get and list after delete.
-#[testkit::test]
+#[testkit::test(id = "t-3tfdx240")]
 async fn long_running_exec_delete(cx: &mut Context) -> testkit::Result {
     // ...
 }
 ```
 
-The function name is the test ID, and the doc comment is its required
-description. Declare capabilities a test needs with
+Every test needs a stable `id`: `t-` followed by eight random lowercase letters
+or digits. Results, waivers, and coverage records refer to tests by this ID, so
+never change or reuse it, including when you rename the test or move it to
+another suite or family. Omit `id` when you write a new test; the compile error
+suggests a fresh one. IDs must be unique across all families, which the runner
+checks, and the runner adds each test's ID to its JUnit test case as the
+`test_id` property.
+
+The function name is the nextest test name and is what `--suite` and nextest
+filters select. Rename it when a clearer name helps; the ID keeps the history.
+The doc comment is the required description. Declare capabilities a test needs with
 `#[testkit::test(requires = [service_exposure])]`; the runner excludes the test
 in environments without them and reports it as unsupported. Tests read the
 system under test from the target file named by `OPENSHELL_TEST_TARGET`, so you

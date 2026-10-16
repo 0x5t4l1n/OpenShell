@@ -36,7 +36,7 @@ pub struct FamilyJob {
 #[derive(Debug)]
 pub struct SuiteJob {
     pub suite: Suite,
-    /// Test IDs to run.
+    /// Names of the tests to run.
     pub run: Vec<String>,
     /// Tests excluded because the environment lacks a capability they need.
     pub unsupported: Vec<UnsupportedTest>,
@@ -44,7 +44,7 @@ pub struct SuiteJob {
 
 #[derive(Debug)]
 pub struct UnsupportedTest {
-    pub id: String,
+    pub name: String,
     pub missing: Vec<String>,
 }
 
@@ -160,10 +160,10 @@ fn suite_job(suite: &Suite, environment: &Environment) -> SuiteJob {
             .cloned()
             .collect();
         if missing.is_empty() {
-            run.push(test.id.clone());
+            run.push(test.name.clone());
         } else {
             unsupported.push(UnsupportedTest {
-                id: test.id.clone(),
+                name: test.name.clone(),
                 missing,
             });
         }
@@ -184,6 +184,20 @@ impl FamilyJob {
     /// Whether any test will run.
     pub fn has_tests(&self) -> bool {
         self.suites.iter().any(|suite| !suite.run.is_empty())
+    }
+
+    /// Stable test IDs keyed by nextest `JUnit` `(classname, name)`.
+    pub fn test_ids(&self) -> BTreeMap<(String, String), String> {
+        self.suites
+            .iter()
+            .flat_map(|job| {
+                let classname = format!("{}::{}", job.suite.package, job.suite.binary);
+                job.suite
+                    .tests
+                    .iter()
+                    .map(move |test| ((classname.clone(), test.name.clone()), test.id.clone()))
+            })
+            .collect()
     }
 
     /// The nextest filterset selecting exactly the tests to run.
@@ -224,8 +238,10 @@ mod tests {
             package: format!("pkg-{name}"),
             tests: tests
                 .iter()
-                .map(|(id, requires)| Test {
-                    id: (*id).to_string(),
+                .enumerate()
+                .map(|(index, (name, requires))| Test {
+                    id: format!("t-{index:08}"),
+                    name: (*name).to_string(),
                     description: "d".to_string(),
                     requires: requires.iter().map(ToString::to_string).collect(),
                 })
@@ -288,7 +304,7 @@ mod tests {
         assert_eq!(jobs.len(), 1);
         let suite = &jobs[0].families[0].suites[0];
         assert_eq!(suite.run, ["long_running"]);
-        assert_eq!(suite.unsupported[0].id, "expose");
+        assert_eq!(suite.unsupported[0].name, "expose");
         assert_eq!(suite.unsupported[0].missing, ["service_exposure"]);
         assert_eq!(
             jobs[0].families[0].filterset(),

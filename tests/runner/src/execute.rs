@@ -14,7 +14,7 @@ use tmachine::config::Config;
 
 use crate::bundle::{Bundle, PROFILE, READY_BINARY};
 use crate::jobs::{FamilyJob, Job};
-use crate::report::{Outcome, Status, junit_counts};
+use crate::report::{Outcome, Status, annotate_junit, junit_counts};
 
 /// Where the installer describes the gateway in the guest.
 const GATEWAY_SECTION: &str = "/etc/openshell-test/gateway.yaml";
@@ -245,7 +245,9 @@ async fn run_family(
     let counts = match found.lines().next() {
         Some(path) => {
             session.copy_out(path, &junit).await?;
-            junit_counts(&std::fs::read_to_string(&junit)?)
+            let xml = annotate_junit(&std::fs::read_to_string(&junit)?, &family.test_ids());
+            std::fs::write(&junit, &xml)?;
+            junit_counts(&xml)
         }
         None => None,
     };

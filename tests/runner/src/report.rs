@@ -3,6 +3,7 @@
 
 //! Job outcomes and the run summary.
 
+use std::collections::BTreeMap;
 use std::fmt::Write as _;
 
 /// The outcome of one family in one environment.
@@ -54,6 +55,60 @@ pub fn junit_counts(xml: &str) -> Option<(u32, u32)> {
     Some((tests, failures))
 }
 
+/// The `JUnit` property that carries a test's stable ID.
+pub const TEST_ID_PROPERTY: &str = "test_id";
+
+/// Add each test's stable ID to its `<testcase>` as a property.
+///
+/// `ids` maps a nextest `(classname, name)` pair (`<package>::<binary>`, test
+/// name) to the test's ID. Test cases not in `ids` are left unchanged. The
+/// property is the test case's first child, where pytest's
+/// `record_property` puts it.
+pub fn annotate_junit(xml: &str, ids: &BTreeMap<(String, String), String>) -> String {
+    let mut out = String::with_capacity(xml.len());
+    let mut rest = xml;
+    while let Some(start) = rest.find("<testcase ") {
+        let Some(len) = rest[start..].find('>') else {
+            break;
+        };
+        let end = start + len;
+        let tag = &rest[start..end];
+        out.push_str(&rest[..start]);
+        let key = attr(tag, "classname").zip(attr(tag, "name"));
+        match key.and_then(|(classname, name)| ids.get(&(classname.to_string(), name.to_string())))
+        {
+            Some(id) => {
+                let properties = format!(
+                    "<properties><property name=\"{TEST_ID_PROPERTY}\" value=\"{id}\"/></properties>"
+                );
+                match tag.strip_suffix('/') {
+                    Some(open) => {
+                        let _ = write!(out, "{open}>{properties}</testcase>");
+                    }
+                    None => {
+                        let _ = write!(out, "{tag}>{properties}");
+                    }
+                }
+            }
+            None => {
+                out.push_str(tag);
+                out.push('>');
+            }
+        }
+        rest = &rest[end + 1..];
+    }
+    out.push_str(rest);
+    out
+}
+
+/// An attribute value from a start tag. nextest escapes `"` in values.
+fn attr<'a>(tag: &'a str, name: &str) -> Option<&'a str> {
+    let key = format!(" {name}=\"");
+    let start = tag.find(&key)? + key.len();
+    let end = start + tag[start..].find('"')?;
+    Some(&tag[start..end])
+}
+
 /// A human-readable summary of every outcome.
 pub fn summary(outcomes: &[Outcome]) -> String {
     let mut out = String::from("\nSummary\n");
@@ -93,6 +148,37 @@ mod tests {
 <testsuites name="nextest-run" tests="3" failures="1" errors="1" uuid="x" timestamp="t" time="1.0">
 <testsuite name="a" tests="3"></testsuite></testsuites>"#;
         assert_eq!(junit_counts(xml), Some((3, 2)));
+    }
+
+    #[test]
+    fn annotates_test_cases_with_ids() {
+        let xml = r#"<testsuite name="p::b" tests="3">
+        <testcase name="passed" classname="p::b" time="1.0"/>
+        <testcase name="failed" classname="p::b" time="1.0"><failure message="x"/></testcase>
+        <testcase name="unknown" classname="p::b" time="1.0"/>
+    </testsuite>"#;
+        let ids = BTreeMap::from([
+            (
+                ("p::b".to_string(), "passed".to_string()),
+                "t-00000001".to_string(),
+            ),
+            (
+                ("p::b".to_string(), "failed".to_string()),
+                "t-00000002".to_string(),
+            ),
+        ]);
+        let out = annotate_junit(xml, &ids);
+        assert!(out.contains(
+            r#"<testcase name="passed" classname="p::b" time="1.0"><properties><property name="test_id" value="t-00000001"/></properties></testcase>"#
+        ), "{out}");
+        assert!(out.contains(
+            r#"<testcase name="failed" classname="p::b" time="1.0"><properties><property name="test_id" value="t-00000002"/></properties><failure message="x"/></testcase>"#
+        ), "{out}");
+        assert!(
+            out.contains(r#"<testcase name="unknown" classname="p::b" time="1.0"/>"#),
+            "{out}"
+        );
+        assert!(out.ends_with("</testsuite>"), "{out}");
     }
 
     #[test]

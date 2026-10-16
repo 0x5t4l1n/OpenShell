@@ -11,7 +11,7 @@
 //! use testkit::Context;
 //!
 //! /// A long-running sandbox becomes ready, runs exec, and is gone after delete.
-//! #[testkit::test]
+//! #[testkit::test(id = "t-3tfdx240")]
 //! async fn long_running_exec_delete(cx: &mut Context) -> testkit::Result {
 //!     let sandbox = cx.sandbox("lr").command(["sleep", "infinity"]).create().await?;
 //!     sandbox.wait_ready().await?;
