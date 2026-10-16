@@ -15,6 +15,10 @@ pub const MAX_HEADER_MUTATION_BYTES: usize = 32 * 1024;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HeaderAuthority {
     Request,
+    /// An HTTP session hook request head. Body-mode offers come from the
+    /// original head, so `Content-Encoding` is read-only too: a stage must
+    /// not relabel a body it replaced.
+    SessionRequest,
     RequestTrailers,
     Response,
     ResponseTrailers,
@@ -282,6 +286,9 @@ fn validate_authority(
     let protected = match authority {
         HeaderAuthority::Request | HeaderAuthority::RequestTrailers => {
             is_request_protected(normalized_name)
+        }
+        HeaderAuthority::SessionRequest => {
+            is_request_protected(normalized_name) || normalized_name == "content-encoding"
         }
         HeaderAuthority::Response => {
             is_response_protected(normalized_name)
@@ -712,6 +719,43 @@ mod tests {
                 assert!(matches!(error, HeaderMutationError::Protected { .. }));
             }
         }
+    }
+
+    #[test]
+    fn session_request_authority_keeps_content_encoding_read_only() {
+        let existing = [header("content-encoding", "gzip")];
+        for mutation in [
+            write(
+                "Content-Encoding",
+                "identity",
+                ExistingHeaderAction::Overwrite,
+            ),
+            remove("Content-Encoding"),
+        ] {
+            let error = apply(
+                HeaderAuthority::SessionRequest,
+                &existing,
+                &[],
+                std::slice::from_ref(&mutation),
+            )
+            .expect_err("read-only session request coding");
+            assert!(matches!(error, HeaderMutationError::Protected { .. }));
+            // Legacy request hooks keep their released rules.
+            apply(HeaderAuthority::Request, &existing, &[], &[mutation])
+                .expect("legacy request coding mutation");
+        }
+        let error = apply(
+            HeaderAuthority::SessionRequest,
+            &[],
+            &[],
+            &[write(
+                "Content-Encoding",
+                "gzip",
+                ExistingHeaderAction::Overwrite,
+            )],
+        )
+        .expect_err("cannot label a plaintext body as encoded");
+        assert!(matches!(error, HeaderMutationError::Protected { .. }));
     }
 
     #[test]

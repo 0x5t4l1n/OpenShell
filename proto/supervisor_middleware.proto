@@ -394,8 +394,9 @@ message HttpPreflightResult {
   }
   // Ordered head mutations, validated before the next stage sees the head.
   // Only visible end-to-end headers may change. Credential, routing, framing,
-  // and hop-by-hop headers are protected; response coding and range headers
-  // are protected and response integrity headers may only be removed. Not
+  // and hop-by-hop headers are protected. Request and response
+  // Content-Encoding, and response Content-Range, are protected; response
+  // integrity headers may only be removed. Not
   // allowed for uninspectable traffic. Limited to 64 operations, 32 KiB of
   // name/value data, and 64 KiB encoded.
   repeated HeaderMutation header_mutations = 3;

@@ -106,7 +106,7 @@ A result can include an ordered list of header changes. A `write` change sets ho
 - `overwrite` replaces all existing values.
 - `skip` keeps the existing values.
 
-A `remove` change removes all values for the name. OpenShell protects credential, routing, framing, and connection headers. For responses, it also protects status, authentication challenge, content coding, range, and security policy headers. Header values cannot contain control characters. Request values cannot contain OpenShell credential placeholders.
+A `remove` change removes all values for the name. OpenShell protects credential, routing, framing, connection, and content coding headers. For responses, it also protects status, authentication challenge, range, and security policy headers. Header values cannot contain control characters. Request values cannot contain OpenShell credential placeholders.
 
 OpenShell applies all preflight changes in chain order, then late changes from `buffered_result` or `output_start` in chain order. `begin` carries the head after all preflight changes and earlier stages' late changes. Trailer changes can modify or remove existing trailers but cannot add new names.
 

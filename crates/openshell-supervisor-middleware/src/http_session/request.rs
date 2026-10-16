@@ -166,7 +166,7 @@ impl StageHead for RequestHead<'_> {
 fn request_spec(input: &HttpRequestPreflightInput) -> PipelineSpec {
     PipelineSpec {
         direction: HttpDirection::Request,
-        head_authority: HeaderAuthority::Request,
+        head_authority: HeaderAuthority::SessionRequest,
         trailer_authority: HeaderAuthority::RequestTrailers,
         connection_nominated: input.connection_nominated_headers.clone(),
         timeouts: PipelineTimeouts::default(),
