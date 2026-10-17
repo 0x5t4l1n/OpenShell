@@ -899,7 +899,7 @@ mod tests {
         );
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("backends.json");
-        std::fs::write(&path, r#"{"backends":[{"name":"external","endpoint":{"kind":"unix","socket_path":"/trusted/backend.sock"}}]}"#).unwrap();
+        std::fs::write(&path, r#"{"backends":[{"name":"external","endpoint":{"kind":"tcp","authority":"backend.example:443","addresses":["127.0.0.1:47000"]}}]}"#).unwrap();
         let args = Args::try_parse_from([
             "openshell-supervisor",
             "--isolation-backends-file",
