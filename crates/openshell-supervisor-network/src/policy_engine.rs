@@ -130,7 +130,7 @@ impl PolicyEngine {
     pub fn websocket_assembly_budget(&self) -> WebSocketAssemblyBudget {
         match self {
             Self::Opa(engine) => engine.websocket_assembly_budget(),
-            Self::Cedar(_) => WebSocketAssemblyBudget::default(),
+            Self::Cedar(engine) => engine.websocket_assembly_budget(),
         }
     }
 
@@ -291,7 +291,7 @@ impl PolicyEngine {
                 Ok(TunnelPolicyEngine {
                     generation_guard,
                     middleware_runner: middleware.runner,
-                    websocket_assembly_budget: WebSocketAssemblyBudget::default(),
+                    websocket_assembly_budget: engine.websocket_assembly_budget(),
                     evaluator: TunnelEvaluator::Cedar {
                         l7: engine.l7_handle(expected_generation),
                         middleware: middleware.configs,

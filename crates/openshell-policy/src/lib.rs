@@ -10,6 +10,7 @@
 //! runtime protobuf model and owns runtime-dependent validation.
 
 mod compose;
+pub mod endpoint_status;
 mod l7_validate;
 mod merge;
 mod middleware;

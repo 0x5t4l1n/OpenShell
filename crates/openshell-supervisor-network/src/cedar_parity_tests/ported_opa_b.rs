@@ -931,9 +931,7 @@ when {
     ));
 }
 
-/// Cedar rejects an `HttpRequest` policy that does not name one endpoint in
-/// its scope, so a YAML L7 rule on a wildcard host can only be translated
-/// for the hosts the case uses.
+/// A wildcard selector must inspect every matching host at L7.
 const WILDCARD_L7_CEDAR_CONNECT: &str = r#"
 permit (principal, action == Sandbox::Action::"NetworkConnect", resource)
 when {
@@ -949,9 +947,11 @@ fn ported_wildcard_host_l7_rules_apply() {
         + r#"
 @protocol("rest")
 permit (principal, action == Sandbox::Action::"HttpRequest",
-        resource == Sandbox::NetworkEndpoint::"api.example.com:8080")
+        resource is Sandbox::NetworkEndpoint)
 when {
-    (context.binary_path == "/usr/bin/curl" || context.ancestors.contains("/usr/bin/curl"))
+    resource.host like("*.example.com", ".")
+    && resource.port == 8080
+    && (context.binary_path == "/usr/bin/curl" || context.ancestors.contains("/usr/bin/curl"))
     && ["GET", "HEAD"].contains(context.method)
     && context.path like("/api/**", "/")
 };
@@ -985,6 +985,22 @@ network_policies:
                 "opa.rs::wildcard_host_l7_rules_apply / DELETE",
                 request_in(ctx(), rest("DELETE", "/api/foo")),
             ),
+            same_probe("second wildcard host relays GET", Probe::Relay(Box::new(RelayExchange {
+                    ctx: l7_ctx("other.example.com", 8080, BINARY),
+                    route_selected: false,
+                    request: "GET /api/foo HTTP/1.1\r\nHost: other.example.com:8080\r\nConnection: close\r\n\r\n".to_string(),
+                    upstream_response: NO_CONTENT.to_string(),
+                    marker: None,
+                })),
+            ).asserting_yaml("204/forwarded"),
+            same_probe("second wildcard host blocks DELETE", Probe::Relay(Box::new(RelayExchange {
+                    ctx: l7_ctx("other.example.com", 8080, BINARY),
+                    route_selected: false,
+                    request: "DELETE /api/foo HTTP/1.1\r\nHost: other.example.com:8080\r\nConnection: close\r\n\r\n".to_string(),
+                    upstream_response: NO_CONTENT.to_string(),
+                    marker: None,
+                })),
+            ).asserting_yaml("403/blocked"),
         ],
     ));
 }

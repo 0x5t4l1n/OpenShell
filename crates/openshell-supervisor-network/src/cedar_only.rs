@@ -158,6 +158,7 @@ fn network_request_from_input(input: &NetworkInput) -> NetworkConnectRequest {
 /// Swapped as one unit on reload so a decision never pairs one revision's
 /// Cedar policy with another revision's provider settings.
 struct LoadedPolicy {
+    mcp_endpoints: Vec<openshell_core::proto::NetworkEndpoint>,
     /// Shared with the [`CedarDestination`] of each decision it makes.
     cedar: Arc<CedarEngine>,
     /// Hash of the canonical policy, stamped on every endpoint config so
@@ -231,6 +232,7 @@ impl LoadedPolicy {
             entrypoint_pid,
         )?;
         Ok(Self {
+            mcp_endpoints: openshell_policy::endpoint_status::cedar_mcp_endpoints(policy, &cedar),
             binary_aliases: BinaryAliases::resolve(cedar.binary_alias_paths(), entrypoint_pid),
             binary_globs: BinaryGlobs::compile(&cedar, token_grants.as_ref()),
             cedar,
@@ -273,6 +275,7 @@ impl LoadedPolicy {
         }
         let token_grants = crate::cedar_provider_rules::compile(rules, entrypoint_pid)?;
         Ok(Self {
+            mcp_endpoints: self.mcp_endpoints.clone(),
             cedar: Arc::clone(&self.cedar),
             policy_hash: self.policy_hash.clone(),
             providers: self.providers.clone(),
@@ -359,6 +362,9 @@ impl LoadedPolicy {
                 routes,
                 settings,
                 policy_hash: &self.policy_hash,
+                host,
+                port,
+                mcp_endpoints: &self.mcp_endpoints,
             };
         }
 
@@ -388,6 +394,9 @@ impl LoadedPolicy {
             routes,
             settings,
             policy_hash: &self.policy_hash,
+            host,
+            port,
+            mcp_endpoints: &self.mcp_endpoints,
         }
     }
 
@@ -452,6 +461,9 @@ const UNMATCHED_PATH: &str = "no L7 endpoint path matched request";
 
 /// The endpoint configs of one allowed connection, before they are built.
 struct RoutePlan<'a> {
+    host: String,
+    port: u16,
+    mcp_endpoints: &'a [openshell_core::proto::NetworkEndpoint],
     routes: Vec<Route<'a>>,
     /// The endpoint settings matching the connection, in order.
     settings: Vec<&'a EndpointSetting>,
@@ -521,6 +533,42 @@ impl RoutePlan<'_> {
                 .filter(|setting| setting.path == route.path)
                 .collect();
             apply_settings(&mut config, &scoped, protocol);
+        }
+        if protocol == Some(L7Protocol::Mcp) {
+            // A provider keeps its configured selector and complete effective
+            // port set. Other routes select a configured Cedar/settings
+            // descriptor; an observed host must never replace a host glob.
+            config.endpoint_id = route.provider.map_or_else(
+                || {
+                    self.mcp_endpoints
+                        .iter()
+                        .filter(|endpoint| endpoint.path == route.path)
+                        .filter(|endpoint| {
+                            let ports = if endpoint.ports.is_empty() {
+                                std::slice::from_ref(&endpoint.port)
+                            } else {
+                                &endpoint.ports
+                            };
+                            ports.contains(&u32::from(self.port))
+                                && openshell_core::host_pattern::host_matches(
+                                    &endpoint.host,
+                                    &self.host,
+                                )
+                                .unwrap_or(false)
+                        })
+                        .max_by_key(|endpoint| {
+                            (
+                                endpoint.host == self.host,
+                                endpoint.host.chars().filter(|c| *c != '*').count(),
+                            )
+                        })
+                        .map(openshell_core::endpoint_status::endpoint_id)
+                        .unwrap_or_default()
+                },
+                |endpoint| endpoint.config.endpoint_id.clone(),
+            );
+        } else {
+            config.endpoint_id.clear();
         }
         config
     }
@@ -1009,7 +1057,7 @@ fn apply_settings(
 ///
 /// Settings that describe access, per-request rules, or inspection mode
 /// (`allowed_ips`, `protocol`, `enforcement`, `access`, rules, persisted
-/// queries, MCP options, and MCP identity) are left unset: on a Cedar
+/// queries and MCP options) are left unset: on a Cedar
 /// sandbox, Cedar's `HttpRequest` policies are the per-request rules and
 /// decide inspection, and the proxy checks addresses with the connection's
 /// [`CedarDestination`], which carries provider `allowed_ips` separately so
@@ -1024,6 +1072,7 @@ fn provider_config(endpoint: &openshell_core::proto::NetworkEndpoint) -> Endpoin
         endpoint.ports.clone()
     };
     EndpointConfig {
+        endpoint_id: openshell_core::endpoint_status::endpoint_id(endpoint),
         host: endpoint.host.clone(),
         ports: ports
             .into_iter()
@@ -1114,6 +1163,9 @@ fn policy_from_source(policy_src: &str) -> ProtoSandboxPolicy {
 /// decision, chosen once at policy load.
 #[derive(Debug)]
 pub struct CedarOnlyEngine {
+    /// Sandbox-wide admission survives policy reloads and is shared by forward
+    /// requests and CONNECT tunnels.
+    websocket_assembly_budget: crate::l7::websocket::WebSocketAssemblyBudget,
     /// Shared with every [`CedarL7TunnelEngine`] handed out by
     /// [`Self::l7_handle`].
     engine: Arc<RwLock<LoadedPolicy>>,
@@ -1155,6 +1207,7 @@ impl CedarOnlyEngine {
         let loaded = LoadedPolicy::from_proto(&policy, 0)?;
         let (generation_tx, _) = watch::channel(0);
         Ok(Self {
+            websocket_assembly_budget: crate::l7::websocket::WebSocketAssemblyBudget::default(),
             engine: Arc::new(RwLock::new(loaded)),
             inputs: RwLock::new(PolicyInputs::from_proto(&policy)),
             generation: Arc::new(AtomicU64::new(0)),
@@ -1177,6 +1230,12 @@ impl CedarOnlyEngine {
     #[must_use]
     pub fn current_generation(&self) -> u64 {
         self.generation.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn websocket_assembly_budget(
+        &self,
+    ) -> crate::l7::websocket::WebSocketAssemblyBudget {
+        self.websocket_assembly_budget.clone()
     }
 
     /// Returns the sandbox's middleware configs, services, and generation.
@@ -2529,6 +2588,169 @@ when { context.binary_path == "/usr/bin/curl" };
             .evaluate_request(&ctx(), &request("GET", "/v1/status"))
             .expect("request evaluates");
         assert!(allowed, "Cedar must decide the request");
+    }
+
+    #[tokio::test]
+    async fn cedar_mcp_routes_observe_the_configured_inventory_identity() {
+        use openshell_core::endpoint_status::{
+            EndpointConfigVersion, EndpointInventoryEntry, EndpointResult, endpoint_id,
+            endpoint_status_channel,
+        };
+        use openshell_core::proto::NetworkEndpoint;
+        let source = r#"
+permit (principal, action == Sandbox::Action::"NetworkConnect", resource)
+when { resource.host like("*.example.com", ".") && resource.port == 443 };
+@protocol("mcp") @path("/mcp/**")
+permit (principal, action == Sandbox::Action::"HttpRequest", resource)
+when { resource.host like("*.example.com", ".") && resource.port == 443 };
+@protocol("rest") @path("/rest/**")
+permit (principal, action == Sandbox::Action::"HttpRequest", resource)
+when { resource.host like("*.example.com", ".") && resource.port == 443 };
+"#;
+        let provider = NetworkEndpoint {
+            host: "*.example.com".to_string(),
+            ports: vec![8443, 443],
+            path: "/mcp/provider/**".to_string(),
+            provider_credentialed: true,
+            ..Default::default()
+        };
+        let setting = NetworkEndpoint {
+            host: "api.example.com".to_string(),
+            port: 443,
+            path: "/mcp/scoped".to_string(),
+            allow_encoded_slash: true,
+            ..Default::default()
+        };
+        let mut policy = provider_policy(source, vec![provider.clone()]);
+        policy.endpoint_settings.push(setting.clone());
+        let policy = openshell_policy::validate_and_canonicalize_sandbox_policy(policy)
+            .expect("canonical policy");
+        let engine = CedarOnlyEngine::from_proto(&policy).expect("policy loads");
+        let descriptors = openshell_policy::endpoint_status::configured_mcp_endpoints(&policy)
+            .expect("inventory");
+        let (sender, mut receiver) = endpoint_status_channel();
+        let mut tracker = receiver.tracker();
+        sender
+            .reset(
+                EndpointConfigVersion {
+                    policy_hash: deterministic_policy_hash(&policy),
+                    provider_env_revision: 1,
+                },
+                descriptors
+                    .iter()
+                    .map(|endpoint| EndpointInventoryEntry {
+                        endpoint_id: endpoint_id(endpoint),
+                        uses_provider_credentials: endpoint.provider_credentialed,
+                    })
+                    .collect(),
+            )
+            .await
+            .expect("reset");
+        assert!(tracker.apply(receiver.recv().await.expect("reset received")));
+        let base = NetworkEndpoint {
+            host: "*.example.com".to_string(),
+            port: 443,
+            path: "/mcp/**".to_string(),
+            ..Default::default()
+        };
+        for (host, path, expected) in [
+            ("api.example.com", "/mcp/item", &base),
+            ("other.example.com", "/mcp/item", &base),
+            ("api.example.com", "/mcp/provider/item", &provider),
+            ("other.example.com", "/mcp/provider/item", &provider),
+            ("api.example.com", "/mcp/scoped", &setting),
+        ] {
+            let loaded = engine.read_engine().expect("lock");
+            let config = loaded.request_config(host, 443, path).expect("route");
+            let selected = crate::l7::parse_l7_config(&config).expect("MCP config");
+            assert_eq!(selected.endpoint_id, endpoint_id(expected), "{host}{path}");
+            let observer = crate::l7::EndpointObserver::begin(Some(&sender), &selected)
+                .expect("observation starts");
+            observer.observe(EndpointResult::HttpResponseReceived);
+        }
+        let rest = engine
+            .read_engine()
+            .expect("lock")
+            .request_config("api.example.com", 443, "/rest/item")
+            .expect("REST route");
+        let rest = crate::l7::parse_l7_config(&rest).expect("REST config");
+        assert!(crate::l7::EndpointObserver::begin(Some(&sender), &rest).is_none());
+        while let Ok(command) = receiver.try_recv() {
+            tracker.apply(command);
+        }
+        let snapshot = tracker.snapshot().expect("snapshot");
+        for expected in [&base, &provider, &setting] {
+            assert!(
+                snapshot
+                    .endpoints
+                    .iter()
+                    .any(|endpoint| endpoint.endpoint_id == endpoint_id(expected)
+                        && endpoint.result == EndpointResult::HttpResponseReceived)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn websocket_admission_is_shared_across_forward_tunnels_and_reload() {
+        use crate::l7::websocket::{WebSocketAssemblyAdmissionOutcome, WebSocketAssemblyBudget};
+        let mut cedar = CedarOnlyEngine::from_policy_str(POLICY).expect("policy parses");
+        cedar.websocket_assembly_budget = WebSocketAssemblyBudget::new(1, 1);
+        let cedar = Arc::new(cedar);
+        let engine = crate::policy_engine::PolicyEngine::from(Arc::clone(&cedar));
+        let first = engine
+            .tunnel_engine(cedar.current_generation())
+            .expect("first tunnel");
+        let second = engine
+            .tunnel_engine(cedar.current_generation())
+            .expect("second tunnel");
+        let active = first
+            .websocket_assembly_budget()
+            .reserve()
+            .await
+            .expect("reserve");
+        assert!(matches!(
+            active,
+            WebSocketAssemblyAdmissionOutcome::Admitted(_)
+        ));
+        let waiting_budget = second.websocket_assembly_budget();
+        let waiting = waiting_budget.reserve();
+        tokio::pin!(waiting);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(10), &mut waiting)
+                .await
+                .is_err()
+        );
+        assert!(matches!(
+            engine
+                .websocket_assembly_budget()
+                .reserve()
+                .await
+                .expect("forward admission"),
+            WebSocketAssemblyAdmissionOutcome::QueueExhausted
+        ));
+        cedar
+            .reload_from_policy_str(&POLICY.replace("/v1/status", "/v2/status"))
+            .expect("reload");
+        assert!(
+            first.generation_guard().is_stale(),
+            "the reload changed policy"
+        );
+        let reloaded = engine
+            .tunnel_engine(cedar.current_generation())
+            .expect("new tunnel");
+        assert!(matches!(
+            reloaded
+                .websocket_assembly_budget()
+                .reserve()
+                .await
+                .expect("reloaded admission"),
+            WebSocketAssemblyAdmissionOutcome::QueueExhausted
+        ));
+        drop(active);
+        assert!(matches!(
+            waiting.await.expect("waiter admitted"),
+            WebSocketAssemblyAdmissionOutcome::Admitted(_)
+        ));
     }
 
     #[test]
