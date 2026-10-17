@@ -732,7 +732,7 @@ impl OpenShell for OpenShellService {
         &self,
         request: Request<ApproveDraftChunkRequest>,
     ) -> Result<Response<ApproveDraftChunkResponse>, Status> {
-        mutation_replay::run(&self.state, request).await
+        Box::pin(mutation_replay::run(&self.state, request)).await
     }
 
     async fn reject_draft_chunk(

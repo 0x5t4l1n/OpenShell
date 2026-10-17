@@ -9276,8 +9276,7 @@ mod tests {
                 .unwrap();
             assert_eq!(retained.phase(), SandboxPhase::Deleting as i32);
             assert_eq!(credentials.stored_credential_count(), Some(1));
-            runtime
-                .reconcile_store_with_backend(Duration::ZERO)
+            Box::pin(runtime.reconcile_store_with_backend(Duration::ZERO))
                 .await
                 .unwrap();
             assert!(
@@ -9375,8 +9374,7 @@ mod tests {
         assert_eq!(retained.phase(), SandboxPhase::Deleting as i32);
         assert_eq!(credentials.stored_credential_count(), Some(1));
         driver.set_get_outcome(ControlledGetOutcome::Missing);
-        runtime
-            .reconcile_store_with_backend(Duration::ZERO)
+        Box::pin(runtime.reconcile_store_with_backend(Duration::ZERO))
             .await
             .unwrap();
         assert!(
@@ -14430,8 +14428,7 @@ mod tests {
         let sandbox = sandbox_record("sb-1", "sandbox-a", SandboxPhase::Provisioning);
         runtime.store.put_message(&sandbox).await.unwrap();
 
-        runtime
-            .reconcile_store_with_backend(Duration::ZERO)
+        Box::pin(runtime.reconcile_store_with_backend(Duration::ZERO))
             .await
             .unwrap();
 
@@ -15839,8 +15836,7 @@ mod tests {
         runtime.sandbox_index.update_from_sandbox(&sandbox);
         register_test_supervisor_session(&runtime, "sb-1");
 
-        runtime
-            .reconcile_store_with_backend(Duration::ZERO)
+        Box::pin(runtime.reconcile_store_with_backend(Duration::ZERO))
             .await
             .unwrap();
 
@@ -15908,8 +15904,7 @@ mod tests {
         runtime.sandbox_index.update_from_sandbox(&sandbox);
 
         let traced = test_exporter::install_traced();
-        runtime
-            .reconcile_store_with_backend(Duration::ZERO)
+        Box::pin(runtime.reconcile_store_with_backend(Duration::ZERO))
             .await
             .unwrap();
 
@@ -15987,8 +15982,7 @@ mod tests {
         }))
         .await;
 
-        runtime
-            .reconcile_store_with_backend(Duration::ZERO)
+        Box::pin(runtime.reconcile_store_with_backend(Duration::ZERO))
             .await
             .unwrap();
 
@@ -16036,8 +16030,7 @@ mod tests {
         runtime.sandbox_index.update_from_sandbox(&sandbox);
         register_test_supervisor_session(&runtime, "sb-1");
 
-        runtime
-            .reconcile_store_with_backend(Duration::ZERO)
+        Box::pin(runtime.reconcile_store_with_backend(Duration::ZERO))
             .await
             .unwrap();
 
@@ -16100,8 +16093,7 @@ mod tests {
 
         let mut watch_rx = runtime.sandbox_watch_bus.subscribe(sandbox.object_id());
 
-        runtime
-            .reconcile_store_with_backend(Duration::ZERO)
+        Box::pin(runtime.reconcile_store_with_backend(Duration::ZERO))
             .await
             .unwrap();
 
