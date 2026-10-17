@@ -750,13 +750,40 @@ fn graphql_aware_permits_of_other_paths_still_apply() {
 }
 
 #[test]
+fn other_resource_attributes_do_not_make_rest_permits_graphql_aware() {
+    for rest_scope in [
+        " && resource.port == 443",
+        " && resource has port",
+        r#" && resource.host like("*.example.com", ".")"#,
+        r#" && resource == Sandbox::NetworkEndpoint::"api.example.com:443""#,
+        " && resource == resource",
+    ] {
+        let engine = engine(&rest_and_graphql(rest_scope));
+        assert!(
+            !engine
+                .evaluate_l7(&graphql("mutation", &["createIssue"]))
+                .unwrap()
+                .is_allow(),
+            "{rest_scope}"
+        );
+        assert!(
+            engine
+                .evaluate_l7(&graphql("query", &["viewer"]))
+                .unwrap()
+                .is_allow(),
+            "{rest_scope}"
+        );
+    }
+}
+
+#[test]
 fn websocket_graphql_messages_are_authoritative_but_the_upgrade_is_not() {
     let policy = format!(
         "{}{}",
         http_policy(
             r#"@path("/**") @id("rest")"#,
             "permit",
-            r#"["GET", "WEBSOCKET_TEXT"].contains(context.method)"#
+            r#"["GET", "WEBSOCKET_TEXT"].contains(context.method) && resource.port == 443"#
         ),
         http_policy(
             r#"@path("/ws") @protocol("websocket-graphql") @id("ws")"#,

@@ -31,6 +31,24 @@ when {{ {condition} && {extra} }};
 
 const WILDCARD_443: &str = r#"resource.host like("*.example.com", ".") && resource.port == 443"#;
 
+#[test]
+fn oversized_selectors_are_rejected_before_overlap_analysis() {
+    let host = "a".repeat(100_000);
+    let scoped = format!(
+        r#"permit (principal, action == Sandbox::Action::"HttpRequest",
+              resource == Sandbox::NetworkEndpoint::"{host}:443");"#
+    );
+    assert!(matches!(
+        rejection(&format!("{scoped}{scoped}")),
+        CedarEngineError::InvalidEndpoint { .. }
+    ));
+    let glob = format!(r#"resource.host like("*.{host}.com", ".") && resource.port == 443"#);
+    assert!(matches!(
+        rejection(&glob_policy("", "permit", &glob, "true")),
+        CedarEngineError::InvalidEndpoint { .. }
+    ));
+}
+
 /// A request from curl to `host:443`, routed to the Cedar path `endpoint_path`.
 fn request(host: &str, method: &str, path: &str, endpoint_path: &str) -> HttpRequestInput {
     HttpRequestInput {
@@ -94,6 +112,22 @@ fn a_host_glob_inspects_every_matching_host() {
         matches!(denied.decision, Decision::Deny { .. }),
         "{denied:?}"
     );
+}
+
+#[test]
+fn configured_endpoints_preserve_host_globs_and_paths() {
+    let engine = engine(&glob_policy(
+        r#"@path("/mcp/**") @protocol("mcp")"#,
+        "permit",
+        WILDCARD_443,
+        "true",
+    ));
+    let configured: Vec<_> = engine.configured_l7_endpoints().collect();
+    assert_eq!(configured.len(), 1);
+    assert_eq!(configured[0].0, "*.example.com");
+    assert_eq!(configured[0].1, 443);
+    assert_eq!(configured[0].2, "/mcp/**");
+    assert_eq!(configured[0].3.protocol, L7Protocol::Mcp);
 }
 
 #[test]
@@ -185,6 +219,18 @@ fn glob_endpoints_take_paths_protocols_and_enforcement() {
         Some(L7Protocol::Graphql)
     );
     assert!(inspected(&engine, "example.com").is_empty());
+    for operation in ["query", "mutation"] {
+        let request = HttpRequestInput {
+            graphql_request: true,
+            graphql_operation_type: operation.to_string(),
+            ..request("other.example.com", "GET", "/graphql", "/graphql")
+        };
+        assert_eq!(
+            engine.evaluate_l7(&request).unwrap().is_allow(),
+            operation == "query",
+            "a REST host-glob permit must not allow a GraphQL {operation}"
+        );
+    }
 }
 
 #[test]

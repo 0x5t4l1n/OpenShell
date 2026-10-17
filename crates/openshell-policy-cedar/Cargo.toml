@@ -19,6 +19,7 @@ openshell-core = { path = "../openshell-core", default-features = false }
 openshell-policy-cedar-schema = { path = "../openshell-policy-cedar-schema" }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
+tracing = { workspace = true }
 
 [lints]
 workspace = true

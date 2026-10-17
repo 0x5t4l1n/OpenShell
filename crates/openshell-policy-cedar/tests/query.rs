@@ -329,6 +329,55 @@ fn staged_policies_combine_like_deciding_ones() {
 }
 
 #[test]
+fn staged_query_expansion_cannot_fail_an_enforced_decision() {
+    let staged = http_policy(
+        r#"@enforcement("staged")"#,
+        "forbid",
+        &format!("{} && {}", tag_like("a", "*"), tag_like("b", "*")),
+    );
+    let values: Vec<String> = (0..65).map(|value| value.to_string()).collect();
+    let values: Vec<&str> = values.iter().map(String::as_str).collect();
+    let request = request(&[("a", &values), ("b", &values[..64])]);
+    for condition in ["true", "false"] {
+        let baseline = http_policy("", "permit", condition);
+        let expected = engine(&baseline).evaluate_l7(&request).unwrap();
+        let actual = engine(&format!("{baseline}{staged}"))
+            .evaluate_l7(&request)
+            .unwrap();
+        assert_eq!(actual.decision, expected.decision);
+        assert_eq!(actual.staged, None, "the comparison exceeds its budget");
+    }
+}
+
+#[test]
+fn staged_runtime_errors_do_not_change_enforced_decisions() {
+    let overflow = "resource.port * 9223372036854775807 > 0";
+    for condition in ["true", "false"] {
+        let baseline = http_policy("", "permit", condition);
+        let expected = engine(&baseline).evaluate_l7(&request(&[])).unwrap();
+        let actual = engine(&format!(
+            "{}{}",
+            baseline,
+            http_policy(r#"@enforcement("staged")"#, "forbid", overflow),
+        ))
+        .evaluate_l7(&request(&[]))
+        .unwrap();
+        assert_eq!(actual.decision, expected.decision);
+        assert_eq!(actual.staged, None);
+    }
+    // The same error in an enforced policy must still fail closed.
+    let enforced = engine(&format!(
+        "{}{}",
+        http_policy("", "permit", "true"),
+        http_policy("", "forbid", overflow),
+    ));
+    assert!(matches!(
+        enforced.evaluate_l7(&request(&[])),
+        Err(CedarEngineError::Evaluation { .. })
+    ));
+}
+
+#[test]
 fn query_is_not_part_of_network_connect() {
     let error = CedarEngine::from_policy_str(
         r#"permit (principal, action == Sandbox::Action::"NetworkConnect", resource)

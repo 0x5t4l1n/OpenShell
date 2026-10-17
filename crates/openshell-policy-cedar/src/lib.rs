@@ -519,6 +519,20 @@ impl CedarEngine {
         merged.into_iter()
     }
 
+    /// Returns configured endpoint selectors and paths without expanding host globs.
+    pub fn configured_l7_endpoints(
+        &self,
+    ) -> impl Iterator<Item = (String, u16, String, L7Endpoint)> {
+        self.analysis
+            .l7_endpoints
+            .iter()
+            .flat_map(|((host, port), paths)| {
+                paths
+                    .iter()
+                    .map(move |(path, endpoint)| (host.clone(), *port, path.clone(), *endpoint))
+            })
+    }
+
     /// Evaluates one network-connect request against the loaded policy set.
     ///
     /// # Errors
@@ -647,7 +661,8 @@ impl CedarEngine {
     /// has more than [`MAX_QUERY_COMBINATIONS`] value combinations, and
     /// another [`CedarEngineError`] if the request cannot be represented in
     /// the loaded schema, or if Cedar reports an error while evaluating any
-    /// policy.
+    /// deciding policy. Errors in the staged comparison are logged without
+    /// changing the enforced decision.
     pub fn evaluate_l7(
         &self,
         request: &HttpRequestInput,
@@ -655,7 +670,6 @@ impl CedarEngine {
         let endpoint = self.l7_endpoint_at(&request.host, request.port, &request.endpoint_path);
         let protocol = endpoint.map_or("", |endpoint| endpoint.protocol.as_str());
         let query = QueryCombinations::new(&request.query, &self.analysis.query_keys)?;
-        let evaluate = |policies: &PolicySet| self.decide_l7(policies, request, protocol, &query);
         // Any entry selecting the host that declares the routed path works:
         // its exclusion set covers every entry that can select the host.
         let graphql = request
@@ -675,13 +689,21 @@ impl CedarEngine {
         let (deciding, all) = graphql.map_or((&self.deciding_policies, &self.policies), |sets| {
             (&sets.deciding, &sets.all)
         });
-        let decision = evaluate(deciding)?;
+        let decision = self.decide_l7(deciding, request, protocol, &query)?;
         // Compare decisions, not the staged set's decision alone: Cedar denies
         // by default, so a set of only staged `forbid`s denies every request
         // whether or not one of them matched.
         let staged = if endpoint.is_some_and(|endpoint| endpoint.staged) {
-            let staged = evaluate(all)?;
-            (staged.is_allow() != decision.is_allow()).then_some(staged)
+            match QueryCombinations::new(&request.query, &self.analysis.staged_query_keys)
+                .and_then(|query| self.decide_l7(all, request, protocol, &query))
+            {
+                Ok(staged) => (staged.is_allow() != decision.is_allow()).then_some(staged),
+                Err(_) => {
+                    // Never include authored expressions or request query values.
+                    tracing::debug!("staged Cedar evaluation failed; retaining enforced decision");
+                    None
+                }
+            }
         } else {
             None
         };

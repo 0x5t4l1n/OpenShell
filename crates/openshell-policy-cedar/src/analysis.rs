@@ -499,8 +499,10 @@ pub struct PolicyAnalysis {
     /// The keys of [`Self::l7_endpoints`] whose host is a glob, compiled
     /// with the matcher policy DNS and YAML endpoints use, in key order.
     pub(crate) l7_host_patterns: Vec<L7HostPattern>,
-    /// The query keys a policy can read.
+    /// The query keys deciding policies can read.
     pub(crate) query_keys: QueryKeys,
+    /// The query keys all policies, including staged policies, can read.
+    pub(crate) staged_query_keys: QueryKeys,
     /// What each `NetworkConnect` permit requires of a connection, by id.
     pub(crate) network_permits: HashMap<PolicyId, NetworkPermit>,
     /// Each permit that reads `destination_ip`, without its address
@@ -687,13 +689,17 @@ pub fn analyze(schema: &Schema, policies: &PolicySet) -> Result<PolicyAnalysis, 
     let mut l7_declared: BTreeMap<(String, u16), DeclaredEndpoint> = BTreeMap::new();
     let mut hostless_permits = Vec::new();
     let mut query_keys = QueryKeys::default();
+    let mut staged_query_keys = QueryKeys::default();
     let mut binary_alias_paths = BTreeSet::new();
     let mut binary_glob_patterns = BTreeSet::new();
     let mut http_permits = HashMap::new();
 
     for policy in policies.policies() {
         let policy_id = display_id(policy);
-        query_keys.add_policy(policy);
+        staged_query_keys.add_policy(policy);
+        if !is_staged(policy) {
+            query_keys.add_policy(policy);
+        }
         let json = policy
             .to_json()
             .map_err(|_| CedarEngineError::UnsupportedPolicy {
@@ -974,6 +980,7 @@ pub fn analyze(schema: &Schema, policies: &PolicySet) -> Result<PolicyAnalysis, 
         l7_endpoints,
         l7_host_patterns,
         query_keys,
+        staged_query_keys,
         network_permits,
         unresolved,
         binary_alias_paths,
@@ -1317,15 +1324,18 @@ fn reads_context_attr(expr: &Value, accept: impl Fn(&str) -> bool + Copy) -> boo
     }
 }
 
-/// True if `expr` reads `resource.<attr>`, or the whole `resource` record.
+/// True if `expr` reads or tests `resource.<attr>`.
 fn mentions_resource_attr(expr: &Value, attr: &str) -> bool {
     match expr {
         Value::Object(fields) => fields.iter().any(|(name, value)| {
-            if name == "Var" && value.as_str() == Some("resource") {
-                return true;
-            }
-            if name == "." && is_resource_attr(expr, attr) {
-                return true;
+            if (name == "." || name == "has")
+                && value
+                    .get("left")
+                    .and_then(|left| left.get("Var"))
+                    .and_then(Value::as_str)
+                    == Some("resource")
+            {
+                return value.get("attr").and_then(Value::as_str) == Some(attr);
             }
             mentions_resource_attr(value, attr)
         }),
@@ -1912,48 +1922,59 @@ fn host_tokens(pattern: &str) -> Vec<HostToken> {
 /// Returns whether some host matches both host patterns, each an exact
 /// host or a host glob in policy DNS syntax.
 pub fn host_patterns_overlap(left: &str, right: &str) -> bool {
+    if !left.contains('*') && !right.contains('*') {
+        return left == right;
+    }
+    // Authored selectors are bounded at load time. Keep this public helper
+    // conservative for oversized callers too: an unknown overlap must not
+    // bypass checks for conflicting inspection modes.
+    if left.len() > MAX_DNS_NAME_LEN || right.len() > MAX_DNS_NAME_LEN {
+        return true;
+    }
     let (left, right) = (host_tokens(left), host_tokens(right));
     let accepts = |token: HostToken, c: char| match token {
         HostToken::Literal(literal) => literal == c,
         HostToken::Star { crosses_labels } => crosses_labels || c != '.',
     };
-    // Search the states (position in left, position in right) reachable
-    // while reading one host through both patterns.
-    let mut seen = vec![vec![false; right.len() + 1]; left.len() + 1];
-    let mut pending = vec![(0, 0)];
-    while let Some((i, j)) = pending.pop() {
-        if std::mem::replace(&mut seen[i][j], true) {
-            continue;
-        }
-        if i == left.len() && j == right.len() {
-            return true;
-        }
-        let (l, r) = (left.get(i).copied(), right.get(j).copied());
-        // A star may match nothing.
-        if let Some(HostToken::Star { .. }) = l {
-            pending.push((i + 1, j));
-        }
-        if let Some(HostToken::Star { .. }) = r {
-            pending.push((i, j + 1));
-        }
-        // Read one character that both patterns accept. Two stars reading
-        // the same character stay where they are, so only a literal moves.
-        match (l, r) {
-            (Some(HostToken::Literal(a)), Some(HostToken::Literal(b))) if a == b => {
-                pending.push((i + 1, j + 1));
+    // Every transition advances at least one pattern position. Keep only
+    // the current and next row of reachable states, rather than a matrix.
+    let mut current = vec![false; right.len() + 1];
+    let mut next = vec![false; right.len() + 1];
+    current[0] = true;
+    for i in 0..=left.len() {
+        for j in 0..=right.len() {
+            if !current[j] {
+                continue;
             }
-            (Some(HostToken::Literal(c)), Some(star @ HostToken::Star { .. }))
-                if accepts(star, c) =>
-            {
-                pending.push((i + 1, j));
+            if i == left.len() && j == right.len() {
+                return true;
             }
-            (Some(star @ HostToken::Star { .. }), Some(HostToken::Literal(c)))
-                if accepts(star, c) =>
-            {
-                pending.push((i, j + 1));
+            let (l, r) = (left.get(i).copied(), right.get(j).copied());
+            if let Some(HostToken::Star { .. }) = l {
+                next[j] = true;
             }
-            _ => {}
+            if let Some(HostToken::Star { .. }) = r {
+                current[j + 1] = true;
+            }
+            match (l, r) {
+                (Some(HostToken::Literal(a)), Some(HostToken::Literal(b))) if a == b => {
+                    next[j + 1] = true;
+                }
+                (Some(HostToken::Literal(c)), Some(star @ HostToken::Star { .. }))
+                    if accepts(star, c) =>
+                {
+                    next[j] = true;
+                }
+                (Some(star @ HostToken::Star { .. }), Some(HostToken::Literal(c)))
+                    if accepts(star, c) =>
+                {
+                    current[j + 1] = true;
+                }
+                _ => {}
+            }
         }
+        std::mem::swap(&mut current, &mut next);
+        next.fill(false);
     }
     false
 }
@@ -2213,6 +2234,9 @@ fn parse_endpoint(policy_id: &str, endpoint: &str) -> Result<(String, u16), Ceda
     if host.is_empty() {
         return Err(invalid("host must not be empty"));
     }
+    if host.len() > MAX_DNS_NAME_LEN {
+        return Err(invalid("host selector must not exceed 253 bytes"));
+    }
     if host.ends_with('.') {
         return Err(invalid("host must not end with '.'"));
     }
@@ -2280,7 +2304,16 @@ fn condition_endpoint(
         HostConstraint::Eligible(_) | HostConstraint::Ineligible => single_port(&operands),
     };
     Ok(match (host, port) {
-        (HostConstraint::Eligible(host), Some(port)) => Some((host, port)),
+        (HostConstraint::Eligible(host), Some(port)) => {
+            if host.len() > MAX_DNS_NAME_LEN {
+                return Err(CedarEngineError::InvalidEndpoint {
+                    policy_id: policy_id.to_string(),
+                    endpoint: format!("{host}:{port}"),
+                    reason: "host selector must not exceed 253 bytes".to_string(),
+                });
+            }
+            Some((host, port))
+        }
         _ => None,
     })
 }
@@ -2698,4 +2731,37 @@ pub fn display_id(policy: &Policy) -> String {
     policy
         .annotation(ID_ANNOTATION)
         .map_or_else(|| policy.id().to_string(), ToString::to_string)
+}
+
+#[cfg(test)]
+mod overlap_tests {
+    use super::host_patterns_overlap;
+
+    #[test]
+    fn literal_and_glob_boundaries() {
+        for (left, right, overlaps) in [
+            ("api.example.com", "api.example.com", true),
+            ("api.example.com", "other.example.com", false),
+            ("*.example.com", "api.example.com", true),
+            ("*.example.com", "deep.api.example.com", false),
+            ("**.example.com", "deep.api.example.com", true),
+            ("a*.example.com", "*b.example.com", true),
+            ("*.example.com", "*.example.org", false),
+        ] {
+            assert_eq!(
+                host_patterns_overlap(left, right),
+                overlaps,
+                "{left} vs {right}"
+            );
+            assert_eq!(
+                host_patterns_overlap(right, left),
+                overlaps,
+                "{right} vs {left}"
+            );
+        }
+        let huge = "a".repeat(100_000);
+        assert!(host_patterns_overlap(&huge, &huge));
+        assert!(!host_patterns_overlap(&huge, "other.example.com"));
+        assert!(host_patterns_overlap(&format!("*.{huge}"), "*.example.com"));
+    }
 }
