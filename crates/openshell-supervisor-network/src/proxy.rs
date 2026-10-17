@@ -878,11 +878,13 @@ pub(crate) async fn stage_transparent_open_for_test(
             cmdline_paths: Vec::new(),
         }),
         destination,
-        socket: Some(openshell_isolation_interface::contract::NetworkSocketMetadata {
-            socket_cookie: 7,
-            nonblocking: false,
-            process_generation: 1,
-        }),
+        socket: Some(
+            openshell_isolation_interface::contract::NetworkSocketMetadata {
+                socket_cookie: 7,
+                nonblocking: false,
+                process_generation: 1,
+            },
+        ),
         policy_generation: engine.current_generation(),
         timing: MediationTiming::default(),
         decision,
