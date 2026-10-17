@@ -16,6 +16,10 @@ Cedar's restricted language makes policies easier to analyze, for example to che
 
 OpenShell treats a policy file as Cedar when its extension is `.cedar`, in any case. Any other extension is parsed as YAML.
 
+Host selectors, including host globs, must not exceed 253 bytes.
+
+Both the gateway and sandbox runtime must support Cedar. The CLI refuses to send Cedar policies to a gateway that does not advertise Cedar support, and the gateway withholds Cedar configuration from an older runtime. Upgrade both before applying a Cedar policy.
+
 Create a sandbox with a Cedar policy:
 
 ```shell
@@ -356,7 +360,7 @@ forbid (
 when { context.query.hasTag("force") && context.query.getTag("force") == "true" };
 ```
 
-When a key repeats, as in `?tag=foo-a&tag=foo-b`, OpenShell evaluates the request once for each combination of values. It allows the request only if no evaluation is denied and one `permit` allows every evaluation. This matches YAML: a permit must accept every value of each key it reads, and a `forbid` applies when each key it reads has one matching value. Write each YAML allow rule as its own `permit`, because two rules joined with `||` in one permit can together allow values that neither rule allows alone. OpenShell denies a request with more than 4096 combinations of the keys that policies read.
+When a key repeats, as in `?tag=foo-a&tag=foo-b`, OpenShell evaluates the request once for each combination of values. It allows the request only if no evaluation is denied and one `permit` allows every evaluation. This matches YAML: a permit must accept every value of each key it reads, and a `forbid` applies when each key it reads has one matching value. Write each YAML allow rule as its own `permit`, because two rules joined with `||` in one permit can together allow values that neither rule allows alone. OpenShell denies a request with more than 4096 combinations of the keys that deciding policies read. Staged policies have a separate comparison budget; exceeding it or encountering an evaluation error skips the staged comparison and preserves the enforced decision.
 
 ### MCP
 

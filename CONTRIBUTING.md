@@ -87,7 +87,7 @@ Public skills live in `skills/` and work without an OpenShell source checkout. I
 | `openshell-cli` | CLI usage, sandbox lifecycle, provider management, and BYOC workflows |
 | `debug-openshell-cluster` | Diagnose gateway deployment and health issues |
 | `debug-inference` | Diagnose attached-provider inference, native endpoints, and migration from the retired managed endpoint |
-| `generate-sandbox-policy` | Generate YAML sandbox policies from requirements or API documentation |
+| `generate-sandbox-policy` | Generate or edit YAML and Cedar sandbox policies while preserving their format and middleware configuration |
 
 Public skills use `openshell --help` for installed command syntax and published OpenShell documentation for product concepts and configuration. They must not depend on repository-relative source or documentation files.
 
