@@ -5536,6 +5536,8 @@ network_policies:
         .await;
     }
 
+    // This scenario requires the Unix filesystem paths used by proxy baselines.
+    #[cfg(unix)]
     #[tokio::test(start_paused = true)]
     async fn startup_policy_write_refusal_baseline_write_back_waits_for_repair() {
         // The gateway policy has network rules but lacks the proxy baseline
@@ -5665,6 +5667,8 @@ network_policies:
         .await;
     }
 
+    // This scenario requires the Unix filesystem paths used by proxy baselines.
+    #[cfg(unix)]
     #[tokio::test(start_paused = true)]
     async fn startup_policy_write_refusal_baseline_repair_before_report_refetches() {
         let mut repaired = proto_tcp_policy_fixture();
@@ -5808,6 +5812,8 @@ network_policies:
         .await;
     }
 
+    // This scenario requires the Unix filesystem paths used by proxy baselines.
+    #[cfg(unix)]
     #[tokio::test(start_paused = true)]
     async fn startup_policy_write_refusal_write_back_outlasts_the_attempt_limit() {
         // The same limit applies to a refused baseline-path write-back.
@@ -5895,6 +5901,8 @@ network_policies:
         );
     }
 
+    // This scenario requires the Unix filesystem paths used by proxy baselines.
+    #[cfg(unix)]
     #[tokio::test(start_paused = true)]
     async fn startup_policy_write_refusal_global_policy_skips_baseline_write_back() {
         use openshell_core::proto::{ConfigurationAdmissionState, PolicySource};
@@ -5977,21 +5985,26 @@ network_policies:
 
     #[tokio::test(start_paused = true)]
     async fn startup_policy_write_refusal_permanent_codes_still_exit() {
-        use openshell_core::proto::{ConfigurationAdmissionState, PolicySource};
+        use openshell_core::proto::ConfigurationAdmissionState;
         // No policy or provider change repairs these refusals, so startup
         // keeps exiting instead of holding the sandbox in its repair window.
-        // Both writes are checked: the image policy upload to a gateway with
-        // no policy, and the write-back of a stored policy that lacks the
-        // proxy baseline paths.
+        // Check image policy uploads to a gateway with no policy. On Unix,
+        // also check write-back of a stored policy missing proxy baseline paths.
         let writes = [
             (
                 "image policy upload",
                 unset_policy_snapshot(),
                 ImagePolicyDiscovery::Policy(Box::new(proto_tcp_policy_fixture())),
             ),
+            // Baseline enrichment requires existing Unix filesystem paths.
+            #[cfg(unix)]
             (
                 "baseline write-back",
-                settings_poll_result(Some(proto_tcp_policy_fixture()), 1, PolicySource::Sandbox),
+                settings_poll_result(
+                    Some(proto_tcp_policy_fixture()),
+                    1,
+                    openshell_core::proto::PolicySource::Sandbox,
+                ),
                 ImagePolicyDiscovery::Missing,
             ),
         ];
