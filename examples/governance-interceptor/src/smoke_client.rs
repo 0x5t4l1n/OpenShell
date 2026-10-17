@@ -58,6 +58,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let before = client
         .get_sandbox_config(GetSandboxConfigRequest {
+            supports_cedar_policy: true,
             name: sandbox_name.clone(),
             workspace_scope: Some(default_workspace()),
         })
@@ -145,6 +146,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let after = client
         .get_sandbox_config(GetSandboxConfigRequest {
+            supports_cedar_policy: true,
             name: sandbox_name,
             workspace_scope: Some(default_workspace()),
         })
