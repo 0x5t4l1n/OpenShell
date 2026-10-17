@@ -694,16 +694,18 @@ impl CedarEngine {
         // by default, so a set of only staged `forbid`s denies every request
         // whether or not one of them matched.
         let staged = if endpoint.is_some_and(|endpoint| endpoint.staged) {
-            match QueryCombinations::new(&request.query, &self.analysis.staged_query_keys)
+            QueryCombinations::new(&request.query, &self.analysis.staged_query_keys)
                 .and_then(|query| self.decide_l7(all, request, protocol, &query))
-            {
-                Ok(staged) => (staged.is_allow() != decision.is_allow()).then_some(staged),
-                Err(_) => {
-                    // Never include authored expressions or request query values.
-                    tracing::debug!("staged Cedar evaluation failed; retaining enforced decision");
-                    None
-                }
-            }
+                .map_or_else(
+                    |_| {
+                        // Never include authored expressions or request query values.
+                        tracing::debug!(
+                            "staged Cedar evaluation failed; retaining enforced decision"
+                        );
+                        None
+                    },
+                    |staged| (staged.is_allow() != decision.is_allow()).then_some(staged),
+                )
         } else {
             None
         };
