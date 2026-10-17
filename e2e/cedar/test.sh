@@ -23,11 +23,24 @@ RUN_ID="${RUN_ID:-$(date +%H%M%S)}"
 SANDBOX="${SANDBOX:-cedar-e2e-${RUN_ID}}"
 TMP_DIR="$(mktemp -d)"
 SERVER_PID=""
+PROVIDER_NAME="cedar-e2e-${RUN_ID}"
+PROFILE_ID="cedar-e2e-${RUN_ID}"
+PROVIDER_CREATED=0
 FAILURES=0
 
 cleanup() {
     if [[ "${CEDAR_E2E_KEEP_SANDBOX:-0}" != "1" ]]; then
         "$OPENSHELL_BIN" sandbox delete "$SANDBOX" >/dev/null 2>&1 || true
+        # Sandbox deletion drains asynchronously; wait for references to clear.
+        if [[ "$PROVIDER_CREATED" == "1" ]]; then
+            for _ in $(seq 1 40); do
+                if "$OPENSHELL_BIN" provider delete "$PROVIDER_NAME" >/dev/null 2>&1; then
+                    break
+                fi
+                sleep 0.5
+            done
+        fi
+        "$OPENSHELL_BIN" profile delete "$PROFILE_ID" >/dev/null 2>&1 || true
     fi
     if [[ -n "$SERVER_PID" ]]; then
         kill "$SERVER_PID" >/dev/null 2>&1 || true
@@ -88,13 +101,13 @@ fi
 if [[ -n "${CEDAR_E2E_UPSTREAM_URL:-}" ]]; then
     ECHO_URL="${CEDAR_E2E_UPSTREAM_URL%/}"
 else
-    python3 "${SCRIPT_DIR}/echo-server.py" "${TMP_DIR}/port" &
+    python3 "${SCRIPT_DIR}/echo-server.py" "${TMP_DIR}/port" "${TMP_DIR}/upstream-state.json" &
     SERVER_PID=$!
     for _ in $(seq 1 50); do
         [[ -s "${TMP_DIR}/port" ]] && break
         sleep 0.1
     done
-    ECHO_URL="http://host.openshell.internal:$(cat "${TMP_DIR}/port")"
+    ECHO_URL="http://${CEDAR_E2E_LOCAL_UPSTREAM_HOST:-host.openshell.internal}:$(cat "${TMP_DIR}/port")"
 fi
 read -r UP_HOST UP_PORT UP_PREFIX < <(python3 - "$ECHO_URL" <<'PY'
 import sys
@@ -265,6 +278,128 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+# Providers: real attachment, credential injection, denial, and rotation
+# ---------------------------------------------------------------------------
+
+provider_probe() {
+    capture_in_sandbox "curl -s --max-time 5 -H \"Authorization: Bearer \${CEDAR_E2E_TOKEN}\" \
+        -w '\n%{http_code}' '${ECHO_URL}$1'" | tail -2
+}
+
+upstream_hits() {
+    python3 - "${TMP_DIR}/upstream-state.json" "$1" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as state_file:
+    print(json.load(state_file)["paths"].get(sys.argv[2], 0))
+PY
+}
+
+provider_checks() {
+    if [[ -z "$SERVER_PID" ]]; then
+        echo "SKIP  providers: remote upstream has no trusted credential/count observer"
+        return
+    fi
+    cat > "${TMP_DIR}/provider-profile.yaml" <<EOF
+id: ${PROFILE_ID}
+display_name: Cedar e2e credential boundary
+category: other
+credentials:
+  - name: token
+    env_vars: [CEDAR_E2E_TOKEN]
+    required: true
+    auth_style: bearer
+    header_name: authorization
+endpoints:
+  - host: ${UP_HOST}
+    port: ${UP_PORT}
+    path: /provider/**
+    protocol: rest
+    access: full
+binaries:
+  - path: /usr/bin/curl
+EOF
+    if ! "$OPENSHELL_BIN" profile import --file "${TMP_DIR}/provider-profile.yaml" >/dev/null 2>&1; then
+        fail "providers: import fixture profile"
+        return
+    fi
+    # Dummy credentials only. CLI output is intentionally not printed on failure.
+    if ! CEDAR_E2E_TOKEN=cedar-e2e-dummy-initial "$OPENSHELL_BIN" provider create \
+        --name "$PROVIDER_NAME" --type "$PROFILE_ID" --credential CEDAR_E2E_TOKEN >/dev/null 2>&1; then
+        fail "providers: create fixture provider"
+        return
+    fi
+    PROVIDER_CREATED=1
+    if ! "$OPENSHELL_BIN" sandbox provider attach "$SANDBOX" "$PROVIDER_NAME" --wait >/dev/null 2>&1; then
+        fail "providers: attach fixture provider and activate configuration"
+        return
+    fi
+
+    local before response
+    before="$(upstream_hits /provider/allowed)"
+    response="$(provider_probe /provider/allowed)"
+    expect_eq "providers: attachment alone grants no request access" "${response##*$'\n'}" "403"
+    expect_eq "providers: attachment-only denial never reaches upstream" "$(upstream_hits /provider/allowed)" "$before"
+
+    cp "${TMP_DIR}/policy-updated.cedar" "${TMP_DIR}/policy-provider.cedar"
+    cat >> "${TMP_DIR}/policy-provider.cedar" <<EOF
+
+// A provider supplies credentials only after this scoped Cedar permit allows.
+permit (
+    principal is Sandbox::Process,
+    action == Sandbox::Action::"HttpRequest",
+    resource == Sandbox::NetworkEndpoint::"${UP_HOST}:${UP_PORT}"
+)
+when {
+    context.binary_path == "/usr/bin/curl"
+    && context.method == "GET" && context.path == "/provider/allowed"
+};
+EOF
+    if ! "$OPENSHELL_BIN" policy set "$SANDBOX" --policy "${TMP_DIR}/policy-provider.cedar" \
+        --middleware "${TMP_DIR}/middleware.yaml" --wait >/dev/null 2>&1; then
+        fail "providers: activate explicit scoped Cedar permit"
+        return
+    fi
+    response="$(provider_probe /provider/allowed)"
+    expect_eq "providers: explicit permit reaches upstream" "${response##*$'\n'}" "200"
+    if [[ "$response" == *'"credential_generation": "initial"'* ]]; then
+        pass "providers: issued placeholder resolves to initial credential upstream"
+    else
+        fail "providers: issued placeholder resolves to initial credential upstream"
+    fi
+    before="$(upstream_hits /provider/denied)"
+    response="$(provider_probe /provider/denied)"
+    expect_eq "providers: attached profile cannot widen the Cedar path" "${response##*$'\n'}" "403"
+    expect_eq "providers: denied credential-bearing request never reaches upstream" "$(upstream_hits /provider/denied)" "$before"
+
+    if ! CEDAR_E2E_TOKEN=cedar-e2e-dummy-rotated "$OPENSHELL_BIN" provider update \
+        "$PROVIDER_NAME" --credential CEDAR_E2E_TOKEN >/dev/null 2>&1; then
+        fail "providers: rotate fixture credential"
+        return
+    fi
+    # A successful update saves the change; observe actual injection rather
+    # than assuming a delay proves the supervisor installed the credential.
+    local deadline=$((SECONDS + 60)) rotated=0
+    while (( SECONDS < deadline )); do
+        response="$(provider_probe /provider/allowed)"
+        if [[ "${response##*$'\n'}" == "200" && "$response" == *'"credential_generation": "rotated"'* ]]; then
+            rotated=1
+            break
+        fi
+        sleep 0.5
+    done
+    expect_eq "providers: rotation reaches the real upstream with the new credential" "$rotated" "1"
+    before="$(upstream_hits /provider/denied)"
+    response="$(provider_probe /provider/denied)"
+    expect_eq "providers: rotation preserves Cedar path denial" "${response##*$'\n'}" "403"
+    expect_eq "providers: rotated denied request never reaches upstream" "$(upstream_hits /provider/denied)" "$before"
+    expect_eq "providers: rotation preserves Cedar method denial" "$(status '-X POST' /provider/allowed)" "403"
+}
+
+provider_checks
+
+# ---------------------------------------------------------------------------
 # Filesystem: Landlock grants derived from the Cedar policy
 # ---------------------------------------------------------------------------
 
@@ -369,7 +504,8 @@ fi
 # Observability and policy view
 # ---------------------------------------------------------------------------
 
-sandbox_logs="$("$OPENSHELL_BIN" logs "$SANDBOX" 2>&1 || true)"
+# Provider mutations add log entries after the staged request above.
+sandbox_logs="$("$OPENSHELL_BIN" logs "$SANDBOX" -n 1000 2>&1 || true)"
 expect_contains "logs: Cedar is recorded as the deciding engine" "$sandbox_logs" "engine:cedar"
 expect_contains "logs: a staged audit forbid is logged" "$sandbox_logs" "cedar_audit:staged_deny"
 

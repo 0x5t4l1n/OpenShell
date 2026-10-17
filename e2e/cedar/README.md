@@ -10,6 +10,7 @@ layer enforces it:
 |---|---|---|
 | Network | `policy.template.cedar` | Permitted `GET` reaches the upstream; other paths, a path one segment deeper than a delimited glob allows, other methods, a `forbid`, another binary, and an unlisted host are denied. A delimited host glob (`*.github.com`) admits `api.github.com` through policy DNS but not `github.com`. A `@enforcement("staged")` `forbid` lets its request through and is logged. |
 | Policy update | `policy set --wait` with an extended `policy.template.cedar` | The running sandbox loads a changed Cedar policy, with the middleware file passed again: a path the first policy denied is then permitted, and a path it permitted is then forbidden. |
+| Providers | Temporary profile/provider attached through the gateway | Attachment alone grants no request access. An explicit scoped Cedar permit allows a request whose issued placeholder resolves to the initial dummy credential upstream. A credential update is observed upstream with bounded polling; path and method denials remain in effect. Denied credential-bearing requests never reach the upstream. |
 | Middleware | `middleware.template.yaml` via `--middleware` | The `openshell/regex` middleware redacts a secret in the request body before it reaches the upstream. A non-2xx upstream response is retried up to three times and then reported as an upstream failure, not an OpenShell decision. |
 | Filesystem | `policy.template.cedar` | A `WriteFile` grant makes `/sandbox` writable, a `ReadFile` grant makes `/opt` readable, and `/srv` stays unreadable. |
 | Syscalls | sandbox runtime | `memfd_create`, `ptrace`, user-namespace `unshare`, `mount`, `io_uring_setup`, raw netlink sockets, and direct TCP connects that bypass the proxy return `EPERM`. |
@@ -36,7 +37,17 @@ CEDAR_E2E_UPSTREAM_URL=https://httpbin.org/anything bash e2e/cedar/test.sh
 ```
 
 The test substitutes that URL's host, port, and path into the Cedar policy and
-the middleware selector.
+the middleware selector. Provider assertions require the local echo fixture's
+credential-generation labels and request counts. The default Docker CI suite
+runs them; a remote upstream override explicitly skips them because that
+service cannot provide trusted credential observations. The fixture uses dummy
+credentials and reports only generation labels, never credential values.
+
+When a local gateway maps `host.openshell.internal` to loopback, set
+`CEDAR_E2E_LOCAL_UPSTREAM_HOST` to a reachable private address on the host,
+such as the Docker bridge address. This keeps the local echo server and all
+provider assertions active. Cedar blocks loopback destinations even when the
+policy names them explicitly.
 
 ## Run it
 
