@@ -1722,8 +1722,11 @@ type GetSandboxConfigRequest struct {
 	// Workspace scope. Select one named workspace; authenticated sandbox callers may omit it during bootstrap.
 	WorkspaceScope *datamodelv1.WorkspaceSelector `protobuf:"bytes,3,opt,name=workspace_scope,json=workspaceScope,proto3" json:"workspace_scope,omitempty"`
 	Name           string                         `protobuf:"bytes,1,opt,name=name,proto3" json:"name,omitempty"`
-	unknownFields  protoimpl.UnknownFields
-	sizeCache      protoimpl.SizeCache
+	// Required for sandbox-authenticated callers receiving a Cedar policy.
+	// Omitted by older supervisors, which cannot safely interpret Cedar fields.
+	SupportsCedarPolicy bool `protobuf:"varint,4,opt,name=supports_cedar_policy,json=supportsCedarPolicy,proto3" json:"supports_cedar_policy,omitempty"`
+	unknownFields       protoimpl.UnknownFields
+	sizeCache           protoimpl.SizeCache
 }
 
 func (x *GetSandboxConfigRequest) Reset() {
@@ -1768,6 +1771,13 @@ func (x *GetSandboxConfigRequest) GetName() string {
 		return x.Name
 	}
 	return ""
+}
+
+func (x *GetSandboxConfigRequest) GetSupportsCedarPolicy() bool {
+	if x != nil {
+		return x.SupportsCedarPolicy
+	}
+	return false
 }
 
 // Request to get gateway-global settings.
@@ -2471,10 +2481,11 @@ const file_sandbox_proto_rawDesc = "" +
 	"\x04glob\x18\x01 \x01(\tR\x04glob\x12\x10\n" +
 	"\x03any\x18\x02 \x03(\tR\x03any\"2\n" +
 	"\rNetworkBinary\x12\x12\n" +
-	"\x04path\x18\x01 \x01(\tR\x04pathJ\x04\b\x02\x10\x03R\aharness\"\x81\x01\n" +
+	"\x04path\x18\x01 \x01(\tR\x04pathJ\x04\b\x02\x10\x03R\aharness\"\xb5\x01\n" +
 	"\x17GetSandboxConfigRequest\x12R\n" +
 	"\x0fworkspace_scope\x18\x03 \x01(\v2).openshell.datamodel.v1.WorkspaceSelectorR\x0eworkspaceScope\x12\x12\n" +
-	"\x04name\x18\x01 \x01(\tR\x04name\"\x19\n" +
+	"\x04name\x18\x01 \x01(\tR\x04name\x122\n" +
+	"\x15supports_cedar_policy\x18\x04 \x01(\bR\x13supportsCedarPolicy\"\x19\n" +
 	"\x17GetGatewayConfigRequest\"\x82\x02\n" +
 	"\x18GetGatewayConfigResponse\x12X\n" +
 	"\bsettings\x18\x01 \x03(\v2<.openshell.sandbox.v1.GetGatewayConfigResponse.SettingsEntryR\bsettings\x12+\n" +

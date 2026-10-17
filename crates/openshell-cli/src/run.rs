@@ -570,6 +570,9 @@ pub async fn sandbox_create(
     let effective_server = server.to_string();
     let effective_tls = tls.clone();
 
+    let policy = load_sandbox_policy_with_middleware(policy, middleware)?;
+    require_cedar_gateway_support(&mut client, policy.as_ref()).await?;
+
     // Provider profiles are import-only, so the catalog lives on the gateway.
     // Its only consumer is the credential warning, which is advisory: an
     // unreachable catalog degrades the warning to its generic form rather than
@@ -617,7 +620,6 @@ pub async fn sandbox_create(
         ensure_required_providers(&mut client, providers, auto_providers_override, workspace)
             .await?;
 
-    let policy = load_sandbox_policy_with_middleware(policy, middleware)?;
     let resource_limits = if template.is_none() {
         build_sandbox_resource_limits(cpu, memory)?
     } else {
@@ -1538,6 +1540,26 @@ fn load_sandbox_policy(cli_path: Option<&str>) -> Result<Option<SandboxPolicy>> 
     Ok(policy)
 }
 
+/// Reject Cedar before any provisioning or policy mutation on older gateways.
+async fn require_cedar_gateway_support(
+    client: &mut crate::tls::GrpcClient,
+    policy: Option<&SandboxPolicy>,
+) -> Result<()> {
+    if policy.is_some_and(|policy| !policy.cedar_policy_source.is_empty()) {
+        let info = client
+            .health(openshell_core::proto::HealthRequest {})
+            .await
+            .into_diagnostic()?
+            .into_inner();
+        if !info.supports_cedar_policy {
+            return Err(miette::miette!(
+                "gateway does not advertise Cedar policy support; upgrade the gateway before sending Cedar policies"
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// The load-time warnings of a policy's Cedar source, if it has one.
 fn cedar_policy_warning_lines(policy: &SandboxPolicy) -> Vec<String> {
     if policy.cedar_policy_source.is_empty() {
@@ -1727,6 +1749,7 @@ where
 
     let config_result = client
         .get_sandbox_config(GetSandboxConfigRequest {
+            supports_cedar_policy: true,
             name: name.to_string(),
             workspace_scope: Some(openshell_core::proto::workspace_selector(
                 workspace.to_string(),
@@ -5411,6 +5434,7 @@ pub async fn sandbox_policy_set_global(
     let policy = files.load()?;
 
     let mut client = grpc_client(server, tls).await?;
+    require_cedar_gateway_support(&mut client, Some(&policy)).await?;
     let response = client
         .update_config(UpdateConfigRequest {
             policy: Some(policy),
@@ -5444,6 +5468,7 @@ pub async fn sandbox_settings_get(
     let mut client = grpc_client(server, tls).await?;
     let response = client
         .get_sandbox_config(GetSandboxConfigRequest {
+            supports_cedar_policy: true,
             name: name.to_string(),
             workspace_scope: Some(openshell_core::proto::workspace_selector(
                 workspace.to_string(),
@@ -5746,6 +5771,7 @@ pub async fn sandbox_policy_set(
     let policy = files.load()?;
 
     let mut client = grpc_client(server, tls).await?;
+    require_cedar_gateway_support(&mut client, Some(&policy)).await?;
 
     // Get current version so we can detect no-ops.
     let current_version = client
@@ -5899,6 +5925,7 @@ pub async fn sandbox_policy_update(
     let mut client = grpc_client(server, tls).await?;
     let current = client
         .get_sandbox_config(GetSandboxConfigRequest {
+            supports_cedar_policy: true,
             name: name.to_string(),
             workspace_scope: Some(openshell_core::proto::workspace_selector(
                 workspace.to_string(),
@@ -6189,6 +6216,7 @@ where
 
     let config = client
         .get_sandbox_config(GetSandboxConfigRequest {
+            supports_cedar_policy: true,
             name: name.to_string(),
             workspace_scope: Some(openshell_core::proto::workspace_selector(
                 workspace.to_string(),

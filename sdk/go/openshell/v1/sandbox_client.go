@@ -43,6 +43,9 @@ func (s *sandboxClient) Create(ctx context.Context, workspace, name string, spec
 		req.Annotations = converter.CopyStringMap(opts[0].Annotations)
 		req.ServiceExposures = serviceExposuresToProto(opts[0].ServiceExposures)
 	}
+	if err := requireCedarPolicySupport(ctx, s.client, protoSpec.GetPolicy()); err != nil {
+		return nil, err
+	}
 	resp, err := s.client.CreateSandbox(ctx, req)
 	if err != nil {
 		return nil, converter.FromGRPCError(err)
@@ -75,6 +78,9 @@ func (s *sandboxClient) CreateFromTemplate(ctx context.Context, workspace, name,
 	if len(opts) > 0 {
 		req.Annotations = converter.CopyStringMap(opts[0].Annotations)
 		req.ServiceExposures = serviceExposuresToProto(opts[0].ServiceExposures)
+	}
+	if err := requireCedarPolicySupport(ctx, s.client, protoSpec.GetPolicy()); err != nil {
+		return nil, err
 	}
 	resp, err := s.client.CreateSandbox(ctx, req)
 	if err != nil {

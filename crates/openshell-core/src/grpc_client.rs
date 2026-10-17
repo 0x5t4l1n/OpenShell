@@ -954,6 +954,7 @@ async fn fetch_settings_snapshot_with_client(
 ) -> Result<SettingsPollResult> {
     let response = client
         .get_sandbox_config(GetSandboxConfigRequest {
+            supports_cedar_policy: true,
             workspace_scope: workspace.map(crate::proto::workspace_selector),
             name: sandbox_name.to_string(),
         })
@@ -991,6 +992,18 @@ async fn sync_policy_with_client(
     policy: &ProtoSandboxPolicy,
     workspace: &str,
 ) -> Result<()> {
+    if !policy.cedar_policy_source.is_empty() {
+        let info = client
+            .health(crate::proto::HealthRequest {})
+            .await
+            .map_err(grpc_status_error)?
+            .into_inner();
+        if !info.supports_cedar_policy {
+            return Err(grpc_status_error(Status::failed_precondition(
+                "gateway does not advertise Cedar policy support; upgrade the gateway before sending Cedar policies",
+            )));
+        }
+    }
     client
         .update_config(UpdateConfigRequest {
             sandbox: sandbox.to_string(),
@@ -1740,6 +1753,7 @@ impl CachedOpenShellClient {
             .client
             .clone()
             .get_sandbox_config(GetSandboxConfigRequest {
+                supports_cedar_policy: true,
                 workspace_scope,
                 name: sandbox_name.to_string(),
             })

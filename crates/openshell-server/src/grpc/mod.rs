@@ -247,6 +247,7 @@ impl OpenShell for OpenShellService {
         _request: Request<HealthRequest>,
     ) -> Result<Response<HealthResponse>, Status> {
         Ok(Response::new(HealthResponse {
+            supports_cedar_policy: true,
             status: ServiceStatus::Healthy.into(),
             version: openshell_core::VERSION.to_string(),
         }))

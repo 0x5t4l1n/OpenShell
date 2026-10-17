@@ -389,6 +389,9 @@ message GetSandboxConfigRequest {
   // Workspace scope. Select one named workspace; authenticated sandbox callers may omit it during bootstrap.
   openshell.datamodel.v1.WorkspaceSelector workspace_scope = 3;
   string name = 1;
+  // Required for sandbox-authenticated callers receiving a Cedar policy.
+  // Omitted by older supervisors, which cannot safely interpret Cedar fields.
+  bool supports_cedar_policy = 4;
 }
 
 // Request to get gateway-global settings.
