@@ -1208,7 +1208,7 @@ export class SandboxClient {
   }
 
   /** Check before sending Cedar through either the curated or raw client. */
-  async requireCedarPolicySupport(policy?: MessageInitShape<typeof SandboxPolicySchema>): Promise<void> {
+  async requireCedarPolicySupport(policy?: { cedarPolicySource?: string }): Promise<void> {
     if (!policy?.cedarPolicySource) return;
     const info = await this.grpc.health({});
     if (!info.supportsCedarPolicy)
