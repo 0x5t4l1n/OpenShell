@@ -14,8 +14,9 @@ schema in `openshell-policy-cedar-schema`. It then derives three artifacts that
 Cedar does not decide at request time: Landlock grants, which endpoints the
 proxy inspects per request, and policy DNS eligibility. It accepts only policy
 shapes whose meaning those artifacts can enforce exactly. The CLI, the gateway,
-and the supervisor reject everything else. Cedar evaluation errors fail the
-request instead of skipping the erroring policy.
+and the supervisor reject everything else. Errors evaluating deciding policies
+fail the request instead of skipping the erroring policy. Errors in staged
+comparisons preserve the enforcing decision and skip the comparison.
 
 Policy DNS eligibility comes from `NetworkConnect` permit scopes, and from
 `when` conditions that require both `resource.host` and `resource.port`. A host
@@ -180,11 +181,15 @@ Its Lean specification and proofs are in `ai-openshell/cedar-spec`.
   is among the determining policies of every evaluation. That reproduces
   YAML query matchers: an allow rule matches every value of each key, and a
   deny rule fires on one matching value per key. Analysis collects the tag
-  keys policies name literally; other keys are left out of the entity, so
-  their values do not multiply evaluations, unless a policy computes a key.
-  More than `MAX_QUERY_COMBINATIONS` (4096) combinations is an error, which
-  the supervisor turns into a denial with that reason. Audit paths and
-  staged policies use the same combined decision.
+  keys separately for deciding policies (all but staged) and for the staged
+  comparison (all policies). Only keys the relevant policies name literally
+  enter the entity, so other keys' values do not multiply evaluations, unless
+  a policy computes a key. More than `MAX_QUERY_COMBINATIONS` (4096)
+  combinations for deciding policies is an error, which the supervisor turns
+  into a denial with that reason. Audit paths use the same combined decision.
+  Staged comparisons use a separate combination budget; exceeding it or
+  encountering an evaluation error skips the comparison and preserves the
+  enforcing decision.
 - `CedarOnlyEngine` attaches a `CedarDestination` to each allowed
   connection's `EgressAuthorization`. It replaces the YAML destination modes
   below the host gateway aliases: every resolved address must avoid the
