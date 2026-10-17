@@ -507,7 +507,7 @@ when { resource.host like("*.example.com", ".") && resource.port == 443 };
     });
     assert_eq!(expected[&descriptor.endpoint_id].status, descriptor);
     let observations = vec![EndpointObservation {
-        endpoint_id: descriptor.endpoint_id.clone(),
+        endpoint_id: descriptor.endpoint_id,
         result: EndpointResult::HttpResponseReceived.into(),
         failure: None,
     }];

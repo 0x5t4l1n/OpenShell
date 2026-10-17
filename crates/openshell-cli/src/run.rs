@@ -570,8 +570,9 @@ pub async fn sandbox_create(
     let effective_server = server.to_string();
     let effective_tls = tls.clone();
 
-    let policy = load_sandbox_policy_with_middleware(policy, middleware)?;
-    require_cedar_gateway_support(&mut client, policy.as_ref()).await?;
+    // Keep the early-loaded policy off the provisioning future's stack.
+    let policy = Box::new(load_sandbox_policy_with_middleware(policy, middleware)?);
+    require_cedar_gateway_support(&mut client, policy.as_ref().as_ref()).await?;
 
     // Provider profiles are import-only, so the catalog lives on the gateway.
     // Its only consumer is the credential warning, which is advisory: an
@@ -620,6 +621,7 @@ pub async fn sandbox_create(
         ensure_required_providers(&mut client, providers, auto_providers_override, workspace)
             .await?;
 
+    let policy = *policy;
     let resource_limits = if template.is_none() {
         build_sandbox_resource_limits(cpu, memory)?
     } else {
