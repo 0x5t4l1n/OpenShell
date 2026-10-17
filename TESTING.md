@@ -246,8 +246,21 @@ Suites:
   the selected deployment.
 - Docker suite (`--features e2e-docker`) - includes Docker-only coverage such as Dockerfile image builds, Docker preflight checks, and managed Docker gateway start.
 - Docker GPU suite (`--features e2e-docker-gpu`) - Docker suite plus GPU sandbox smoke coverage.
+- Configuration push suite (`--features e2e-config-push`) - CLI conformance and the policy tests against a Docker gateway with `config_delivery_mode = "push"`. Run it with `mise run e2e:rust:push`.
 - VM suite (`--features e2e-vm`) - runs e2e tests on a VM.
 - Kubernetes credential-driver suite (`--features e2e-kubernetes-credential-drivers`) - targeted Kubernetes Secrets and Vault provider credential storage coverage.
+
+The Docker, Podman, Kubernetes, and VM runners execute CLI
+conformance before their Rust tests. Set the driver's feature variable
+(`OPENSHELL_E2E_DOCKER_FEATURES`, `OPENSHELL_E2E_PODMAN_FEATURES`,
+`OPENSHELL_E2E_KUBERNETES_FEATURES`, or `OPENSHELL_E2E_VM_FEATURES`) to
+`e2e-conformance-only` to skip the Rust tests; the runner logs a notice when
+it skips them. Unset or empty values select the driver's default Rust
+features. The selector is handled by the runner; it is not a Cargo feature.
+
+```shell
+OPENSHELL_E2E_KUBERNETES_FEATURES=e2e-conformance-only mise run e2e:kubernetes
+```
 
 GPU device-selection tests compare OpenShell sandboxes against a plain Docker or
 Podman container that requests `--device nvidia.com/gpu=all`. The probe image
@@ -388,6 +401,12 @@ mise run e2e:kubernetes:credential-drivers
 ```
 
 ### Kubernetes E2E (`e2e/rust/e2e-kubernetes.sh`)
+
+The `e2e-kubernetes` nextest profile temporarily excludes only
+`canonical_main_connect_recovers_its_ssh_transport` while
+[#4445](https://github.com/NVIDIA/OpenShell/issues/4445) investigates delayed SSH
+input-owner release through port-forwarding. The test remains available to other
+driver profiles; the remaining Kubernetes tests stay enabled.
 
 Kubernetes e2e tests deploy an OpenShell gateway into a real Kubernetes cluster
 via Helm and run the Rust e2e suite against it. On vanilla Kubernetes the harness
