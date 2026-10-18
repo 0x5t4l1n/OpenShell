@@ -41,6 +41,7 @@ PVCs can be admitted.
 | gateway.networkPolicy.podSelector | object | `{"app.kubernetes.io/instance":"openshell","app.kubernetes.io/name":"openshell"}` | Labels selecting gateway pods allowed to reach sandbox SSH. |
 | gateway.serviceAccount.name | string | `"openshell"` | Name of the shared gateway ServiceAccount. |
 | gateway.serviceAccount.namespace | string | `"openshell"` | Namespace containing the shared gateway ServiceAccount. |
+| gateway.sharedSupervisor.enabled | bool | `false` | Grant deployment bootstrap permissions when workspace-scoped shared supervisors are enabled on the gateway. |
 | nameOverride | string | `""` | Override the chart name used in generated resource names. |
 | networkPolicy.enabled | bool | `true` | Restrict sandbox SSH ingress to the shared gateway pods. |
 | sandboxServiceAccount.annotations | object | `{}` | Annotations added to the generated sandbox ServiceAccount. |

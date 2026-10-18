@@ -12,6 +12,14 @@ metadata:
   labels:
     {{- include "openshell.labels" . | nindent 4 }}
 rules:
+  {{- if get (get $kubernetesConfig "shared_supervisor" | default dict) "enabled" }}
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    verbs: ["get", "create", "patch", "delete"]
+  - apiGroups: ["networking.k8s.io"]
+    resources: ["networkpolicies"]
+    verbs: ["patch"]
+  {{- end }}
   {{- if $allowDriverConfig }}
   # Metadata-only admission of caller-selected PVCs requires get permission.
   - apiGroups: [""]

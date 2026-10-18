@@ -60,3 +60,13 @@ belong to the sandbox or isolation backend. Signals use `BoundarySignal`.
 
 These portable control-plane foundations do not qualify a platform isolation
 backend or enable a Windows workload runtime.
+
+## Experimental shared process bootstrap
+
+`openshell-supervisor shared --gateway-id <id> --scope gateway` starts an idle
+shared process. Workspace scope additionally requires `--workspace <name>`.
+The process exposes TCP health on port 5501 (`--health-port` overrides it),
+logs its scope, and exits cleanly on SIGTERM/SIGINT. It has no gateway client,
+session API, workload credentials, policy engine, or sandbox attachment yet.
+Readiness here means the idle process started, not that it can supervise sessions.
+The normal isolation-backend and network-proxy entry points are unchanged.

@@ -1,0 +1,43 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+suite: experimental shared supervisor bootstrap
+templates:
+  - templates/gateway-config.yaml
+  - templates/role.yaml
+  - templates/deployment.yaml
+tests:
+  - it: keeps deployment bootstrap disabled by default
+    template: templates/gateway-config.yaml
+    asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?s)\[openshell.drivers.kubernetes.shared_supervisor\]\s+enabled = false\s+scope = "gateway"'
+  - it: enables workspace placement through Helm
+    template: templates/gateway-config.yaml
+    set:
+      server.drivers.kubernetes.sharedSupervisor.enabled: true
+      server.drivers.kubernetes.sharedSupervisor.scope: workspace
+    asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?s)\[openshell.drivers.kubernetes.shared_supervisor\]\s+enabled = true\s+scope = "workspace"'
+  - it: grants deployment lifecycle permissions only when enabled
+    template: templates/role.yaml
+    set:
+      server.drivers.kubernetes.sharedSupervisor.enabled: true
+    asserts:
+      - contains:
+          path: rules
+          content:
+            apiGroups: [apps]
+            resources: [deployments]
+            verbs: [get, create, patch, delete]
+  - it: rejects unknown scope before deployment
+    template: templates/deployment.yaml
+    set:
+      server.drivers.kubernetes.sharedSupervisor.enabled: true
+      server.drivers.kubernetes.sharedSupervisor.scope: sandbox
+    asserts:
+      - failedTemplate:
+          errorMessage: Kubernetes shared_supervisor.scope must be gateway or workspace.

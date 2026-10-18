@@ -18,6 +18,7 @@ use tracing_subscriber::filter::LevelFilter;
 use tracing_subscriber::{Layer as _, layer::SubscriberExt as _, util::SubscriberInitExt as _};
 
 mod logging;
+mod shared;
 
 const DEBUG_RPC_SUBCOMMAND: &str = "debug-rpc";
 const HEALTH_SUBCOMMAND: &str = "health";
@@ -365,6 +366,9 @@ fn main() -> Result<()> {
         return openshell_supervisor::check_control_readiness(&args.socket);
     }
 
+    if raw_args.get(1).map(String::as_str) == Some("shared") {
+        return shared::main(&raw_args[1..]);
+    }
     let args = Args::parse();
     validate_role_arguments(&args)?;
     arm_parent_liveness(args.parent_liveness_stdin)?;

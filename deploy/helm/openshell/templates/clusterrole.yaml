@@ -18,6 +18,14 @@ metadata:
   labels:
     {{- include "openshell.labels" . | nindent 4 }}
 rules:
+  {{- if and (ne $workspaceMode "shared") (get (get $kubernetesConfig "shared_supervisor" | default dict) "enabled") }}
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    verbs: ["get", "create", "patch", "delete"]
+  - apiGroups: ["networking.k8s.io"]
+    resources: ["networkpolicies"]
+    verbs: ["patch"]
+  {{- end }}
   - apiGroups: ["node.k8s.io"]
     resources: ["runtimeclasses"]
     verbs: ["get"]

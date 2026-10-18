@@ -99,6 +99,23 @@ impl KubernetesSandboxRuntimeConfig {
     }
 }
 
+/// Placement of experimental shared supervisor processes.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SharedSupervisorScope {
+    #[default]
+    Gateway,
+    Workspace,
+}
+
+/// Deployment-only feature gate. Sandbox sessions still use dedicated supervisors.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct SharedSupervisorConfig {
+    pub enabled: bool,
+    pub scope: SharedSupervisorScope,
+}
+
 /// How workspaces map to Kubernetes namespaces.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -199,6 +216,8 @@ pub struct KubernetesComputeConfig {
     pub sandbox_runtime_image_pull_policy: Option<KubernetesImagePullPolicy>,
     /// Image that provides the trusted `openshell-supervisor` control binary.
     pub supervisor_image: String,
+    /// Opt-in deployment bootstrap for multi-tenant supervisors.
+    pub shared_supervisor: SharedSupervisorConfig,
     /// Kubernetes `imagePullPolicy` for the supervisor image.
     /// When omitted, Kubernetes selects its default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -368,6 +387,7 @@ impl Default for KubernetesComputeConfig {
             sandbox_runtime_image: config::default_sandbox_runtime_image(),
             sandbox_runtime_image_pull_policy: None,
             supervisor_image: config::default_supervisor_image(),
+            shared_supervisor: SharedSupervisorConfig::default(),
             supervisor_image_pull_policy: None,
             sandbox_runtime: KubernetesSandboxRuntimeConfig::default(),
             https_proxy: None,
@@ -402,12 +422,20 @@ impl KubernetesComputeConfig {
     /// Validate startup configuration without connecting to Kubernetes.
     pub fn validate_configuration(&self) -> Result<(), String> {
         self.validate_workspace_mode()?;
+        self.validate_shared_supervisor()?;
         self.validate_provider_spiffe_workload_api_socket_path()?;
         self.validate_sandbox_identity_config()?;
         self.validate_proxy_uid()?;
         self.validate_upstream_proxy_config()?;
         self.validate_allowed_pod_annotations()?;
         self.validate_allowed_pod_labels()
+    }
+
+    pub fn validate_shared_supervisor(&self) -> Result<(), String> {
+        if self.shared_supervisor.enabled && !is_dns_1123_label(&self.gateway_id) {
+            return Err("shared_supervisor requires a DNS-1123 gateway_id".to_string());
+        }
+        Ok(())
     }
 
     pub fn validate_allowed_pod_annotations(&self) -> Result<(), String> {

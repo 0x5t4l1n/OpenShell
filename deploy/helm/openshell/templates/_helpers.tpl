@@ -464,6 +464,9 @@ absent fields so every chart consumer observes the same configuration.
 {{- define "openshell.effectiveKubernetesConfig" -}}
 {{- $gatewayConfig := deepCopy (.Values.gatewayConfig | default dict) -}}
 {{- $kubernetes := get $gatewayConfig "openshell.drivers.kubernetes" | default dict -}}
+{{- if hasKey $gatewayConfig "openshell.drivers.kubernetes.shared_supervisor" -}}
+{{- $_ := set $kubernetes "shared_supervisor" (get $gatewayConfig "openshell.drivers.kubernetes.shared_supervisor") -}}
+{{- end -}}
 {{- if hasKey $gatewayConfig "openshell.drivers.kubernetes.resource_admission" -}}
 {{- $_ := set $kubernetes "resource_admission" (get $gatewayConfig "openshell.drivers.kubernetes.resource_admission") -}}
 {{- end -}}
@@ -510,6 +513,9 @@ absent fields so every chart consumer observes the same configuration.
 {{- $_ := set $kubernetes "proxy_ca_bundle" "/etc/openshell-tls/proxy-ca/ca.crt" -}}
 {{- end -}}
 {{- $legacyKubernetes := .Values.server.drivers.kubernetes | default dict -}}
+{{- if not (hasKey $kubernetes "shared_supervisor") -}}
+{{- $_ := set $kubernetes "shared_supervisor" (dict "enabled" .Values.server.drivers.kubernetes.sharedSupervisor.enabled "scope" .Values.server.drivers.kubernetes.sharedSupervisor.scope) -}}
+{{- end -}}
 {{- $legacyServer := .Values.server | default dict -}}
 {{- if not (hasKey $kubernetes "allow_driver_config") -}}{{- $_ := set $kubernetes "allow_driver_config" (get $legacyKubernetes "allowDriverConfig" | default false) -}}{{- end -}}
 {{- if and (ne (get $legacyKubernetes "workspaceMode" | default "shared") "shared") (not (hasKey $kubernetes "workspace_mode")) -}}
@@ -617,6 +623,10 @@ Validate chart values that Helm would otherwise accept silently.
 {{- end -}}
 {{- $kubernetesConfig := include "openshell.effectiveKubernetesConfig" . | fromYaml -}}
 {{- include "openshell.validateSecretReference" (list "gatewayConfig.openshell.drivers.kubernetes.proxy_auth_secret_name" (get $kubernetesConfig "proxy_auth_secret_name")) -}}
+{{- $sharedSupervisor := get $kubernetesConfig "shared_supervisor" | default dict -}}
+{{- if not (has (get $sharedSupervisor "scope" | default "gateway") (list "gateway" "workspace")) -}}
+{{- fail "Kubernetes shared_supervisor.scope must be gateway or workspace." -}}
+{{- end -}}
 {{- $workspaceMode := get $kubernetesConfig "workspace_mode" | default "shared" -}}
 {{- if not (has $workspaceMode (list "shared" "managed" "operator")) -}}
 {{- fail "gatewayConfig.openshell.drivers.kubernetes.workspace_mode must be one of: shared, managed, operator." -}}

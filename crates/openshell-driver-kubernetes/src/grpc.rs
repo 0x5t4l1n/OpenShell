@@ -296,6 +296,12 @@ impl ComputeDriver for ComputeDriverService {
                     }
                     WorkspaceMode::Shared => {}
                 }
+                self.driver
+                    .ensure_workspace_supervisor(&workspace)
+                    .await
+                    .map_err(|error| {
+                        Status::from(openshell_core::ComputeDriverError::from(error))
+                    })?;
                 Ok(Response::new(EnsureWorkspaceResponse {}))
             })
             .await
@@ -311,6 +317,11 @@ impl ComputeDriver for ComputeDriverService {
                 if workspace.is_empty() {
                     return Err(Status::invalid_argument("workspace is required"));
                 }
+                Box::pin(self.driver.delete_workspace_supervisor(&workspace))
+                    .await
+                    .map_err(|error| {
+                        Status::from(openshell_core::ComputeDriverError::from(error))
+                    })?;
                 if workspace_delete_requires_namespace_access(self.driver.workspace_mode()) {
                     self.driver
                         .validate_workspace_namespace(&workspace)

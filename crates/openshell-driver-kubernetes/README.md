@@ -307,3 +307,22 @@ openshell sandbox create \
   }' \
   -- claude
 ```
+
+## Experimental shared supervisor bootstrap
+
+`shared_supervisor.enabled` defaults to false; `shared_supervisor.scope` accepts
+`gateway` (default) or `workspace`. This deployment milestone starts one idle
+replica per installation or ensured workspace. It does not change sandbox
+placement, provisioning evidence, authentication, or dedicated supervision.
+Gateway scope is applied at driver startup; workspace scope uses the existing
+EnsureWorkspace and sandbox-create paths. Deleting a workspace removes its
+Deployment; deleting a sandbox does not. Deployments have stable names derived
+from gateway ID, scope, and workspace, and are applied without forced ownership.
+
+The `openshell-supervisor shared` command serves process health on TCP 5501 and
+handles SIGTERM/SIGINT. Pods have no boundary-role label, no credential mounts,
+and no ServiceAccount token. A Deployment-owned NetworkPolicy isolates ingress
+and egress; kubelet health checks remain available. No Service or session
+endpoint is created. Existing namespace policies are unchanged. Private-image
+pull Secrets must exist in the target namespace. Disabling the flag or changing
+scope leaves the old Deployments for explicit operator cleanup.

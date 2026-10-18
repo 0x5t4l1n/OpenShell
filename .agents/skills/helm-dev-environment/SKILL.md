@@ -105,6 +105,19 @@ registers the gateway under the worktree-specific k3d
 cluster name and selects it as the active gateway. Keep the forwarding
 task running while using those endpoints.
 
+### Shared supervisor deployment bootstrap
+
+Set `server.drivers.kubernetes.sharedSupervisor.enabled=true` and
+`server.drivers.kubernetes.sharedSupervisor.scope=gateway` (or `workspace`) to
+start experimental idle supervisor Deployments. Build a supervisor image that
+supports the `shared` command. Gateway scope starts at driver startup; workspace
+scope starts when EnsureWorkspace or sandbox creation ensures the workspace.
+Sandbox sessions still use dedicated supervisors. Split workspace chart installs
+need `gateway.sharedSupervisor.enabled=true` for deployment RBAC. Check Pods
+with `kubectl get pods -A -l openshell.ai/component=shared-supervisor`; readiness
+means process health, not session availability. Disabling or changing scope
+leaves old Deployments for explicit cleanup.
+
 ### Viewing local traces
 
 The gateway exports OTLP/gRPC to

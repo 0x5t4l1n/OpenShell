@@ -139,6 +139,8 @@ Top-level lists represent TOML arrays of tables and preserve their YAML order. *
 {{- $_ := set $config "openshell.drivers.kubernetes.resource_admission" $admission -}}
 {{- end -}}
 {{- $_ := unset $kubernetesCompat "resource_admission" -}}
+{{- $_ := set $config "openshell.drivers.kubernetes.shared_supervisor" (deepCopy (get $kubernetesCompat "shared_supervisor")) -}}
+{{- $_ := unset $kubernetesCompat "shared_supervisor" -}}
 {{- $_ := set $config "openshell.drivers.kubernetes" $kubernetesCompat -}}
 {{- if not (hasKey $config "openshell.drivers.kubernetes.managed_ssh_ingress") -}}
 {{- $_ := set $config "openshell.drivers.kubernetes.managed_ssh_ingress" (dict "enabled" .Values.networkPolicy.enabled "gateway_namespace" .Release.Namespace "gateway_pod_selector" (dict "app.kubernetes.io/name" (include "openshell.name" .) "app.kubernetes.io/instance" .Release.Name)) -}}

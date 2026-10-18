@@ -160,7 +160,7 @@ pub enum KubernetesDriverError {
 }
 
 impl KubernetesDriverError {
-    fn from_kube(err: KubeError) -> Self {
+    pub(crate) fn from_kube(err: KubeError) -> Self {
         match err {
             KubeError::Api(api) if api.code == 409 && api.reason == "AlreadyExists" => {
                 Self::AlreadyExists
@@ -752,11 +752,11 @@ fn kubernetes_request_client(
 
 #[derive(Clone)]
 pub struct KubernetesComputeDriver {
-    client: Client,
+    pub(crate) client: Client,
     watch_client: Client,
     sandbox_api_version: Arc<OnceCell<&'static str>>,
     lifecycle_gates: Arc<LifecycleGates>,
-    config: KubernetesComputeConfig,
+    pub(crate) config: KubernetesComputeConfig,
     operator_allowlist: Option<OperatorNamespaceAllowlist>,
 }
 
@@ -813,6 +813,9 @@ impl KubernetesComputeDriver {
         config: KubernetesComputeConfig,
         shutdown_rx: tokio::sync::watch::Receiver<bool>,
     ) -> Result<Self, KubernetesDriverError> {
+        config
+            .validate_shared_supervisor()
+            .map_err(KubernetesDriverError::Precondition)?;
         config
             .resource_admission
             .validate()
@@ -899,6 +902,14 @@ impl KubernetesComputeDriver {
             driver.backfill_gateway_id_labels().await?;
         }
 
+        if driver.config.shared_supervisor.enabled
+            && driver.config.shared_supervisor.scope
+                == crate::config::SharedSupervisorScope::Gateway
+        {
+            driver
+                .ensure_shared_supervisor(&driver.config.namespace, None)
+                .await?;
+        }
         Ok(driver)
     }
 
@@ -1633,7 +1644,7 @@ impl KubernetesComputeDriver {
         ))
     }
 
-    async fn resolve_sandbox_identity_in_namespace(
+    pub(crate) async fn resolve_sandbox_identity_in_namespace(
         &self,
         namespace: &str,
     ) -> (u32, u32, BTreeMap<String, String>) {
@@ -2010,6 +2021,7 @@ impl KubernetesComputeDriver {
             }
         };
 
+        self.ensure_workspace_supervisor(workspace).await?;
         let resource_identities = self
             .admit_requested_resources(sandbox)
             .await

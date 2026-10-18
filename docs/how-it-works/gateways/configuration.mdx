@@ -1016,6 +1016,44 @@ The gateway verifies supervisor JWT-SVIDs with JWT bundles fetched from the
 SPIFFE Workload API, so this validation path does not require gateway access to
 the SPIRE OIDC discovery endpoint or its TLS CA.
 
+### Experimental shared supervisor deployment
+
+The Kubernetes driver can start idle shared supervisor Deployments ahead of
+multi-tenant session support. Enable the deployment bootstrap through Helm:
+
+```yaml
+server:
+  drivers:
+    kubernetes:
+      sharedSupervisor:
+        enabled: true
+        scope: gateway # or workspace
+```
+
+The equivalent gateway configuration is:
+
+```toml
+[openshell.drivers.kubernetes.shared_supervisor]
+enabled = true
+scope = "gateway"
+```
+
+The feature defaults off. `gateway` creates one Deployment in the driver's
+configured namespace, independent of gateway replica count. `workspace` creates
+one Deployment when a workspace is ensured or creates its first sandbox, in
+that workspace's resolved namespace. Workspace deletion removes its Deployment.
+Each Deployment starts one supervisor replica. Sandbox sessions continue to use
+dedicated supervisors in both scopes; shared process readiness only confirms
+that the idle process is running.
+
+Use a supervisor image with the `shared` command. Shared Pods mount neither
+workload credentials nor Kubernetes API tokens and have no session API. Image
+pull Secrets must already exist in their target namespaces. Split workspace
+chart installs also need `gateway.sharedSupervisor.enabled=true` on the
+`openshell-workspace` chart. Disabling the flag or changing scope stops managing
+the previous Deployments; remove those Deployments explicitly when retiring
+this experiment.
+
 ### MXC
 
 The MXC driver runs Windows workloads through `wxc-exec`. Enable ETW auditing to

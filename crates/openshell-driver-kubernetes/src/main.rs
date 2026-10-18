@@ -280,6 +280,8 @@ async fn main() -> Result<()> {
                 .sandbox_runtime_image
                 .unwrap_or_else(openshell_core::config::default_sandbox_runtime_image),
             sandbox_runtime_image_pull_policy: args.sandbox_runtime_image_pull_policy,
+            shared_supervisor: openshell_driver_kubernetes::config::SharedSupervisorConfig::default(
+            ),
             supervisor_image: args
                 .supervisor_image
                 .unwrap_or_else(openshell_core::config::default_supervisor_image),

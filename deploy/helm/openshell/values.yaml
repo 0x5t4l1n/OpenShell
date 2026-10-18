@@ -439,6 +439,11 @@ server:
       # "managed": auto-creates per-workspace namespaces.
       # "operator": uses pre-provisioned namespaces.
       workspaceMode: "shared"
+      sharedSupervisor:
+        # -- Experimental deployment bootstrap only; sandbox sessions remain dedicated.
+        enabled: false
+        # -- Place one idle shared supervisor Deployment per gateway installation or workspace.
+        scope: gateway
       # -- K8s label selector for namespace discovery in operator mode.
       # The driver watches namespaces matching this label.
       operatorNamespaceLabel: ""

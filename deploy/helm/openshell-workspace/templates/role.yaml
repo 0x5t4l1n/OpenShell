@@ -10,6 +10,14 @@ metadata:
   labels:
     {{- include "openshell-workspace.labels" . | nindent 4 }}
 rules:
+  {{- if .Values.gateway.sharedSupervisor.enabled }}
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    verbs: ["get", "create", "patch", "delete"]
+  - apiGroups: ["networking.k8s.io"]
+    resources: ["networkpolicies"]
+    verbs: ["patch"]
+  {{- end }}
   {{- if .Values.gateway.allowDriverConfig }}
   # Metadata-only admission of caller-selected PVCs requires get permission.
   - apiGroups: [""]

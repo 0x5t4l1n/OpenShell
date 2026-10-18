@@ -39,6 +39,15 @@ for selective-build options and external-driver configuration.
 
 For local evaluation only, TLS may be disabled and the gateway can be reached through `http://127.0.0.1:<port>`.
 
+For the experimental Kubernetes shared-supervisor deployment, check the
+[gateway configuration reference](https://docs.nvidia.com/openshell/latest/how-it-works/gateways/configuration)
+for `shared_supervisor`. These Deployments start idle processes; they do not
+replace dedicated sandbox supervisors yet. Inspect them with
+`kubectl get deployments,pods -A -l openshell.ai/component=shared-supervisor`.
+A Ready idle replica confirms process startup only. Check image compatibility,
+namespace-local pull Secrets, and gateway RBAC if it fails to start. Disabling
+the feature leaves existing shared Deployments for explicit cleanup.
+
 ## Prerequisites
 
 - The `openshell` CLI must be available for endpoint checks.
