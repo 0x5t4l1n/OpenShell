@@ -148,7 +148,7 @@ jobs:
 
   notify-prerelease-success:
     name: Notify Prerelease Success
-    needs: [build, publish, qualify]
+    needs: [resolve, build, publish, qualify]
     if: success()
     runs-on: ubuntu-latest
     timeout-minutes: 2
@@ -157,10 +157,10 @@ jobs:
       - name: Send Slack notification
         continue-on-error: true
         env:
-          RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+          RELEASE_TAG: ${{ needs.resolve.outputs.tag }}
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_OPENSHELL_TRIAGE_WEBHOOK_URL }}
           RUN_URL: ${{ format('{0}/{1}/actions/runs/{2}/attempts/{3}', github.server_url, github.repository, github.run_id, github.run_attempt) }}
-          TAG_URL: ${{ format('{0}/{1}/tree/{2}', github.server_url, github.repository, inputs.tag || github.ref_name) }}
+          TAG_URL: ${{ format('{0}/{1}/tree/{2}', github.server_url, github.repository, needs.resolve.outputs.tag) }}
         run: |
           set -euo pipefail
           if [[ -z "${SLACK_WEBHOOK_URL}" ]]; then
