@@ -629,11 +629,13 @@ class SandboxSession:
     def delete(
         self, *, allow_missing: bool = False, timeout: float | None = None
     ) -> DeletionResult:
+        # Forward `timeout` only on opt-in so older client subclasses still work.
+        extra = {} if timeout is None else {"timeout": timeout}
         return self._client.delete(
             self.sandbox.name,
             workspace=self._workspace,
             allow_missing=allow_missing,
-            timeout=timeout,
+            **extra,
         )
 
     def stop(self) -> SandboxRef:
