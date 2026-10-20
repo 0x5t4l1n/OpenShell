@@ -33,7 +33,6 @@ const TEST_HOST: &str = "host.openshell.internal";
 /// Matches `ci/values-spire-delegation-stack.yaml`.
 const TRUST_DOMAIN: &str = "openshell.local";
 const SPIRE_CLUSTER: &str = "openshell-e2e";
-const SPIRE_CLASS: &str = "spire-spire";
 /// Matches `ci/values-experimental-supervisor-spiffe.yaml`.
 const ID_PREFIX: &str = "spiffe://openshell.local/openshell";
 /// Label on the registration entries this run creates, naming its SPIRE
@@ -596,6 +595,9 @@ fn spire_fixture() -> String {
 /// Register `sandbox_id`'s SPIFFE ID for delegation, scoped to `agent_id`.
 async fn register(gateway_id: &str, sandbox_id: &str, agent_id: &str) {
     let fixture = spire_fixture();
+    // The SPIRE Controller Manager's class is `<namespace>-<release>`; the
+    // wrapper installs release `spire` in the fixture namespace.
+    let class_name = format!("{fixture}-spire");
     let manifest = format!(
         r"apiVersion: spire.spiffe.io/v1alpha1
 kind: ClusterStaticEntry
@@ -604,7 +606,7 @@ metadata:
   labels:
     {ENTRY_LABEL}: {fixture}
 spec:
-  className: {SPIRE_CLASS}
+  className: {class_name}
   spiffeID: {}
   parentID: {agent_id}
   selectors:
