@@ -76,10 +76,10 @@ struct Keys {
 }
 
 fn gateway_keys(gateway_id: &str) -> Keys {
-    let key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ED25519).unwrap();
+    let key = openshell_crypto::pki::generate_jwt_keypair().unwrap();
     Keys {
         issuer: SessionJwtIssuer::from_ed25519_pem(
-            key.serialize_pem().as_bytes(),
+            key.serialize_pem().unwrap().as_bytes(),
             KEY_ID,
             gateway_id,
             Some(Duration::from_hours(1)),
