@@ -4488,15 +4488,8 @@ fn docker_sandbox_bundle_archive(
         identity.uid,
         identity.gid,
     )?;
-    // The supervisor writes only the separate socket volume; its bootstrap
-    // and runtime key mounts stay read-only.
-    append_docker_archive_directory(
-        &mut archive,
-        ".openshell/channel/control",
-        0o711,
-        SUPERVISOR_UID,
-        SUPERVISOR_GID,
-    )?;
+    // The control volume is read-only in the runtime container; the
+    // supervisor stager initializes it.
     append_docker_archive_file(
         &mut archive,
         ".openshell/runtime/openshell-sandbox",
@@ -6025,11 +6018,12 @@ fn build_container_create_body_for_image(
         }),
         ..Default::default()
     });
+    // The runtime only dials the supervisor-owned socket; it never writes here.
     user_mounts.push(Mount {
         target: Some(BOUNDARY_CONTROL_MOUNT_PATH.to_string()),
         source: Some(docker_control_volume_name_by_id(&sandbox.id, config)),
         typ: Some(MountTypeEnum::VOLUME),
-        read_only: Some(false),
+        read_only: Some(true),
         volume_options: Some(MountVolumeOptions {
             no_copy: Some(true),
             ..Default::default()
