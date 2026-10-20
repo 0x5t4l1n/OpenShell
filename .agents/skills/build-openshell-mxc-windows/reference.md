@@ -1,7 +1,10 @@
 # Reference: Windows MSVC maintenance lane
 
 Companion to [SKILL.md](SKILL.md). Use this file for quick lookup while
-maintaining the existing build-only Windows MSVC lane.
+maintaining the native Windows MSVC and MXC runtime lane on the
+[`windows` development and release branch](https://github.com/NVIDIA/OpenShell/tree/windows).
+Run the commands below from that branch or a branch based on it, including
+when reading this reference on `main`.
 
 ## Lane Files
 
@@ -75,7 +78,7 @@ Ninja to `PATH`, while the crypto crates select `clang-cl`. Use a short
 
 ## Unsupported Driver Rules
 
-Windows is a build target only. These runtimes remain unsupported:
+These Windows runtimes remain unsupported:
 
 - Docker
 - Kubernetes
@@ -115,11 +118,10 @@ top-level workspace targets for check/test:
 ```
 
 The gateway keeps platform configuration and unsupported-operation contracts
-without depending on the Docker, Kubernetes, Podman, sandbox runtime,
-standalone supervisor, supervisor process runtime, VM, or VFIO crates. The MXC
-driver does depend on the cross-platform supervisor network library for its host
-egress proxy. The Kubernetes Secrets and Vault libraries still compile as
-gateway dependencies; only their standalone Unix-socket binaries and
+without depending on the Docker, Kubernetes, Podman, VM, or VFIO runtime crates.
+The MXC runtime compiles the supervisor, supervisor-process library, and sandbox
+boundary on Windows. The Kubernetes Secrets and Vault libraries still compile
+as gateway dependencies; only their standalone Unix-socket binaries and
 package-level tests are excluded as top-level targets.
 
 The supervisor and supervisor-process packages now participate as top-level

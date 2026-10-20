@@ -1018,43 +1018,18 @@ the SPIRE OIDC discovery endpoint or its TLS CA.
 
 ### MXC
 
-The MXC driver runs Windows workloads through `wxc-exec`. Enable ETW auditing to
-map Windows Sandboxing provider events into the gateway's OCSF stream.
+Native Windows implementation and releases remain on the
+[`windows` branch](https://github.com/NVIDIA/OpenShell/tree/windows).
+Use the [Windows gateway configuration reference](https://github.com/NVIDIA/OpenShell/blob/windows/docs/how-it-works/gateways/configuration.mdx#mxc)
+and [example TOML](https://github.com/NVIDIA/OpenShell/blob/windows/crates/openshell-driver-mxc/examples/mxc-gateway.toml)
+from the same branch as your Windows build. The maintained runtime pairs a
+host supervisor with `openshell-windows-sandbox.exe` inside an MXC
+ProcessContainer.
 
-```toml
-[openshell]
-version = 2
-
-[openshell.gateway]
-bind_address    = "127.0.0.1:17670"
-log_level       = "info"
-compute_driver = "mxc"
-
-[openshell.drivers.mxc]
-wxc_exec_path           = "C:\\mxc-kit\\bin\\wxc-exec.exe"
-backend                 = "process_container"
-default_configuration_id = "composable"
-pc_least_privilege      = false
-pc_capabilities         = []
-debug                   = false
-etw_audit               = true
-```
-
-`etw_audit` defaults to `false`. When enabled, the gateway account must be an
-administrator or belong to the Windows Performance Log Users group. Workload
-commands and working directories remain sandbox-scoped and must be supplied in
-the `mxc` driver configuration when creating a sandbox.
-
-`OPENSHELL_OCSF_JSON=1` enables the gateway's JSONL audit
-sink independently of the selected compute driver. Set `OPENSHELL_OCSF_LOG_DIR`
-to override the default `%PROGRAMDATA%\OpenShell\logs` directory on Windows
-or `$XDG_STATE_HOME/openshell/logs` on Unix. Prefer the gateway's configured
-`ocsf_log` output for retention controls and loss metrics.
-
-The driver records executable identity in process audit events and omits raw
-command arguments because they can contain credentials or personal data. See
-[OCSF JSON Export](/observability/ocsf-json-export) for durable Windows audit
-output.
+The [Windows guide](https://github.com/NVIDIA/OpenShell/blob/windows/WINDOWS.md)
+covers MSVC builds, MXC host probing, and current limitations. Windows runtime
+configuration stays on `windows` even when shared documentation is published
+from `main`; older MXC examples on `main` are not the Windows release contract.
 
 ### Docker
 
