@@ -5,7 +5,7 @@
 //!
 //! A connection that selects middleware but cannot be shown to it as HTTP
 //! messages (`tls: skip`, h2c, unsupported tunnels, raw TCP, SQL passthrough)
-//! opens one `EvaluateHttpRequestSession` exchange per selected stage whose
+//! opens one `HttpSessionMiddleware.EvaluateRequest` exchange per selected stage whose
 //! HTTP session hook service binds `HTTP_REQUEST`, in chain order, with an uninspectable
 //! preflight. Each stage continues, which allows the connection, or rejects
 //! it. Any failure or timeout denies.

@@ -18,13 +18,13 @@ use crate::proto::{
     ValidateConfigResponse, WebSocketSessionEvent, WebSocketSessionEventResult,
 };
 
-/// Transport-neutral result stream for one `EvaluateHttpRequestSession`
+/// Transport-neutral result stream for one `HttpSessionMiddleware.EvaluateRequest`
 /// exchange.
 pub type HttpRequestSessionResultStream = Pin<
     Box<dyn tokio_stream::Stream<Item = Result<HttpRequestSessionResult, Status>> + Send + 'static>,
 >;
 
-/// Transport-neutral result stream for one `EvaluateHttpResponseSession`
+/// Transport-neutral result stream for one `HttpSessionMiddleware.EvaluateResponse`
 /// exchange.
 pub type HttpResponseSessionResultStream = Pin<
     Box<
@@ -83,7 +83,7 @@ pub trait SupervisorMiddlewareEndpoint: Send + Sync {
         ))
     }
 
-    /// Open one HTTP session hook request exchange (`EvaluateHttpRequestSession`).
+    /// Open one HTTP session hook request exchange (`HttpSessionMiddleware.EvaluateRequest`).
     async fn open_http_request_session(
         &self,
         _requests: mpsc::Receiver<HttpRequestSessionEvent>,
@@ -93,7 +93,7 @@ pub trait SupervisorMiddlewareEndpoint: Send + Sync {
         ))
     }
 
-    /// Open one HTTP session hook response exchange (`EvaluateHttpResponseSession`).
+    /// Open one HTTP session hook response exchange (`HttpSessionMiddleware.EvaluateResponse`).
     async fn open_http_response_session(
         &self,
         _requests: mpsc::Receiver<HttpResponseSessionEvent>,
@@ -316,7 +316,7 @@ pub trait InProcessMiddleware: Send + Sync {
         ))
     }
 
-    /// Open one HTTP session hook request exchange (`EvaluateHttpRequestSession`),
+    /// Open one HTTP session hook request exchange (`HttpSessionMiddleware.EvaluateRequest`),
     /// for a request or for traffic `OpenShell` cannot inspect.
     ///
     /// Implementations that do not require the HTTP session hooks capability
@@ -330,7 +330,7 @@ pub trait InProcessMiddleware: Send + Sync {
         ))
     }
 
-    /// Open one HTTP session hook response exchange (`EvaluateHttpResponseSession`).
+    /// Open one HTTP session hook response exchange (`HttpSessionMiddleware.EvaluateResponse`).
     ///
     /// Implementations that do not require the HTTP session hooks capability
     /// may keep the default unsupported response.

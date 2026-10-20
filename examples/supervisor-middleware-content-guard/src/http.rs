@@ -1,8 +1,8 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! HTTP session hooks (`EvaluateHttpRequestSession` and
-//! `EvaluateHttpResponseSession`) for requests, responses, and uninspectable
+//! HTTP session hooks (`HttpSessionMiddleware.EvaluateRequest` and
+//! `HttpSessionMiddleware.EvaluateResponse`) for requests, responses, and uninspectable
 //! connections.
 //!
 //! The guard selects its configured body mode, BUFFERED by default, and falls
@@ -37,7 +37,7 @@ use crate::guard::{
     BodyMode, GuardConfig, GuardOutcome, MAX_PAYLOAD_BYTES, Mode, StreamScanner, inspect, outcome,
 };
 
-/// Run one `EvaluateHttpRequestSession` exchange.
+/// Run one `HttpSessionMiddleware.EvaluateRequest` exchange.
 pub(crate) fn request_stream<S>(events: S) -> HttpRequestSessionResultStream
 where
     S: Stream<Item = Result<HttpRequestSessionEvent, Status>> + Send + Unpin + 'static,
@@ -47,7 +47,7 @@ where
     })
 }
 
-/// Run one `EvaluateHttpResponseSession` exchange.
+/// Run one `HttpSessionMiddleware.EvaluateResponse` exchange.
 pub(crate) fn response_stream<S>(events: S) -> HttpResponseSessionResultStream
 where
     S: Stream<Item = Result<HttpResponseSessionEvent, Status>> + Send + Unpin + 'static,

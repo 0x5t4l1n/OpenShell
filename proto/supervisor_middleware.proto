@@ -10,8 +10,8 @@ import "google/protobuf/duration.proto";
 import "extension.proto";
 
 // SupervisorMiddleware discovers and configures one operator-run middleware.
-// It evaluates HTTP requests, HTTP responses, and WebSocket messages.
-// Phase-specific services share the same registration.
+// It evaluates legacy HTTP requests and WebSocket messages.
+// Hook-specific services share the same registration and endpoint.
 service SupervisorMiddleware {
   // Describe returns the service manifest and declared bindings.
   rpc Describe(MiddlewareDescribeRequest) returns (MiddlewareManifest);
@@ -20,30 +20,13 @@ service SupervisorMiddleware {
   rpc ValidateConfig(ValidateConfigRequest) returns (ValidateConfigResponse);
 
   // Deprecated: v1 HTTP hooks, removed in 0.2.0. Use
-  // EvaluateHttpRequestSession.
+  // HttpSessionMiddleware.EvaluateRequest.
   // EvaluateHttpRequest returns an allow, deny, or mutation decision for one
   // buffered HTTP request. OpenShell calls it for the HTTP_REQUEST bindings of
   // a service that does not require the HTTP session hooks capability.
   rpc EvaluateHttpRequest(HttpRequestEvaluation) returns (HttpRequestResult) {
     option deprecated = true;
   }
-
-  // HTTP session hooks for requests. OpenShell calls it for the HTTP_REQUEST
-  // bindings of a service whose manifest lists
-  // openshell.supervisor-middleware.http-session in
-  // extension.required_capabilities. Peers that predate HTTP session hooks
-  // reject such a service at Describe. One stream per request and middleware
-  // stage, or per connection OpenShell cannot inspect. The first event is a
-  // preflight whose subject is a request or uninspectable traffic.
-  rpc EvaluateHttpRequestSession(stream HttpRequestSessionEvent)
-      returns (stream HttpRequestSessionResult);
-
-  // HTTP session hooks for responses, for the HTTP_RESPONSE bindings of a
-  // service that requires the HTTP session hooks capability. One stream per
-  // response and middleware stage. The first event is a preflight of the
-  // response head.
-  rpc EvaluateHttpResponseSession(stream HttpResponseSessionEvent)
-      returns (stream HttpResponseSessionResult);
 
   // EvaluateWebSocketSession opens one ordered, phase-specific stream for a
   // single middleware stage and WebSocket upgrade attempt. The current
@@ -56,6 +39,28 @@ service SupervisorMiddleware {
       returns (stream WebSocketSessionEventResult);
 }
 
+// HttpSessionMiddleware evaluates HTTP messages for one operator-run middleware.
+// It shares SupervisorMiddleware's registration, discovery, configuration, and
+// endpoint. Each invocation serves one binding phase, carried in its preflight.
+service HttpSessionMiddleware {
+  // HTTP session hooks for requests. OpenShell calls it for the HTTP_REQUEST
+  // bindings of a service whose manifest lists
+  // openshell.supervisor-middleware.http-session in
+  // extension.required_capabilities. Peers that predate HTTP session hooks
+  // reject such a service at Describe. One stream per request and middleware
+  // stage, or per connection OpenShell cannot inspect. The first event is a
+  // preflight whose subject is a request or uninspectable traffic.
+  rpc EvaluateRequest(stream HttpRequestSessionEvent)
+      returns (stream HttpRequestSessionResult);
+
+  // HTTP session hooks for responses, for the HTTP_RESPONSE bindings of a
+  // service that requires the HTTP session hooks capability. One stream per
+  // response and middleware stage. The first event is a preflight of the
+  // response head.
+  rpc EvaluateResponse(stream HttpResponseSessionEvent)
+      returns (stream HttpResponseSessionResult);
+}
+
 message MiddlewareDescribeRequest {
   // Gateway or supervisor protocol metadata. Middleware must reject unmet
   // requirements before accepting traffic.
@@ -63,7 +68,7 @@ message MiddlewareDescribeRequest {
 }
 
 // Deprecated: v1 HTTP hooks, removed in 0.2.0. Use
-// SupervisorMiddleware.EvaluateHttpResponseSession.
+// HttpSessionMiddleware.EvaluateResponse.
 // HttpResponsePreReturn evaluates one response for one middleware stage before
 // OpenShell returns it to the sandbox. OpenShell calls it for the HTTP_RESPONSE
 // bindings of a service that does not require the HTTP session hooks
@@ -140,7 +145,7 @@ message ValidateConfigResponse {
   string reason = 2;
 }
 
-// HTTP session hooks. One ordered event in an EvaluateHttpRequestSession
+// HTTP session hooks. One ordered event in a HttpSessionMiddleware.EvaluateRequest
 // stream. Preflight is always first. An inspect result is followed by begin
 // and exactly one body lifecycle: buffered_body for BUFFERED, or input_chunk
 // events ending with input_end for STREAM. session_end is best effort and has
@@ -156,7 +161,7 @@ message HttpRequestSessionEvent {
   }
 }
 
-// HTTP session hooks. One ordered event in an EvaluateHttpResponseSession
+// HTTP session hooks. One ordered event in a HttpSessionMiddleware.EvaluateResponse
 // stream, in the order HttpRequestSessionEvent describes.
 message HttpResponseSessionEvent {
   oneof event {
@@ -169,7 +174,7 @@ message HttpResponseSessionEvent {
   }
 }
 
-// HTTP session hooks. One ordered result in an EvaluateHttpRequestSession
+// HTTP session hooks. One ordered result in a HttpSessionMiddleware.EvaluateRequest
 // stream. Preflight requires preflight_result or reject. BUFFERED ends with
 // buffered_result or reject. STREAM sends output_start before any
 // output_chunk, even for an empty output, and ends with finish or reject. An
@@ -189,7 +194,7 @@ message HttpRequestSessionResult {
   }
 }
 
-// HTTP session hooks. One ordered result in an EvaluateHttpResponseSession
+// HTTP session hooks. One ordered result in a HttpSessionMiddleware.EvaluateResponse
 // stream, under the rules HttpRequestSessionResult describes, with
 // block_delivery instead of reject. Blocking delivery does not undo the
 // request already handled by the external service.
@@ -902,13 +907,13 @@ message MiddlewareExchangeProtocolError {}
 enum SupervisorMiddlewareOperation {
   SUPERVISOR_MIDDLEWARE_OPERATION_UNSPECIFIED = 0;
   // An HTTP request at PRE_CREDENTIALS. OpenShell calls
-  // EvaluateHttpRequestSession when the service requires the
+  // HttpSessionMiddleware.EvaluateRequest when the service requires the
   // openshell.supervisor-middleware.http-session capability, and the
   // deprecated v1 EvaluateHttpRequest otherwise.
   SUPERVISOR_MIDDLEWARE_OPERATION_HTTP_REQUEST = 1;
   SUPERVISOR_MIDDLEWARE_OPERATION_WEBSOCKET_MESSAGE = 2;
   // A final HTTP response at PRE_RETURN. OpenShell calls
-  // EvaluateHttpResponseSession when the service requires the HTTP session
+  // HttpSessionMiddleware.EvaluateResponse when the service requires the HTTP session
   // hooks capability, and the deprecated v1 HttpResponsePreReturn.Evaluate
   // otherwise.
   SUPERVISOR_MIDDLEWARE_OPERATION_HTTP_RESPONSE = 3;

@@ -4,8 +4,8 @@
 //! Example OpenShell supervisor middleware service.
 //!
 //! The content guard redacts or denies configured terms in HTTP request and
-//! response bodies through HTTP session hooks (`EvaluateHttpRequestSession`
-//! and `EvaluateHttpResponseSession`), and in WebSocket text messages. Its
+//! response bodies through HTTP session hooks (`HttpSessionMiddleware.EvaluateRequest`
+//! and `HttpSessionMiddleware.EvaluateResponse`), and in WebSocket text messages. Its
 //! manifest requires the `openshell.supervisor-middleware.http-session`
 //! capability, which gateways and supervisors that predate HTTP session hooks
 //! do not support, so they refuse it at Describe.
@@ -22,6 +22,9 @@ use openshell_core::extension_protocol::{
 };
 use openshell_core::middleware::{
     HttpRequestSessionResultStream, HttpResponseSessionResultStream, WebSocketResponseStream,
+};
+use openshell_core::proto::middleware::v1::http_session_middleware_server::{
+    HttpSessionMiddleware, HttpSessionMiddlewareServer,
 };
 use openshell_core::proto::middleware::v1::supervisor_middleware_server::{
     SupervisorMiddleware, SupervisorMiddlewareServer,
@@ -69,8 +72,6 @@ fn http_binding(
 #[tonic::async_trait]
 impl SupervisorMiddleware for ContentGuard {
     type EvaluateWebSocketSessionStream = WebSocketResponseStream;
-    type EvaluateHttpRequestSessionStream = HttpRequestSessionResultStream;
-    type EvaluateHttpResponseSessionStream = HttpResponseSessionResultStream;
 
     async fn describe(
         &self,
@@ -140,20 +141,6 @@ impl SupervisorMiddleware for ContentGuard {
         ))
     }
 
-    async fn evaluate_http_request_session(
-        &self,
-        request: Request<tonic::Streaming<HttpRequestSessionEvent>>,
-    ) -> Result<Response<Self::EvaluateHttpRequestSessionStream>, Status> {
-        Ok(Response::new(http::request_stream(request.into_inner())))
-    }
-
-    async fn evaluate_http_response_session(
-        &self,
-        request: Request<tonic::Streaming<HttpResponseSessionEvent>>,
-    ) -> Result<Response<Self::EvaluateHttpResponseSessionStream>, Status> {
-        Ok(Response::new(http::response_stream(request.into_inner())))
-    }
-
     async fn evaluate_web_socket_session(
         &self,
         request: Request<tonic::Streaming<WebSocketSessionEvent>>,
@@ -164,6 +151,26 @@ impl SupervisorMiddleware for ContentGuard {
     }
 }
 
+#[tonic::async_trait]
+impl HttpSessionMiddleware for ContentGuard {
+    type EvaluateRequestStream = HttpRequestSessionResultStream;
+    type EvaluateResponseStream = HttpResponseSessionResultStream;
+
+    async fn evaluate_request(
+        &self,
+        request: Request<tonic::Streaming<HttpRequestSessionEvent>>,
+    ) -> Result<Response<Self::EvaluateRequestStream>, Status> {
+        Ok(Response::new(http::request_stream(request.into_inner())))
+    }
+
+    async fn evaluate_response(
+        &self,
+        request: Request<tonic::Streaming<HttpResponseSessionEvent>>,
+    ) -> Result<Response<Self::EvaluateResponseStream>, Status> {
+        Ok(Response::new(http::response_stream(request.into_inner())))
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
@@ -171,6 +178,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Server::builder()
         .add_service(
             SupervisorMiddlewareServer::new(ContentGuard)
+                .max_decoding_message_size(MAX_GRPC_MESSAGE_BYTES)
+                .max_encoding_message_size(MAX_GRPC_MESSAGE_BYTES),
+        )
+        .add_service(
+            HttpSessionMiddlewareServer::new(ContentGuard)
                 .max_decoding_message_size(MAX_GRPC_MESSAGE_BYTES)
                 .max_encoding_message_size(MAX_GRPC_MESSAGE_BYTES),
         )

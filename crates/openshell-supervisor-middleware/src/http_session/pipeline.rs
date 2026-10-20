@@ -405,7 +405,7 @@ pub struct PreflightFields {
 }
 
 impl PreflightFields {
-    /// An `EvaluateHttpRequestSession` preflight at `PRE_CREDENTIALS`.
+    /// An `HttpSessionMiddleware.EvaluateRequest` preflight at `PRE_CREDENTIALS`.
     pub fn request(self, subject: http_request_session_preflight::Subject) -> StagePreflight {
         StagePreflight::Request(HttpRequestSessionPreflight {
             subject: Some(subject),
@@ -420,7 +420,7 @@ impl PreflightFields {
         })
     }
 
-    /// An `EvaluateHttpResponseSession` preflight at `PRE_RETURN`.
+    /// An `HttpSessionMiddleware.EvaluateResponse` preflight at `PRE_RETURN`.
     pub fn response(self, head: HttpResponsePreflightHead) -> StagePreflight {
         StagePreflight::Response(HttpResponseSessionPreflight {
             response: Some(head),
