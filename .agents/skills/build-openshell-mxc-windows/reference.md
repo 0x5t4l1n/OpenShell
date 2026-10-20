@@ -39,11 +39,18 @@ if ($arch -eq [System.Runtime.InteropServices.Architecture]::Arm64) {
     mise run --skip-tools windows:build:arm64
     mise run --skip-tools windows:test:arm64
     mise run --skip-tools windows:test:unsupported:arm64
+    mise run --skip-tools windows:test:mxc-real:arm64
     mise run --skip-tools windows:artifacts
 } else {
     mise run --skip-tools windows:ci
+    mise run --skip-tools windows:test:mxc-real:x64
 }
 ```
+
+`windows:ci` does not include the real MXC runtime tests. Run the matching
+`windows:test:mxc-real:*` task explicitly on either native architecture.
+These tasks can report `SKIP` when the executor or backend is unavailable;
+report that missing runtime coverage separately from passing tests.
 
 The native test tasks reject a target that does not match the host architecture.
 Do not report x64 compatibility-under-emulation coverage from an ARM64 run.
