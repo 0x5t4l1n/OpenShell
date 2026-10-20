@@ -192,7 +192,7 @@ for _, p := range providers {
 
 Blocks until the sandbox reaches the `Ready` phase, returning the final sandbox state. Under the hood, WaitReady polls via `Get` at a configurable interval (default 500ms). Use context cancellation or deadlines to set a timeout.
 
-If the sandbox enters the `Error` phase, WaitReady returns immediately with a `StatusError`.
+If the sandbox enters the `Error`, `Stopped`, `Deleting`, `Suspending`, or `Suspended` phase, WaitReady returns immediately with a `StatusError`.
 
 ```go
 // Wait with a 30-second timeout
@@ -212,6 +212,32 @@ sb, err := client.Sandboxes().WaitReady(ctx, "default", "my-sandbox", v1.WaitOpt
 ```
 
 There is no dedicated WaitReady RPC. The SDK implements this by polling `GetSandbox` until the sandbox phase is `Ready` or `Error`.
+
+## Suspend and Resume
+
+`SandboxSuspendResume()` freezes a `Ready` sandbox and retains its memory state, then restores it later in a new runtime generation. The gateway returns a `Conflict` error when its compute driver or the sandbox's isolation backend does not support suspension.
+
+```go
+sr := client.SandboxSuspendResume()
+
+if _, err := sr.Suspend(ctx, "default", "my-sandbox"); err != nil {
+    log.Fatal(err)
+}
+if _, err := sr.WaitSuspended(ctx, "default", "my-sandbox"); err != nil {
+    log.Fatal(err)
+}
+
+// Later: restore the retained state. RestartIfRestoreFails boots the
+// sandbox cleanly if the state cannot be restored.
+if _, err := sr.Resume(ctx, "default", "my-sandbox", v1.ResumeOptions{
+    RestartIfRestoreFails: true,
+}); err != nil {
+    log.Fatal(err)
+}
+sb, err := client.Sandboxes().WaitReady(ctx, "default", "my-sandbox")
+```
+
+`Sandboxes().Start` on a `Suspended` sandbox discards the retained state and boots it cleanly. `Sandboxes().Stop` and `Delete` also discard it.
 
 ## Watch
 

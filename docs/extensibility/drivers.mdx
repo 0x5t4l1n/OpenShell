@@ -63,6 +63,42 @@ active driver and negotiated capabilities. See the
 [Extension Driver configuration reference](/how-it-works/gateways/configuration#extension-driver)
 for configuration details.
 
+### Suspend and Resume
+
+A compute driver that can retain workload state lists
+`openshell.compute.suspend-resume` in its supported capabilities and implements
+`SuspendSandbox`. The gateway rejects suspend and resume requests for drivers
+that do not advertise it. The driver stores the restore reference; the gateway
+never receives it. Suspension also requires an isolation backend that advertises
+`openshell.sandbox.suspend-resume`. Refer to
+[Isolation Backends](/extensibility/isolation-backends#suspend-and-resume).
+
+The driver coordinates retained state with the backend through its native
+provisioning or control integration. The shared supervisor launch metadata
+contains identity and transport settings; it contains no restore references,
+reference-file paths, or restart policy.
+
+To implement `SuspendSandbox`, send `SIGUSR1` to the supervisor and wait,
+with a bound, for it to exit with status 0. The supervisor calls
+`SuspendBoundary`, and the backend freezes the workload, retains its state,
+and fences the generation. The backend must make its retained-state handle
+available to the driver through their private integration before confirming
+suspension. The supervisor exits without terminating the boundary or reporting
+a main-process exit. It ignores `SIGUSR1` when the backend lacks support.
+
+For `StartSandbox` with `resume` set, provision the backend to restore the
+retained state under the new launch identity. Pass the request's
+`restart_if_restore_fails` choice through the driver-to-backend integration.
+The supervisor attaches using `OpenBoundary`; the backend reports `RESTORED`
+or an explicitly permitted `COLD_START_FALLBACK`. The backend must reject
+missing, invalid, or superseded state instead of silently starting fresh.
+Keep the restored workload frozen until the new supervisor admits and starts it.
+
+If you can observe a failed restore before `StartSandbox` returns, keep the
+retained-state handle and return an error so the gateway can return the sandbox
+to Suspended for another attempt. `StartSandbox` without `resume`,
+`StopSandbox`, and `DeleteSandbox` discard retained state.
+
 ## Credential Drivers
 
 Credential drivers store provider credentials behind opaque handles. The

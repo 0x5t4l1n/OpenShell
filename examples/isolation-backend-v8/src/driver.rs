@@ -36,6 +36,13 @@ struct Entry {
     sandbox: DriverSandbox,
     supervisor: tokio::process::Child,
     boundary: DelegatedLaunch,
+    /// The backend holds suspended state named by `restore-reference`.
+    retained: bool,
+}
+
+/// Restore flags for a launch that resumes suspended state.
+struct Restore {
+    restart_if_restore_fails: bool,
 }
 impl Driver {
     pub fn new(
@@ -112,6 +119,7 @@ impl Driver {
             conditions: vec![DriverCondition {
                 r#type: if exited.is_some() { "Stopped" } else { "Ready" }.into(),
                 status: "True".into(),
+                reason: if entry.retained { "StateRetained" } else { "" }.into(),
                 ..Default::default()
             }],
             resolved_identity: Some(ResolvedWorkloadIdentity {
@@ -139,6 +147,88 @@ impl Driver {
         let _ = entry.supervisor.wait().await;
         self.retire_boundary().await
     }
+    /// Have the supervisor suspend its boundary; the backend persists the handle.
+    async fn suspend_entry(&self, entry: &mut Entry) -> Result<(), Status> {
+        if entry.retained {
+            return Ok(());
+        }
+        if entry.supervisor.try_wait().map_err(internal)?.is_some() {
+            return Err(Status::failed_precondition("sandbox is not running"));
+        }
+        let output = self.state_dir.join("restore-reference");
+        match std::fs::remove_file(&output) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => return Err(Status::internal("clear suspend reference")),
+        }
+        let pid = entry
+            .supervisor
+            .id()
+            .and_then(|id| rustix::process::Pid::from_raw(id.cast_signed()))
+            .ok_or_else(|| Status::failed_precondition("sandbox is not running"))?;
+        // The supervisor calls SuspendBoundary; the backend persists the handle.
+        rustix::process::kill_process(pid, rustix::process::Signal::USR1).map_err(internal)?;
+        // `Child::wait` closes stdin, which the supervisor reads as parent
+        // death. Keep the liveness pipe open until it exits on its own.
+        let liveness = entry.supervisor.stdin.take();
+        let status = tokio::time::timeout(Duration::from_secs(15), entry.supervisor.wait()).await;
+        if status.is_err() {
+            entry.supervisor.stdin = liveness;
+            return Err(Status::unavailable(
+                "supervisor did not suspend the sandbox",
+            ));
+        }
+        drop(liveness);
+        let status = status.unwrap().map_err(internal)?;
+        if !status.success() || !output.exists() {
+            self.retire_boundary().await?;
+            return Err(Status::internal(format!(
+                "supervisor exited without suspending ({status})"
+            )));
+        }
+        entry.retained = true;
+        // The backend retains the frozen guest when its generation retires.
+        self.retire_boundary().await
+    }
+    /// Wait until a resuming supervisor is ready or has failed to restore.
+    async fn await_resume(&self, entry: &mut Entry) -> Result<(), Status> {
+        let ready = self.state_dir.join("ready.sock");
+        for _ in 0..300 {
+            if let Some(status) = entry.supervisor.try_wait().map_err(internal)? {
+                self.retire_boundary().await?;
+                return Err(Status::failed_precondition(format!(
+                    "supervisor could not resume the sandbox ({status}); see supervisor.err.log"
+                )));
+            }
+            // The supervisor serves readiness only after the restored agent starts.
+            if tokio::net::UnixStream::connect(&ready).await.is_ok() {
+                // The new generation owns the restored state; the reference is spent.
+                return match std::fs::remove_file(self.state_dir.join("restore-reference")) {
+                    Ok(()) => Ok(()),
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                    Err(_) => Err(Status::internal("remove restore reference")),
+                };
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        Err(Status::deadline_exceeded(
+            "supervisor did not finish resuming",
+        ))
+    }
+    /// Drop retained state for stop, delete, and fresh starts.
+    fn discard_retained(&self, entry: &mut Entry) -> Result<(), Status> {
+        if !entry.retained {
+            return Ok(());
+        }
+        match std::fs::remove_file(self.state_dir.join("restore-reference")) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => return Err(Status::internal("remove restore reference")),
+        }
+        write_private(&self.state_dir.join("discard-retained"), b"").map_err(internal)?;
+        entry.retained = false;
+        Ok(())
+    }
     async fn retire_boundary(&self) -> Result<(), Status> {
         match std::fs::remove_file(self.state_dir.join("launch.json")) {
             Ok(()) => {}
@@ -156,7 +246,11 @@ impl Driver {
             "backend did not acknowledge termination",
         ))
     }
-    async fn launch(&self, sandbox: DriverSandbox) -> Result<Entry, Status> {
+    async fn launch(
+        &self,
+        sandbox: DriverSandbox,
+        restore: Option<Restore>,
+    ) -> Result<Entry, Status> {
         self.validate(&sandbox)?;
         let spec = sandbox.spec.as_ref().unwrap();
         let auth: SandboxLaunchAuthentication = serde_json::from_slice(&spec.launch_authentication)
@@ -199,6 +293,29 @@ impl Driver {
             rotation: auth.supervisor.session_rotation,
             certificate: tls.certificate_chain_pem,
             private_key: tls.private_key_pem,
+            restore: restore
+                .as_ref()
+                .map(|restore| {
+                    use std::io::Read as _;
+                    let file = std::fs::File::open(self.state_dir.join("restore-reference"))
+                        .map_err(internal)?;
+                    let mut reference = Vec::new();
+                    file.take(openshell_sandbox_backend::MAX_RESTORE_REFERENCE_BYTES as u64 + 1)
+                        .read_to_end(&mut reference)
+                        .map_err(internal)?;
+                    if reference.is_empty()
+                        || reference.len() > openshell_sandbox_backend::MAX_RESTORE_REFERENCE_BYTES
+                    {
+                        return Err(Status::failed_precondition(
+                            "invalid retained restore reference",
+                        ));
+                    }
+                    Ok(crate::launch::Restore {
+                        reference,
+                        restart_if_restore_fails: restore.restart_if_restore_fails,
+                    })
+                })
+                .transpose()?,
         };
         let selected = spec.isolation_backend.as_ref().unwrap();
         let Some(isolation_backend_registration::Endpoint::UnixSocketPath(path)) =
@@ -321,6 +438,7 @@ impl Driver {
             sandbox,
             supervisor,
             boundary,
+            retained: false,
         })
     }
 }
@@ -348,6 +466,7 @@ impl compute_driver_server::ComputeDriver for DriverService {
             [
                 extension_protocol::COMPUTE_LAUNCH_AUTHENTICATION.into(),
                 extension_protocol::COMPUTE_ISOLATION_BACKEND.into(),
+                extension_protocol::COMPUTE_SUSPEND_RESUME.into(),
             ],
         );
         extension
@@ -405,7 +524,7 @@ impl compute_driver_server::ComputeDriver for DriverService {
                 "this example supports one sandbox; delete it first",
             ));
         }
-        let created = self.launch(sandbox).await?;
+        let created = self.launch(sandbox, None).await?;
         let identity = created.sandbox.id.clone();
         *entry = Some(created);
         Ok(Response::new(CreateSandboxResponse {
@@ -447,8 +566,21 @@ impl compute_driver_server::ComputeDriver for DriverService {
             .filter(|e| e.sandbox.id == q.get_ref().sandbox_id)
         {
             self.stop_entry(entry).await?;
+            self.discard_retained(entry)?;
         }
         Ok(Response::new(StopSandboxResponse {}))
+    }
+    async fn suspend_sandbox(
+        &self,
+        q: Request<SuspendSandboxRequest>,
+    ) -> Result<Response<SuspendSandboxResponse>, Status> {
+        let mut entry = self.entry.lock().await;
+        let entry = entry
+            .as_mut()
+            .filter(|e| e.sandbox.id == q.get_ref().sandbox)
+            .ok_or_else(|| Status::not_found("sandbox not found"))?;
+        self.suspend_entry(entry).await?;
+        Ok(Response::new(SuspendSandboxResponse {}))
     }
     async fn delete_sandbox(
         &self,
@@ -460,6 +592,7 @@ impl compute_driver_server::ComputeDriver for DriverService {
             .is_some_and(|e| e.sandbox.id == q.get_ref().sandbox_id)
         {
             self.stop_entry(entry.as_mut().unwrap()).await?;
+            self.discard_retained(entry.as_mut().unwrap())?;
             *entry = None;
             self.deleted
                 .send_replace(Some(q.get_ref().sandbox_id.clone()));
@@ -484,12 +617,37 @@ impl compute_driver_server::ComputeDriver for DriverService {
             }));
         }
         self.stop_entry(current).await?;
+        let restore = if q.resume {
+            if !current.retained {
+                return Err(Status::failed_precondition(
+                    "no suspended state is retained for this sandbox",
+                ));
+            }
+            Some(Restore {
+                restart_if_restore_fails: q.restart_if_restore_fails,
+            })
+        } else {
+            self.discard_retained(current)?;
+            None
+        };
         let mut sandbox = current.sandbox.clone();
         let spec = sandbox.spec.as_mut().unwrap();
         spec.launch_authentication = q.launch_authentication;
         spec.isolation_backend = q.isolation_backend;
-        let launched = self.launch(sandbox).await?;
+        let resuming = restore.is_some();
+        let mut launched = self.launch(sandbox, restore).await?;
+        // Report a failed restore from this call, while the reference is still
+        // retained, so the gateway can return the sandbox to Suspended.
+        let result = if resuming {
+            launched.retained = true;
+            let result = self.await_resume(&mut launched).await;
+            launched.retained = result.is_err();
+            result
+        } else {
+            Ok(())
+        };
         *entry = Some(launched);
+        result?;
         Ok(Response::new(StartSandboxResponse {
             runtime_identity: q.sandbox_id,
         }))

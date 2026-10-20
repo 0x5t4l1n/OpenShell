@@ -75,6 +75,44 @@ print an error and return exit code 1.
 Add `--detach` to run without attaching; detached creation does not stream guest
 output. Use `openshell sandbox connect js-demo` to attach afterward.
 
+## Suspend and resume
+
+The example implements sandbox suspend and resume. Suspension freezes the V8
+isolate in place and the `js-sbx serve` process keeps it in memory; resume
+continues the same isolate in a new runtime generation. Start the demo with
+the counting script, which runs for about 12 seconds:
+
+```shell
+./start.sh counter.js
+```
+
+In another terminal, create the sandbox, then suspend and resume it while it
+counts:
+
+```shell
+openshell sandbox create --name js-demo \
+  --keep --no-tty --no-auto-providers --detach -- /work/guest.js
+openshell sandbox suspend js-demo
+openshell sandbox resume js-demo
+```
+
+`backend.log` shows the count continue from its value at suspension, and the
+elapsed time includes the gap. The 15-second deadline counts only running time.
+
+The driver sends `SIGUSR1` to the supervisor, which calls `SuspendBoundary`.
+The backend retains the frozen isolate and privately persists its handle in
+`restore-reference` before acknowledging suspension. The supervisor exits;
+it does not write or read a reference file. On resume the driver provisions
+the backend using `launch.json`, while the supervisor attaches through its
+ordinary boundary-opening path. The shared `boundary.json` contains no
+retention fields. The
+reference authenticates the sandbox with a key in `retention.key`, so a
+restarted `js-sbx serve` can tell lost state from a forged or superseded
+reference. If you restart `js-sbx serve` while the sandbox is suspended, resume
+fails and the sandbox stays `Suspended`; `openshell sandbox start js-demo`
+then runs the script from the beginning.
+`openshell sandbox start`, `stop`, and `delete` discard the retained state.
+
 ## Inspect and stop
 
 ```shell
@@ -94,5 +132,5 @@ limits do not bound all native V8 resources. The V8 isolate confines JavaScript;
 the host process does not run in a Linux namespace or container.
 
 The example has no HTTP relay or guest network implementation. `fetch` is only
-a synchronous denial stub. Exec, PTY, providers, suspend/resume, and supervisor
-recovery are unsupported.
+a synchronous denial stub. Exec, PTY, providers, and supervisor recovery are
+unsupported. Retained state lives only in the `js-sbx serve` process memory.
