@@ -115,6 +115,7 @@ pub struct SandboxRuntimeNames {
     pub sandbox_secret: String,
     pub supervisor_secret: String,
     pub boundary_service: String,
+    pub supervisor_service: String,
     /// Per-sandbox egress allowance used only by runtime-initiated control.
     pub control_policy: String,
     pub supervisor_pod: String,
@@ -131,11 +132,23 @@ impl SandboxRuntimeNames {
             sandbox_secret: format!("os-sandbox-{suffix}"),
             supervisor_secret: format!("os-supervisor-{suffix}"),
             boundary_service: format!("os-boundary-{suffix}"),
+            supervisor_service: format!("os-supervisor-{suffix}"),
             control_policy: format!("os-control-{suffix}"),
             supervisor_pod: format!("os-supervisor-{suffix}"),
             workload_policy: NAMESPACE_WORKLOAD_POLICY_NAME.to_string(),
             supervisor_policy: NAMESPACE_SUPERVISOR_EGRESS_POLICY_NAME.to_string(),
             image_pull_secret_prefix: format!("os-pull-{suffix}"),
+        }
+    }
+
+    /// The legacy boundary Service always selects the workload. New runtimes
+    /// dial a separate supervisor Service, so old gateways can still restart
+    /// the pair without understanding runtime-initiated control.
+    #[must_use]
+    pub fn control_service(&self, mode: KubernetesControlConnection) -> &str {
+        match mode {
+            KubernetesControlConnection::SupervisorInitiated => &self.boundary_service,
+            KubernetesControlConnection::RuntimeInitiated => &self.supervisor_service,
         }
     }
 
@@ -187,8 +200,8 @@ pub fn workload_fence(
 }
 
 /// Per-sandbox Sandbox Protocol endpoint. Its stable `ClusterIP` is allocated
-/// before either Pod runs; the selected role follows the current generation's
-/// connection mode. A legacy endpoint is upgraded when both Pods are replaced.
+/// before either Pod runs. Each connection mode has a separate Service name
+/// and fixed selector, so legacy gateways keep their workload endpoint.
 #[must_use]
 pub fn boundary_service(
     namespace: &str,
@@ -200,7 +213,7 @@ pub fn boundary_service(
 ) -> Service {
     Service {
         metadata: ObjectMeta {
-            name: Some(names.boundary_service.clone()),
+            name: Some(names.control_service(mode).to_string()),
             namespace: Some(namespace.to_string()),
             owner_references: Some(vec![owner]),
             labels: Some(common_labels(sandbox_id, "boundary-service")),
@@ -783,7 +796,7 @@ mod tests {
     #[test]
     fn service_selects_only_the_workload_boundary() {
         let names = SandboxRuntimeNames::new("4b67c0d0-1111-2222-3333-444444444444");
-        let service = boundary_service(
+        let legacy = boundary_service(
             "sandbox",
             &names,
             "pair",
@@ -792,9 +805,33 @@ mod tests {
             owner(),
         );
         assert_eq!(
-            service.spec.unwrap().selector.unwrap()[BOUNDARY_ROLE_LABEL],
+            legacy.spec.as_ref().unwrap().selector.as_ref().unwrap()[BOUNDARY_ROLE_LABEL],
             "workload"
         );
+        let runtime_initiated = boundary_service(
+            "sandbox",
+            &names,
+            "pair",
+            5500,
+            KubernetesControlConnection::RuntimeInitiated,
+            owner(),
+        );
+        assert_eq!(
+            legacy.metadata.name.as_deref(),
+            Some(names.boundary_service.as_str())
+        );
+        assert_eq!(
+            runtime_initiated.metadata.name.as_deref(),
+            Some(names.supervisor_service.as_str())
+        );
+        assert_ne!(legacy.metadata.name, runtime_initiated.metadata.name);
+        assert_ne!(
+            legacy.spec.as_ref().unwrap().publish_not_ready_addresses,
+            Some(true)
+        );
+        let spec = runtime_initiated.spec.unwrap();
+        assert_eq!(spec.selector.unwrap()[BOUNDARY_ROLE_LABEL], "supervisor");
+        assert_eq!(spec.publish_not_ready_addresses, Some(true));
     }
 
     #[test]

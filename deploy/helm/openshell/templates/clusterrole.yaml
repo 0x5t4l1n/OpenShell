@@ -101,8 +101,7 @@ rules:
   {{- if ne $workspaceMode "shared" }}
   - apiGroups: [""]
     resources: ["services"]
-    # Restart upgrades a legacy control endpoint without replacing its ClusterIP.
-    verbs: ["create", "get", "patch"]
+    verbs: ["create", "get"]
   - apiGroups: ["networking.k8s.io"]
     resources: ["networkpolicies"]
     verbs: ["create", "get"]

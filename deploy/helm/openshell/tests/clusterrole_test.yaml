@@ -156,7 +156,7 @@ tests:
           content:
             apiGroups: [""]
             resources: ["services"]
-            verbs: ["create", "get", "patch"]
+            verbs: ["create", "get"]
       - contains:
           path: rules
           content:
@@ -181,7 +181,7 @@ tests:
           content:
             apiGroups: [""]
             resources: ["services"]
-            verbs: ["create", "get", "patch"]
+            verbs: ["create", "get"]
   - it: omits the ClusterRole when cluster-scoped RBAC is disabled
     set:
       rbac.clusterScoped.create: false

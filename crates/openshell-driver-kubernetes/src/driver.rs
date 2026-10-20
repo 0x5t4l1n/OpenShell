@@ -110,6 +110,8 @@ const ANNOTATION_SANDBOX_RUNTIME_NETWORK_POLICY_GENERATION: &str =
 /// generations, which remain supervisor-initiated until they are replaced.
 const ANNOTATION_SANDBOX_RUNTIME_CONTROL_CONNECTION: &str =
     "openshell.ai/sandbox-runtime-control-connection";
+const ANNOTATION_SANDBOX_RUNTIME_CONTROL_GENERATION: &str =
+    "openshell.ai/sandbox-runtime-control-generation";
 const ANNOTATION_SANDBOX_RUNTIME_CONTROL_POLICY_UID: &str =
     "openshell.ai/sandbox-runtime-control-policy-uid";
 const ANNOTATION_SANDBOX_RUNTIME_CONTROL_POLICY_GENERATION: &str =
@@ -148,10 +150,11 @@ fn boundary_service_authority(
     namespace: &str,
     names: &SandboxRuntimeNames,
     boundary_port: u16,
+    mode: KubernetesControlConnection,
 ) -> String {
     format!(
-        "{}.{}.svc:{boundary_port}",
-        names.boundary_service, namespace
+        "{}.{namespace}.svc:{boundary_port}",
+        names.control_service(mode),
     )
 }
 
@@ -159,15 +162,24 @@ fn boundary_service_authority(
 fn sandbox_runtime_control_connection(
     object: &DynamicObject,
 ) -> Result<KubernetesControlConnection, KubernetesDriverError> {
-    object
-        .metadata
-        .annotations
-        .as_ref()
-        .and_then(|annotations| annotations.get(ANNOTATION_SANDBOX_RUNTIME_CONTROL_CONNECTION))
-        .map_or(
-            Ok(KubernetesControlConnection::SupervisorInitiated),
-            |value| value.parse().map_err(KubernetesDriverError::Precondition),
-        )
+    let Some(annotations) = object.metadata.annotations.as_ref() else {
+        return Ok(KubernetesControlConnection::SupervisorInitiated);
+    };
+    let Some(value) = annotations.get(ANNOTATION_SANDBOX_RUNTIME_CONTROL_CONNECTION) else {
+        return Ok(KubernetesControlConnection::SupervisorInitiated);
+    };
+    let mode = value.parse().map_err(KubernetesDriverError::Precondition)?;
+    // Old gateways rotate the runtime generation but preserve unknown
+    // annotations. Their replacement uses legacy control, not this stale mode.
+    if annotations
+        .get(ANNOTATION_SANDBOX_RUNTIME_CONTROL_GENERATION)
+        .is_none_or(|generation| {
+            Some(generation) != annotations.get(ANNOTATION_SANDBOX_RUNTIME_GENERATION)
+        })
+    {
+        return Ok(KubernetesControlConnection::SupervisorInitiated);
+    }
+    Ok(mode)
 }
 
 /// Operator-provided bootstrap bytes read once per runtime generation.
@@ -2183,6 +2195,10 @@ impl KubernetesComputeDriver {
             ANNOTATION_SANDBOX_RUNTIME_CONTROL_CONNECTION.to_string(),
             control_connection.as_str().to_string(),
         );
+        annotations.insert(
+            ANNOTATION_SANDBOX_RUNTIME_CONTROL_GENERATION.to_string(),
+            generation.clone(),
+        );
         for key in [
             crate::config::ANNOTATION_SCC_UID_RANGE,
             crate::config::ANNOTATION_SCC_SUPPLEMENTAL_GROUPS,
@@ -2312,7 +2328,12 @@ impl KubernetesComputeDriver {
             },
             port,
         );
-        let control_authority = boundary_service_authority(namespace, names, port);
+        let mode = if control_policy.is_some() {
+            KubernetesControlConnection::RuntimeInitiated
+        } else {
+            KubernetesControlConnection::SupervisorInitiated
+        };
+        let control_authority = boundary_service_authority(namespace, names, port, mode);
         let service_address = std::net::SocketAddr::new(service_ip, port);
         match control_policy {
             None => KubernetesControlPath::SupervisorInitiated {
@@ -2343,27 +2364,26 @@ impl KubernetesComputeDriver {
     ) -> Result<(), KubernetesDriverError> {
         let mode = sandbox_runtime_control_connection(object)?;
         let names = SandboxRuntimeNames::new(sandbox_id);
+        let service_name = names.control_service(mode);
         let services = Api::<Service>::namespaced(self.client.clone(), namespace);
-        let service =
-            tokio::time::timeout(KUBE_API_TIMEOUT, services.get_opt(&names.boundary_service))
-                .await
-                .map_err(|_| {
-                    KubernetesDriverError::Message(
-                        "timed out reading sandbox-runtime boundary Service".to_string(),
-                    )
-                })?
-                .map_err(KubernetesDriverError::from_kube)?;
+        let service = tokio::time::timeout(KUBE_API_TIMEOUT, services.get_opt(service_name))
+            .await
+            .map_err(|_| {
+                KubernetesDriverError::Message(
+                    "timed out reading sandbox-runtime boundary Service".to_string(),
+                )
+            })?
+            .map_err(KubernetesDriverError::from_kube)?;
         match service {
             None if require_service => {
                 return Err(KubernetesDriverError::Precondition(format!(
-                    "sandbox-runtime boundary Service {} is missing and its allocated address cannot be safely reconstructed",
-                    names.boundary_service
+                    "sandbox-runtime boundary Service {service_name} is missing and its allocated address cannot be safely reconstructed",
                 )));
             }
             Some(service) if !boundary_service_matches_mode(&service, sandbox_id, mode) => {
                 return Err(KubernetesDriverError::Precondition(format!(
                     "boundary Service {} no longer selects the {} listener",
-                    names.boundary_service,
+                    service_name,
                     mode.as_str()
                 )));
             }
@@ -2716,21 +2736,21 @@ impl KubernetesComputeDriver {
             &sandbox_api.resource.api_version,
             false,
         );
-        let services: Api<Service> = Api::namespaced(self.client.clone(), namespace);
-        services
-            .create(
-                &PostParams::default(),
-                &boundary_service(
-                    namespace,
-                    names,
-                    &sandbox.id,
-                    self.config.sandbox_runtime.boundary_port,
-                    control_connection,
-                    dependent_owner.clone(),
-                ),
+        // Preserve the legacy workload endpoint even for newly created
+        // sandboxes: an old gateway may handle their next start mid-rollout.
+        for mode in [
+            KubernetesControlConnection::SupervisorInitiated,
+            KubernetesControlConnection::RuntimeInitiated,
+        ] {
+            self.ensure_sandbox_runtime_service(
+                namespace,
+                names,
+                &sandbox.id,
+                mode,
+                dependent_owner.clone(),
             )
-            .await
-            .map_err(KubernetesDriverError::from_kube)?;
+            .await?;
+        }
         let supervisor_uid = self
             .create_sandbox_runtime_supervisor(
                 namespace,
@@ -2793,6 +2813,42 @@ impl KubernetesComputeDriver {
             cr_uid,
             &supervisor_uid,
         ))
+    }
+
+    /// Add an endpoint without changing the destination of an existing one.
+    async fn ensure_sandbox_runtime_service(
+        &self,
+        namespace: &str,
+        names: &SandboxRuntimeNames,
+        sandbox_id: &str,
+        mode: KubernetesControlConnection,
+        owner: OwnerReference,
+    ) -> Result<(), KubernetesDriverError> {
+        let services: Api<Service> = Api::namespaced(self.client.clone(), namespace);
+        let expected = boundary_service(
+            namespace,
+            names,
+            sandbox_id,
+            self.config.sandbox_runtime.boundary_port,
+            mode,
+            owner,
+        );
+        let service = match services.create(&PostParams::default(), &expected).await {
+            Ok(service) => service,
+            Err(kube::Error::Api(error)) if error.code == 409 => services
+                .get(names.control_service(mode))
+                .await
+                .map_err(KubernetesDriverError::from_kube)?,
+            Err(error) => return Err(KubernetesDriverError::from_kube(error)),
+        };
+        if !boundary_service_matches_mode(&service, sandbox_id, mode) {
+            return Err(KubernetesDriverError::Precondition(format!(
+                "control Service {} does not select the {} listener",
+                names.control_service(mode),
+                mode.as_str(),
+            )));
+        }
+        Ok(())
     }
 
     /// Read operator-provided bootstrap material once per generation, so the
@@ -2898,15 +2954,16 @@ impl KubernetesComputeDriver {
                 KubernetesDriverError::Message("sandbox namespace has no UID".to_string())
             })?;
         let services = Api::<Service>::namespaced(self.client.clone(), namespace);
+        let service_name = names.control_service(control_connection);
         let service = services
-            .get(&names.boundary_service)
+            .get(service_name)
             .await
             .map_err(KubernetesDriverError::from_kube)?;
         // Running generations must retain the Service role prepared for them.
         if !boundary_service_matches_mode(&service, sandbox_id, control_connection) {
             return Err(KubernetesDriverError::Precondition(format!(
                 "boundary Service {} does not select the {} listener recorded for this sandbox",
-                names.boundary_service,
+                service_name,
                 control_connection.as_str()
             )));
         }
@@ -3382,7 +3439,6 @@ impl KubernetesComputeDriver {
             ));
         }
 
-        let previous_control_connection = sandbox_runtime_control_connection(&object)?;
         let control_connection = KubernetesControlConnection::RuntimeInitiated;
         let names = SandboxRuntimeNames::for_generation(sandbox_id, generation.as_str());
         self.create_sandbox_runtime_fence(&namespace, &names)
@@ -3391,48 +3447,36 @@ impl KubernetesComputeDriver {
         stale_generations.push(generation.as_str());
         self.delete_sandbox_runtime_supervisor(sandbox_id, &namespace, &stale_generations)
             .await?;
-        // Both old Pods are gone and the lifecycle gate excludes reconcile.
-        // Upgrade the endpoint in place, preserving its stable ClusterIP. A
-        // retry may find this update completed before the new mode was saved.
+        // The legacy Service keeps selecting the workload for old gateways.
+        // Add the supervisor endpoint when upgrading a legacy sandbox.
         let services = Api::<Service>::namespaced(self.client.clone(), &namespace);
         let service = services
             .get(&names.boundary_service)
             .await
             .map_err(KubernetesDriverError::from_kube)?;
-        if !boundary_service_matches_mode(&service, sandbox_id, control_connection) {
-            if !boundary_service_matches_mode(&service, sandbox_id, previous_control_connection) {
-                return Err(KubernetesDriverError::Precondition(format!(
-                    "boundary Service {} no longer matches the recorded control connection",
-                    names.boundary_service
-                )));
-            }
-            let version = service
-                .metadata
-                .resource_version
-                .as_deref()
-                .ok_or_else(|| {
-                    KubernetesDriverError::Message(
-                        "boundary Service has no resourceVersion".to_string(),
-                    )
-                })?;
-            services
-                .patch(
-                    &names.boundary_service,
-                    &PatchParams::default(),
-                    &Patch::Merge(serde_json::json!({
-                        "metadata": {"resourceVersion": version},
-                        "spec": {
-                            "selector": crate::isolation::pair_role_labels(
-                                &crate::sandbox_runtime::pair_label_value(sandbox_id),
-                                crate::isolation::boundary_service_role(control_connection),
-                            ),
-                            "publishNotReadyAddresses": true,
-                        },
-                    })),
-                )
-                .await
-                .map_err(KubernetesDriverError::from_kube)?;
+        if !boundary_service_matches_mode(
+            &service,
+            sandbox_id,
+            KubernetesControlConnection::SupervisorInitiated,
+        ) {
+            return Err(KubernetesDriverError::Precondition(format!(
+                "boundary Service {} no longer selects the workload",
+                names.boundary_service
+            )));
         }
+        self.ensure_sandbox_runtime_service(
+            &namespace,
+            &names,
+            sandbox_id,
+            control_connection,
+            sandbox_runtime_sandbox_owner_reference(
+                cr_name,
+                cr_uid,
+                &sandbox_api.resource.api_version,
+                false,
+            ),
+        )
+        .await?;
         let main_process_spec =
             required_sandbox_annotation(&object, ANNOTATION_SANDBOX_RUNTIME_MAIN_PROCESS_SPEC)?;
         let log_level = required_sandbox_annotation(&object, ANNOTATION_SANDBOX_RUNTIME_LOG_LEVEL)?;
@@ -3518,6 +3562,7 @@ impl KubernetesComputeDriver {
                         ANNOTATION_SANDBOX_RUNTIME_GENERATION: generation.as_str(),
                         ANNOTATION_SANDBOX_RUNTIME_SUPERVISOR_UID: supervisor_uid.clone(),
                         ANNOTATION_SANDBOX_RUNTIME_CONTROL_CONNECTION: control_connection.as_str(),
+                        ANNOTATION_SANDBOX_RUNTIME_CONTROL_GENERATION: generation.as_str(),
                     });
                     running_patch["spec"]["podTemplate"]["spec"] = restart_pod_template_spec(
                         &volumes,
@@ -8169,9 +8214,55 @@ mod tests {
         let names = SandboxRuntimeNames::new("sandbox-1");
 
         assert_eq!(
-            boundary_service_authority("workspace-a", &names, 5500),
+            boundary_service_authority(
+                "workspace-a",
+                &names,
+                5500,
+                KubernetesControlConnection::SupervisorInitiated,
+            ),
             "os-boundary-sandbox-1.workspace-a.svc:5500"
         );
+        assert_eq!(
+            boundary_service_authority(
+                "workspace-a",
+                &names,
+                5500,
+                KubernetesControlConnection::RuntimeInitiated,
+            ),
+            "os-supervisor-sandbox-1.workspace-a.svc:5500"
+        );
+    }
+
+    #[test]
+    fn control_mode_does_not_survive_an_old_gateways_generation_replacement() {
+        let mut object: DynamicObject = serde_json::from_value(serde_json::json!({
+            "apiVersion": "agents.x-k8s.io/v1beta1",
+            "kind": "Sandbox",
+            "metadata": {"annotations": {
+                ANNOTATION_SANDBOX_RUNTIME_GENERATION: "new-generation",
+                ANNOTATION_SANDBOX_RUNTIME_CONTROL_GENERATION: "new-generation",
+                ANNOTATION_SANDBOX_RUNTIME_CONTROL_CONNECTION: "runtime-initiated",
+            }},
+        }))
+        .unwrap();
+        assert_eq!(
+            sandbox_runtime_control_connection(&object).unwrap(),
+            KubernetesControlConnection::RuntimeInitiated
+        );
+        let annotations = object.metadata.annotations.as_mut().unwrap();
+        annotations.insert(
+            ANNOTATION_SANDBOX_RUNTIME_GENERATION.into(),
+            "old-gateway-generation".into(),
+        );
+        assert_eq!(
+            sandbox_runtime_control_connection(&object).unwrap(),
+            KubernetesControlConnection::SupervisorInitiated
+        );
+        object.metadata.annotations.as_mut().unwrap().insert(
+            ANNOTATION_SANDBOX_RUNTIME_CONTROL_CONNECTION.into(),
+            "unknown".into(),
+        );
+        assert!(sandbox_runtime_control_connection(&object).is_err());
     }
 
     #[tokio::test]

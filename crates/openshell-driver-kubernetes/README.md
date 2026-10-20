@@ -106,11 +106,12 @@ enforcement, so operators must verify CNI support before running sandboxes.
 ### Control connection direction
 
 Every new runtime generation uses `runtime-initiated` control. The Sandbox
-annotation `openshell.ai/sandbox-runtime-control-connection` records the current
-generation's mode. A missing annotation identifies a legacy,
+annotation `openshell.ai/sandbox-runtime-control-connection` records the mode,
+bound to `openshell.ai/sandbox-runtime-control-generation`. A missing marker or
+a different current runtime generation identifies a legacy,
 `supervisor-initiated` generation, which keeps working until replaced. Stop/start
-upgrades it automatically: with both old Pods removed, the driver changes the
-Service selector in place, preserves its ClusterIP, and records the new mode
+upgrades it automatically: with both old Pods removed, the driver adds the
+supervisor Service and records the new mode and generation
 before releasing the replacement workload. Gateway recovery that recreates both
 Pods also upgrades the generation. Reconciliation never migrates a running
 generation. An unknown annotation value fails closed; there is no rollout flag.
@@ -118,9 +119,11 @@ generation. An unknown annotation value fails closed; there is no rollout flag.
 Only the dial direction differs. In both modes the sandbox runtime presents the
 generation-pinned TLS server identity and serves gRPC, and the supervisor
 verifies that identity, acts as the gRPC client, and sends the Sandbox Protocol
-JWT. The per-sandbox Service `os-boundary-<id>` keeps one stable ClusterIP for
-the sandbox's lifetime; it selects the paired workload Pod for
-`supervisor-initiated` and the paired supervisor Pod for `runtime-initiated`.
+JWT. The per-sandbox Service `os-boundary-<id>` always selects the paired
+workload Pod. A separate `os-supervisor-<id>` Service always selects the paired
+supervisor Pod. New gateways create both Services, retaining the legacy
+Service's UID, ClusterIP, and selector across restarts so an older gateway can
+still replace the generation during a rolling upgrade.
 
 For `runtime-initiated`:
 
@@ -140,20 +143,20 @@ For `runtime-initiated`:
   namespace-wide policies are unchanged.
 - The policy's UID and resourceVersion are bound into the boundary resource
   claims and outer-fence evidence. Reconciliation suspends the workload if the
-  policy disappears, diverges, or changes generation, or if the boundary
+  policy disappears, diverges, or changes generation, or if the active control
   Service no longer selects the role the recorded mode requires.
-- The Service and control policy are owned by the Sandbox resource and are
+- Both Services and the control policy are owned by the Sandbox resource and are
   deleted only with that sandbox.
 
 Deploy a gateway, supervisor image, and sandbox runtime image that all support
 `runtime-initiated` before using it. Older binaries reject the new descriptor
 shapes and fail closed.
 
-Rollback is unsupported for `runtime-initiated` sandboxes. Already running Pods
-keep their established connection, but older binaries cannot start or restart
-these sandboxes: an older driver ignores the recorded mode while the boundary
-Service selects the supervisor, and older supervisors and runtimes reject the
-new descriptor variants. Delete them before rolling back, or roll forward.
+During a mixed-version rollout, an old gateway can restart a sandbox by
+creating its own compatible supervisor/runtime pair through the legacy
+Service. It preserves unknown annotations, so the mode marker is accepted only
+for its recorded generation. Do not replace an individual generation's
+supervisor or runtime binary with one that cannot read its descriptor.
 
 Each sandbox generation uses two immutable bootstrap Secrets. A trusted init
 container stages the sandbox bootstrap into memory, and the sandbox removes it

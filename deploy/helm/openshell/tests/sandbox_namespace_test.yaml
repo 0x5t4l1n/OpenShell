@@ -67,7 +67,7 @@ tests:
           content:
             apiGroups: [""]
             resources: ["services"]
-            verbs: ["create", "get", "patch"]
+            verbs: ["create", "get"]
       - contains:
           path: rules
           content:

@@ -82,7 +82,10 @@ and deploys the OpenShell Helm chart. The Kubernetes driver creates a
 capability-free workload Pod and a directly managed capability-free supervisor
 Pod. One namespace-wide NetworkPolicy denies direct egress from every OpenShell
 workload Pod. New sandbox generations use `runtime-initiated` control: the sandbox
-runtime dials its supervisor Pod, and the driver adds a per-sandbox
+runtime dials its supervisor through `os-supervisor-<id>`. The legacy
+`os-boundary-<id>` Service keeps selecting the workload for old gateways during
+rolling upgrades. New gateways create both Services and bind the control-mode
+annotation to its runtime generation. The driver adds a per-sandbox
 `os-control-<id>` NetworkPolicy for that path only. Existing running generations
 keep their connection until replaced; stop/start and gateway recovery that
 recreates both Pods upgrade legacy generations automatically. Use compatible
