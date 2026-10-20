@@ -1004,34 +1004,6 @@ If an infrastructure failure leaves a sandbox in `Error`, fix the reported cause
 
 For a provisioning timeout, wait for cleanup to finish, then run `sandbox start` directly.
 
-## Suspend and Resume Sandboxes
-
-Suspend a `Ready` sandbox to freeze its workload and retain its memory state,
-so running processes continue where they left off when you resume it:
-
-```shell
-openshell sandbox suspend my-sandbox
-openshell sandbox resume my-sandbox
-```
-
-Suspend requires a compute driver and isolation backend that both support
-retaining memory state. None of the bundled compute drivers support it yet, and
-the gateway rejects the request with `FAILED_PRECONDITION`. The
-`examples/isolation-backend-v8` example backend demonstrates suspend and resume
-end to end.
-
-The name is optional and defaults to the last-used sandbox. Suspend stops local
-background forwards and waits for the `Suspended` phase. While suspended, the
-sandbox is unavailable in the same way as a stopped sandbox. Resume restores the
-retained state in a new runtime generation with fresh credentials and waits for
-`Ready`. SSH sessions issued for the previous generation stop working.
-
-If the isolation backend cannot restore the retained state, resume fails.
-
-Running `sandbox start` on a suspended sandbox discards the retained memory
-state and boots it cleanly. `sandbox stop` and `sandbox delete` also discard it.
-Persistent workspace data is retained in every case except delete.
-
 ## Delete Sandboxes
 
 Deleting a sandbox stops all processes, releases resources, and purges injected credentials.
@@ -1094,8 +1066,6 @@ Editing configuration after expiry does not restart compute. An explicit retry g
 | Stopping     | The gateway accepted a stop request and is stopping compute while retaining persistent state.                                                         |
 | Stopped      | Compute was stopped explicitly and access is unavailable.                                                                                 |
 | Starting     | Compute is starting, or a selected main-process restart is waiting for backoff or a fresh supervisor session. Access resumes after the new session connects. |
-| Suspending   | The gateway accepted a suspend request and is freezing the workload.                                                                                           |
-| Suspended    | The workload is frozen and its memory state is retained for `sandbox resume`. Access is unavailable.                                                         |
 | Completed    | The canonical main process exited with code 0. Its normalized result is available in `status.exit_code`.                                           |
 | Error        | The canonical main process failed, or sandbox infrastructure failed. Inspect the condition reason and `status.exit_code`.                  |
 | Deleting     | The sandbox is being torn down. The system releases resources and purges credentials.                                                                          |

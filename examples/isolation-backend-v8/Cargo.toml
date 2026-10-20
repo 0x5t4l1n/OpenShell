@@ -36,6 +36,10 @@ uuid = { version = "1", features = ["v4"] }
 
 v8 = "152.2.0"
 
+[dev-dependencies]
+tempfile = "3"
+rcgen = { version = "0.13", default-features = false, features = ["crypto", "pem", "aws_lc_rs"] }
+
 [build-dependencies]
 protoc-bin-vendored = "3"
 tonic-prost-build = "0.14"

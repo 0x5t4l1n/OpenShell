@@ -36,6 +36,8 @@ struct State {
     opened_as: Option<i32>,
     /// Restore reference returned once this generation was suspended.
     suspended: Option<Vec<u8>>,
+    /// Borrowed retained state until the driver acknowledges readiness.
+    restoring: Option<Vec<u8>>,
 }
 
 /// The guest and its output. It outlives a runtime generation while suspended.
@@ -218,6 +220,7 @@ impl Runtime {
                 terminal: false,
                 opened_as: None,
                 suspended: None,
+                restoring: None,
             }),
             ended: watch::channel(false).0,
         }))
@@ -275,17 +278,62 @@ impl Runtime {
         }
     }
     pub async fn stop(&self) {
-        let suspended = self.state.lock().await.suspended.is_some();
+        let _mutation = self.mutation.lock().await;
+        let mut state = self.state.lock().await;
+        if let Err(error) = self.preserve_restore(&mut state).await {
+            eprintln!("Could not retain failed restore: {error}");
+            // Never leave a running guest behind after failed cleanup.
+            self.retention.discard();
+            let _ = std::fs::remove_file(&self.restore_reference_path);
+        }
         // A suspended guest now belongs to the retention slot.
-        if !suspended {
+        if state.suspended.is_none() {
             self.workload().guest.terminate();
-            if self.state.lock().await.running {
+            if state.running {
                 let _ = self.result().await;
             }
         }
-        self.state.lock().await.terminal = true;
+        state.terminal = true;
         self.ended.send_replace(true);
         self.registry.mark_terminal();
+    }
+    /// A reference remains present until the driver observes readiness. A failed
+    /// launch may already have thawed the guest, so freeze it again before the
+    /// generation retires. The original reference stays valid for a retry.
+    async fn preserve_restore(&self, state: &mut State) -> Result<bool, Status> {
+        if state.suspended.is_some() {
+            return Ok(true);
+        }
+        let Some(reference) = &state.restoring else {
+            return Ok(false);
+        };
+        let pending = match std::fs::read(&self.restore_reference_path) {
+            Ok(bytes) => bytes == *reference,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+            Err(_) => return Err(Status::internal("read restore acknowledgement")),
+        };
+        if pending {
+            let guest = self.workload().guest.clone();
+            tokio::task::spawn_blocking(move || guest.freeze(Duration::from_secs(5)))
+                .await
+                .map_err(|_| Status::internal("freeze task failed"))?
+                .map_err(|error| Status::unavailable(error.to_string()))?;
+            state.suspended = Some(reference.clone());
+            self.registry.mark_terminal();
+        } else {
+            // Readiness consumed the reference; this generation now owns the
+            // guest. Retiring it must terminate rather than retain the guest.
+            let workload = self.workload();
+            let mut slot = self.retention.slot.lock().unwrap();
+            if slot
+                .as_ref()
+                .is_some_and(|retained| Arc::ptr_eq(&retained.workload, &workload))
+            {
+                slot.take();
+            }
+            state.restoring = None;
+        }
+        Ok(pending)
     }
     fn validate_policy(&self, policy: &wire::SandboxPolicyWire) -> Result<(), Status> {
         for (selector, expected) in [
@@ -400,9 +448,12 @@ impl Runtime {
             envelope.request,
             Q::TerminateBoundary | Q::Terminate { .. } | Q::Signal { .. }
         ) {
-            self.workload().guest.terminate();
-            if self.state.lock().await.running {
-                let _ = self.result().await?;
+            let mut state = self.state.lock().await;
+            if !self.preserve_restore(&mut state).await? {
+                self.workload().guest.terminate();
+                if state.running {
+                    let _ = self.result().await?;
+                }
             }
         }
         let mut state = self.state.lock().await;
@@ -668,11 +719,12 @@ impl Runtime {
             .retention
             .verify(sandbox_id, reference)
             .ok_or_else(|| Status::failed_precondition("restore reference is not valid"))?;
-        let mut slot = self.retention.slot.lock().unwrap();
+        let slot = self.retention.slot.lock().unwrap();
         match slot.as_ref() {
             Some(retained) if retained.sandbox_id == *sandbox_id && retained.nonce == nonce => {
-                let retained = slot.take().unwrap();
-                *self.workload.lock().unwrap() = retained.workload;
+                // Borrow the retained guest until readiness is acknowledged.
+                // Opening a boundary must not consume the only retryable state.
+                *self.workload.lock().unwrap() = retained.workload.clone();
                 *self.output_start.lock().unwrap() = retained.offsets;
                 Ok(LaunchOutcome::Restored as i32)
             }
@@ -724,6 +776,9 @@ impl isolation_backend_server::IsolationBackend for Arc<Runtime> {
                 if let Some(restore) = &self.launch.restore {
                     let outcome =
                         self.restore(&restore.reference, restore.restart_if_restore_fails)?;
+                    if outcome == LaunchOutcome::Restored as i32 {
+                        state.restoring = Some(restore.reference.clone());
+                    }
                     println!(
                         "Boundary resumed: {} ({})",
                         self.launch.boundary.generation,
@@ -829,6 +884,9 @@ impl isolation_backend_server::IsolationBackend for Arc<Runtime> {
             }
             None => {
                 let outcome = self.restore(&q.restore_reference, q.restart_if_restore_fails)?;
+                if outcome == open_boundary_response::LaunchOutcome::Restored as i32 {
+                    state.restoring = Some(q.restore_reference.clone());
+                }
                 println!(
                     "Boundary resumed: {} ({})",
                     self.launch.boundary.generation,
@@ -1019,8 +1077,161 @@ pub async fn serve(state_dir: PathBuf) -> Result<()> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
+
+    pub(crate) fn launch(directory: &Path, generation: &str) -> Launch {
+        use openshell_core::jwt::{CredentialEpoch, SessionRotation, SessionVerificationKey};
+        use openshell_isolation_interface::contract::ProvisioningEvidence;
+        use openshell_sandbox_backend::delegated::DelegatedLaunch;
+        let bytes = read_script(&directory.join("guest.js")).unwrap();
+        let digest = format!("{:x}", Sha256::digest(bytes));
+        let key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ED25519).unwrap();
+        Launch {
+            boundary: DelegatedLaunch {
+                backend_name: BACKEND.into(),
+                sandbox_id: "sandbox-a".into(),
+                generation: generation.into(),
+                session_id: uuid::Uuid::new_v4().to_string().parse().unwrap(),
+                workload_identity: crate::launch::host_identity(digest.clone()).unwrap(),
+                tls: wire::SandboxTlsClientConfig {
+                    server_name: "test".into(),
+                    trust_anchor_pem: String::new(),
+                },
+                host_gateway_ip: None,
+                resource_claims: Default::default(),
+                provisioning_evidence: ProvisioningEvidence::from_enforcement_evidence(
+                    generation,
+                    &crate::launch::capability_evidence(&digest),
+                )
+                .unwrap(),
+            },
+            script: directory.join("guest.js"),
+            descriptor: serde_json::to_vec(&serde_json::json!({"script_sha256": digest})).unwrap(),
+            gateway_id: "test".into(),
+            keys: vec![SessionVerificationKey {
+                key_id: "test".into(),
+                public_key_pem: key.public_key_pem().into_bytes(),
+            }],
+            epoch: CredentialEpoch::new(1).unwrap(),
+            rotation: SessionRotation::new(1).unwrap(),
+            certificate: String::new(),
+            private_key: String::new(),
+            restore: None,
+        }
+    }
+
+    async fn restoring_runtime(
+        directory: &Path,
+        retention: Arc<Retention>,
+        reference: &[u8],
+        generation: &str,
+    ) -> Arc<Runtime> {
+        let runtime = Runtime::new(
+            launch(directory, generation),
+            retention,
+            directory.join("restore-reference"),
+        )
+        .unwrap();
+        assert_eq!(
+            runtime.restore(reference, false).unwrap(),
+            open_boundary_response::LaunchOutcome::Restored as i32
+        );
+        runtime.state.lock().await.restoring = Some(reference.to_vec());
+        runtime
+    }
+
+    #[tokio::test]
+    async fn failed_restore_before_start_keeps_the_guest_for_retry() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(
+            directory.path().join("guest.js"),
+            b"console.log('retained')",
+        )
+        .unwrap();
+        let retention = Arc::new(retention());
+        let workload = Workload::new(b"console.log('retained')").unwrap();
+        workload.guest.freeze(Duration::from_secs(1)).unwrap();
+        let nonce = [3; NONCE_BYTES];
+        let reference = retention.reference("sandbox-a", &nonce);
+        crate::launch::write_private(&directory.path().join("restore-reference"), &reference)
+            .unwrap();
+        *retention.slot.lock().unwrap() = Some(Retained {
+            sandbox_id: "sandbox-a".into(),
+            nonce,
+            workload: workload.clone(),
+            offsets: [0, 0],
+        });
+        let failed = restoring_runtime(directory.path(), retention.clone(), &reference, "g1").await;
+        failed.stop().await;
+        let retry = restoring_runtime(directory.path(), retention.clone(), &reference, "g2").await;
+        assert!(Arc::ptr_eq(&retry.workload(), &workload));
+        workload.guest.thaw();
+        let result = tokio::task::spawn_blocking(move || workload.guest.run(|_, _| {}))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(result.status, GuestStatus::Exited);
+        assert_eq!(result.stdout, b"retained\n");
+    }
+
+    #[tokio::test]
+    async fn failed_restore_after_thaw_refreezes_until_retry() {
+        let directory = tempfile::tempdir().unwrap();
+        let script = b"let n = 0; let next = Date.now(); while (n < 6) { if (Date.now() >= next) { console.log(++n); next = Date.now() + 100; } }";
+        std::fs::write(directory.path().join("guest.js"), script).unwrap();
+        let retention = Arc::new(retention());
+        let workload = Workload::new(script).unwrap();
+        let nonce = [3; NONCE_BYTES];
+        let reference = retention.reference("sandbox-a", &nonce);
+        crate::launch::write_private(&directory.path().join("restore-reference"), &reference)
+            .unwrap();
+        *retention.slot.lock().unwrap() = Some(Retained {
+            sandbox_id: "sandbox-a".into(),
+            nonce,
+            workload: workload.clone(),
+            offsets: [0, 0],
+        });
+        let failed = restoring_runtime(directory.path(), retention.clone(), &reference, "g1").await;
+        failed.state.lock().await.running = true;
+        workload.started.store(true, Ordering::SeqCst);
+        let runner = workload.clone();
+        let (sent, received) = tokio::sync::oneshot::channel();
+        let task = tokio::task::spawn_blocking(move || {
+            let result = runner
+                .guest
+                .run(|stdout, stderr| {
+                    *runner.output.lock().unwrap() = Some((stdout.clone(), stderr));
+                    assert!(sent.send(stdout).is_ok());
+                })
+                .unwrap();
+            runner.result.send_replace(Some(Arc::new(result)));
+        });
+        let output = received.await.unwrap();
+        while output.contents().is_empty() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        failed.stop().await;
+        let frozen = output.contents();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(output.contents(), frozen);
+        let retry = restoring_runtime(directory.path(), retention.clone(), &reference, "g2").await;
+        assert!(Arc::ptr_eq(&retry.workload(), &workload));
+        workload.guest.thaw();
+        tokio::time::timeout(Duration::from_secs(3), task)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            workload.result.borrow().as_ref().unwrap().status,
+            GuestStatus::Exited
+        );
+        assert_eq!(output.contents(), b"1\n2\n3\n4\n5\n6\n");
+        // Once readiness consumes the reference, retirement must not keep state.
+        std::fs::remove_file(directory.path().join("restore-reference")).unwrap();
+        retry.stop().await;
+        assert!(retention.slot.lock().unwrap().is_none());
+    }
 
     fn retention() -> Retention {
         Retention {

@@ -39,29 +39,6 @@ accept an operator-selected `IsolationBackendRegistration`, including its Unix,
 TCP, or vsock endpoint. The driver provisions the resource and delivers the
 backend's trusted launch metadata to the supervisor.
 
-## Suspend and Resume
-
-A backend that can retain workload state advertises
-`openshell.sandbox.suspend-resume` from `Describe`. The supervisor lists the
-capability as supported, never required, so backends without it still
-negotiate. The built-in `openshell-sandbox` runtime does not advertise it.
-
-When its compute driver requests suspension, the supervisor calls
-`SuspendBoundary` with the boundary handle, session, and generation. The
-backend freezes the workload, fences the old generation, and returns an opaque
-restore reference of at most 64 KiB. The supervisor hands the reference to the
-compute driver and exits without calling TerminateBoundary.
-
-A resumed launch calls `ResumeBoundary` in place of `OpenBoundary`, with a fresh
-launch identity and the stored reference. The supervisor replays the same
-request for every connection in that launch, including policy discovery and
-transport recovery, so the backend must return the same handle and outcome
-for each replay. The supervisor accepts `LAUNCH_OUTCOME_RESTORED`, or
-`LAUNCH_OUTCOME_COLD_START_FALLBACK` only when the launch permits fallback.
-Attach, Confirm, and StartAgent follow as for a fresh launch. The backend keeps
-the restored workload frozen until StartAgent, and StartAgent returns the
-restored main process.
-
 ## Who Owns What
 
 | Component | Owns |

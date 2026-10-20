@@ -61,10 +61,11 @@ openshell sandbox create --name js-demo \
   --keep --no-tty --no-auto-providers -- /work/guest.js
 ```
 
-The bundled script prints a greeting, attempts a request, and catches the
-network-disabled error. Egress is disabled by the runtime's lack of network
-bindings; this example does not relay requests to the supervisor for policy
-evaluation. No policy file is needed.
+The bundled script prints a greeting, attempts a request, catches the
+network-disabled error, and counts once per second for about 12 seconds.
+Egress is disabled by the runtime's lack of network bindings; this example
+does not relay requests to the supervisor for policy evaluation. No policy
+file is needed.
 
 The create command prints the script's output and returns its exit code. The
 sandbox becomes `Completed` on exit code 0 or `Error` on a nonzero exit code.
@@ -77,13 +78,12 @@ output. Use `openshell sandbox connect js-demo` to attach afterward.
 
 ## Suspend and resume
 
-The example implements sandbox suspend and resume. Suspension freezes the V8
-isolate in place and the `js-sbx serve` process keeps it in memory; resume
-continues the same isolate in a new runtime generation. Start the demo with
-the counting script, which runs for about 12 seconds:
+Suspension freezes the V8 isolate in place and the `js-sbx serve` process keeps
+it in memory; resume continues the same isolate in a new runtime generation.
+The default `guest.js` counts for about 12 seconds after its network check:
 
 ```shell
-./start.sh counter.js
+./start.sh
 ```
 
 In another terminal, create the sandbox, then suspend and resume it while it
@@ -96,6 +96,13 @@ openshell sandbox suspend js-demo
 openshell sandbox resume js-demo
 ```
 
+To discard the retained state and start the script from the beginning:
+
+```shell
+openshell sandbox stop js-demo
+openshell sandbox start js-demo
+```
+
 `backend.log` shows the count continue from its value at suspension, and the
 elapsed time includes the gap. The 15-second deadline counts only running time.
 
@@ -105,13 +112,17 @@ The backend retains the frozen isolate and privately persists its handle in
 it does not write or read a reference file. On resume the driver provisions
 the backend using `launch.json`, while the supervisor attaches through its
 ordinary boundary-opening path. The shared `boundary.json` contains no
-retention fields. The
-reference authenticates the sandbox with a key in `retention.key`, so a
-restarted `js-sbx serve` can tell lost state from a forged or superseded
-reference. If you restart `js-sbx serve` while the sandbox is suspended, resume
+retention fields. The reference authenticates the sandbox with a key in
+`retention.key`, so a restarted `js-sbx serve` can tell lost state from a forged
+or superseded reference. If you restart `js-sbx serve` while the sandbox is suspended, resume
 fails and the sandbox stays `Suspended`; `openshell sandbox start js-demo`
 then runs the script from the beginning.
 `openshell sandbox start`, `stop`, and `delete` discard the retained state.
+
+Restoration borrows the retained guest until the driver observes supervisor
+readiness and consumes `restore-reference`. If startup fails or times out,
+the driver stops the supervisor and waits for the backend to refreeze the guest
+before reporting failure. The same reference remains available for a retry.
 
 ## Inspect and stop
 

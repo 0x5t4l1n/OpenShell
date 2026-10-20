@@ -1665,12 +1665,14 @@ dependencies = [
  "prost",
  "prost-types",
  "protoc-bin-vendored",
+ "rcgen 0.13.2",
  "rustix 1.1.5",
  "rustls",
  "rustls-pemfile",
  "serde",
  "serde_json",
  "sha2 0.10.9",
+ "tempfile",
  "tokio",
  "tokio-rustls",
  "tokio-stream",
@@ -2175,7 +2177,7 @@ dependencies = [
  "jsonwebtoken",
  "kube",
  "pem 3.0.6",
- "rcgen",
+ "rcgen 0.14.10",
  "rustls",
  "serde",
  "sqlx",
@@ -2232,7 +2234,7 @@ dependencies = [
  "openshell-isolation-interface",
  "prost",
  "prost-types",
- "rcgen",
+ "rcgen 0.14.10",
  "rustix 1.1.5",
  "rustls",
  "rustls-pemfile",
@@ -2651,6 +2653,19 @@ checksum = "63b8176103e19a2643978565ca18b50549f6101881c443590420e4dc998a3c69"
 
 [[package]]
 name = "rcgen"
+version = "0.13.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "75e669e5202259b5314d1ea5397316ad400819437857b90861765f24c4cf80a2"
+dependencies = [
+ "aws-lc-rs",
+ "pem 3.0.6",
+ "rustls-pki-types",
+ "time",
+ "yasna 0.5.2",
+]
+
+[[package]]
+name = "rcgen"
 version = "0.14.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8774e05a7d0de114588e6a28fe7e71694b82614ed569d86d8b389dfbc98b8ad8"
@@ -2660,7 +2675,7 @@ dependencies = [
  "rustls-pki-types",
  "time",
  "x509-parser",
- "yasna",
+ "yasna 0.6.0",
 ]
 
 [[package]]
@@ -4180,6 +4195,15 @@ dependencies = [
  "oid-registry",
  "rusticata-macros",
  "thiserror",
+ "time",
+]
+
+[[package]]
+name = "yasna"
+version = "0.5.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e17bb3549cc1321ae1296b9cdc2698e2b6cb1992adfa19a8c72e5b7a738f44cd"
+dependencies = [
  "time",
 ]
 

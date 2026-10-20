@@ -44,6 +44,7 @@ struct Entry {
 struct Restore {
     restart_if_restore_fails: bool,
 }
+
 impl Driver {
     pub fn new(
         state_dir: PathBuf,
@@ -192,10 +193,26 @@ impl Driver {
     }
     /// Wait until a resuming supervisor is ready or has failed to restore.
     async fn await_resume(&self, entry: &mut Entry) -> Result<(), Status> {
+        self.finish_resume(entry, Duration::from_secs(15)).await
+    }
+    async fn finish_resume(&self, entry: &mut Entry, timeout: Duration) -> Result<(), Status> {
+        let result = self.wait_resume_ready(entry, timeout).await;
+        if result.is_err() {
+            // Kill even a supervisor that is merely slow. Retiring the boundary
+            // refreezes an unacknowledged restore before cleanup completes.
+            let cleanup = self.stop_entry(entry).await;
+            entry.retained = cleanup.is_ok() && self.state_dir.join("restore-reference").is_file();
+            cleanup?;
+        } else {
+            entry.retained = false;
+        }
+        result
+    }
+    async fn wait_resume_ready(&self, entry: &mut Entry, timeout: Duration) -> Result<(), Status> {
         let ready = self.state_dir.join("ready.sock");
-        for _ in 0..300 {
+        let deadline = tokio::time::Instant::now() + timeout;
+        while tokio::time::Instant::now() < deadline {
             if let Some(status) = entry.supervisor.try_wait().map_err(internal)? {
-                self.retire_boundary().await?;
                 return Err(Status::failed_precondition(format!(
                     "supervisor could not resume the sandbox ({status}); see supervisor.err.log"
                 )));
@@ -235,8 +252,9 @@ impl Driver {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(_) => return Err(Status::internal("remove backend launch")),
         }
-        // Backend closes TLS, interrupts its guest, then acknowledges file deletion.
-        for _ in 0..100 {
+        // Allow the backend's bounded freeze to finish before it closes TLS
+        // and acknowledges file deletion.
+        for _ in 0..200 {
             if !self.state_dir.join("active").exists() {
                 return Ok(());
             }
@@ -639,10 +657,7 @@ impl compute_driver_server::ComputeDriver for DriverService {
         // Report a failed restore from this call, while the reference is still
         // retained, so the gateway can return the sandbox to Suspended.
         let result = if resuming {
-            launched.retained = true;
-            let result = self.await_resume(&mut launched).await;
-            launched.retained = result.is_err();
-            result
+            self.await_resume(&mut launched).await
         } else {
             Ok(())
         };
@@ -711,4 +726,61 @@ pub async fn serve(driver: Arc<Driver>, socket: PathBuf) -> Result<()> {
         .await?;
     std::fs::remove_file(socket)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn resume_timeout_stops_supervisor_and_waits_for_retention() {
+        for retain in [true, false] {
+            let directory = tempfile::tempdir().unwrap();
+            std::fs::write(directory.path().join("guest.js"), b"1").unwrap();
+            let boundary = crate::lifecycle::tests::launch(directory.path(), "g1").boundary;
+            let driver = Driver {
+                state_dir: directory.path().into(),
+                supervisor: "/bin/sleep".into(),
+                script: directory.path().join("guest.js"),
+                gateway: String::new(),
+                policy_rules: directory.path().join("policy.yaml"),
+                entry: Mutex::new(None),
+                deleted: tokio::sync::watch::channel(None).0,
+            };
+            let mut entry = Entry {
+                sandbox: DriverSandbox::default(),
+                supervisor: tokio::process::Command::new("/bin/sleep")
+                    .arg("60")
+                    .kill_on_drop(true)
+                    .spawn()
+                    .unwrap(),
+                boundary,
+                retained: false,
+            };
+            for file in ["active", "launch.json", "restore-reference"] {
+                std::fs::write(directory.path().join(file), b"pending").unwrap();
+            }
+            let state_dir = directory.path().to_path_buf();
+            let backend = tokio::spawn(async move {
+                while state_dir.join("launch.json").exists() {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+                // A backend that cannot retain the guest removes the reference
+                // before acknowledging retirement.
+                if !retain {
+                    std::fs::remove_file(state_dir.join("restore-reference")).unwrap();
+                }
+                std::fs::remove_file(state_dir.join("active")).unwrap();
+            });
+            let result = driver.finish_resume(&mut entry, Duration::ZERO).await;
+            assert_eq!(result.unwrap_err().code(), tonic::Code::DeadlineExceeded);
+            assert!(entry.supervisor.try_wait().unwrap().is_some());
+            assert!(!directory.path().join("active").exists());
+            assert_eq!(entry.retained, retain);
+            if !retain {
+                assert!(driver.suspend_entry(&mut entry).await.is_err());
+            }
+            backend.await.unwrap();
+        }
+    }
 }
