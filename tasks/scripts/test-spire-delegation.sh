@@ -64,7 +64,7 @@ DELEGATE_ID="spiffe://${TRUST_DOMAIN}/openshell/shared-supervisor"
 NODE_ID="spiffe://${TRUST_DOMAIN}/node/test"
 SERVER_SOCKET="${WORK}/server/api.sock"
 ADMIN_SOCKET="${WORK}/agent/private/admin.sock"
-SERVER_PORT="$(python3 -c 'import socket; s = socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1])')"
+SERVER_PORT="$(uv run --no-project python -c 'import socket; s = socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1])')"
 mkdir -p "${WORK}/server" "${WORK}/agent/public" "${WORK}/agent/private"
 
 cat >"${WORK}/server.conf" <<EOF
@@ -147,7 +147,7 @@ entry() {
   server entry create -parentID "${NODE_ID}" -spiffeID "$1" -selector "$2" >/dev/null
 }
 sandbox_id() {
-  python3 -c 'import uuid; print(uuid.uuid4())'
+  cat /proc/sys/kernel/random/uuid
 }
 sandbox_entry() {
   entry "${ID_PREFIX}/gateway/${GATEWAY_ID}/sandbox/$2" "openshell:sandbox:${GATEWAY_ID}:$1"

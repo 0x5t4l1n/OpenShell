@@ -269,22 +269,13 @@ pub struct ExperimentalSupervisorSpiffeDelegationConfig {
 }
 
 impl ExperimentalSupervisorSpiffeDelegationConfig {
-    fn validate(&self, gateway_id: &str, workload_api_socket_path: &str) -> Result<(), String> {
-        // Mounts expose whole directories, so both socket directories must be
-        // canonical for the comparison below to mean what it says.
+    fn validate(&self, gateway_id: &str) -> Result<(), String> {
         if self.admin_socket_group == Some(0) {
             return Err("experimental_supervisor_spiffe_delegation.admin_socket_group must not be the root group".into());
         }
-        let admin_dir = canonical_socket_dir(&self.admin_socket_path).ok_or("experimental_supervisor_spiffe_delegation.admin_socket_path must be a canonical absolute UNIX socket path below a dedicated directory")?;
-        // The admin API authorizes delegation. Its directory is mounted into
-        // the shared supervisor only, and the Workload API directory into
-        // gateway Pods, so neither directory may contain the other.
-        if !workload_api_socket_path.trim().is_empty() {
-            let workload_dir = canonical_socket_dir(workload_api_socket_path).ok_or("provider_spiffe_workload_api_socket_path must be a canonical absolute UNIX socket path when experimental_supervisor_spiffe_delegation is set")?;
-            if admin_dir.starts_with(workload_dir) || workload_dir.starts_with(admin_dir) {
-                return Err("experimental_supervisor_spiffe_delegation.admin_socket_path and provider_spiffe_workload_api_socket_path must be in separate, non-nested directories".into());
-            }
-        }
+        // The socket's directory is mounted from the node, so the path must be
+        // canonical for the mount to be exactly the directory it names.
+        canonical_socket_dir(&self.admin_socket_path).ok_or("experimental_supervisor_spiffe_delegation.admin_socket_path must be a canonical absolute UNIX socket path below a dedicated directory")?;
         let prefix = openshell_core::spiffe::SandboxSpiffeIdPrefix::parse(&self.spiffe_id_prefix)
             .map_err(|error| {
             format!("experimental_supervisor_spiffe_delegation.spiffe_id_prefix: {error}")
@@ -616,10 +607,7 @@ impl KubernetesComputeConfig {
                 })?;
                 shared.validate()?;
                 match &self.experimental_supervisor_spiffe_delegation {
-                    Some(delegation) => delegation.validate(
-                        &self.gateway_id,
-                        &self.provider_spiffe_workload_api_socket_path,
-                    )?,
+                    Some(delegation) => delegation.validate(&self.gateway_id)?,
                     // Without delegation the shared supervisor has only its
                     // own identity, which must not stand in for a sandbox.
                     None if self.provider_spiffe_enabled() => {
@@ -1264,7 +1252,7 @@ mod tests {
     }
 
     #[test]
-    fn spiffe_delegation_is_gateway_topology_only_and_never_reuses_the_workload_api() {
+    fn spiffe_delegation_is_gateway_topology_only() {
         let delegation = || ExperimentalSupervisorSpiffeDelegationConfig {
             admin_socket_path: "/run/spire/admin/admin.sock".to_string(),
             spiffe_id_prefix: "spiffe://example.org/openshell".to_string(),
@@ -1294,34 +1282,6 @@ mod tests {
         let invalid = [
             // The supervisor's own Workload API identity never stands in for a sandbox.
             gateway(None, workload_api),
-            gateway(
-                Some(ExperimentalSupervisorSpiffeDelegationConfig {
-                    admin_socket_path: "/spiffe-workload-api/admin.sock".to_string(),
-                    ..delegation()
-                }),
-                workload_api,
-            ),
-            gateway(
-                Some(ExperimentalSupervisorSpiffeDelegationConfig {
-                    admin_socket_path: "/spiffe-workload-api/private/admin.sock".to_string(),
-                    ..delegation()
-                }),
-                workload_api,
-            ),
-            gateway(
-                Some(ExperimentalSupervisorSpiffeDelegationConfig {
-                    admin_socket_path: "/run/admin.sock".to_string(),
-                    ..delegation()
-                }),
-                "/run/spire/workload/api.sock",
-            ),
-            gateway(
-                Some(ExperimentalSupervisorSpiffeDelegationConfig {
-                    admin_socket_path: "/run/spire/private/admin.sock".to_string(),
-                    ..delegation()
-                }),
-                "/run/x/../spire/api.sock",
-            ),
         ];
         let invalid = invalid.into_iter().chain(
             [

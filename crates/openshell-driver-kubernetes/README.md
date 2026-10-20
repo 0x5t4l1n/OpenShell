@@ -218,9 +218,8 @@ fails closed.
   `experimental_supervisor_spiffe_delegation`, the supervisor uses them to
   authorize acting as the sandbox's SPIRE-delegated SPIFFE ID; the driver mounts
   nothing SPIFFE-related into workload Pods. The table is accepted only with the
-  gateway topology, its admin socket must be canonical and outside the
-  `provider_spiffe_workload_api_socket_path` directory, and the gateway ID must
-  be a SPIFFE path segment. `provider_spiffe_workload_api_socket_path` is
+  gateway topology, its admin socket path must be canonical, and the gateway ID
+  must be a SPIFFE path segment. `provider_spiffe_workload_api_socket_path` is
   accepted with the topology only alongside delegation, for the gateway's own
   identity.
 

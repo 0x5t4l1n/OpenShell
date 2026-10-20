@@ -36,7 +36,9 @@ const SPIRE_CLUSTER: &str = "openshell-e2e";
 const SPIRE_CLASS: &str = "spire-spire";
 /// Matches `ci/values-experimental-supervisor-spiffe.yaml`.
 const ID_PREFIX: &str = "spiffe://openshell.local/openshell";
-const ENTRY_LABEL: &str = "app.kubernetes.io/managed-by=openshell-e2e";
+/// Label on the registration entries this run creates, naming its SPIRE
+/// fixture so cleanup never touches another run's entries.
+const ENTRY_LABEL: &str = "openshell.ai/e2e-spire-fixture";
 const STS_SERVICE: &str = "openshell-e2e-sts";
 const CLIENT_ASSERTION_TYPE: &str = "urn:ietf:params:oauth:client-assertion-type:jwt-spiffe";
 const TOKEN_TYPE_ACCESS_TOKEN: &str = "urn:ietf:params:oauth:token-type:access_token";
@@ -584,15 +586,23 @@ async fn supervisor_agent_id() -> String {
     )
 }
 
+fn spire_fixture() -> String {
+    std::env::var("OPENSHELL_E2E_SPIRE_NAMESPACE")
+        .ok()
+        .filter(|namespace| !namespace.is_empty())
+        .expect("OPENSHELL_E2E_SPIRE_NAMESPACE is set by with-kube-gateway.sh")
+}
+
 /// Register `sandbox_id`'s SPIFFE ID for delegation, scoped to `agent_id`.
 async fn register(gateway_id: &str, sandbox_id: &str, agent_id: &str) {
+    let fixture = spire_fixture();
     let manifest = format!(
         r"apiVersion: spire.spiffe.io/v1alpha1
 kind: ClusterStaticEntry
 metadata:
   name: openshell-sandbox-{sandbox_id}
   labels:
-    app.kubernetes.io/managed-by: openshell-e2e
+    {ENTRY_LABEL}: {fixture}
 spec:
   className: {SPIRE_CLASS}
   spiffeID: {}
@@ -611,7 +621,7 @@ async fn unregister_all() {
             "delete",
             "clusterstaticentries.spire.spiffe.io",
             "-l",
-            ENTRY_LABEL,
+            &format!("{ENTRY_LABEL}={}", spire_fixture()),
             "--ignore-not-found",
         ])
         .output()

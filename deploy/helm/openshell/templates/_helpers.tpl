@@ -380,9 +380,9 @@ fullname, so the name never collapses into another release resource's name.
 
 {{/*
 SPIRE delegation of sandbox identities to the shared supervisor. The admin
-socket directory is mounted into the shared supervisor only and the Workload
-API directory into gateway Pods, so the two must be canonical, separate, and
-non-nested. The gateway compute driver repeats these checks at startup.
+socket's directory is mounted from the node into the shared supervisor only,
+so its path must be canonical. The gateway compute driver repeats these checks
+at startup.
 */}}
 {{- define "openshell.validateSpiffeDelegation" -}}
 {{- $delegation := .delegation -}}
@@ -397,14 +397,6 @@ non-nested. The gateway compute driver repeats these checks at startup.
 {{- end -}}
 {{- if not (regexMatch "^spiffe://[a-z0-9._-]+(/[A-Za-z0-9._-]+)*$" $prefix) -}}
 {{- fail "experimental_supervisor_spiffe_delegation.spiffe_id_prefix must be spiffe://<trust-domain>[/<segment>...]" -}}
-{{- end -}}
-{{- $workload := get .kubernetes "provider_spiffe_workload_api_socket_path" | default "" -}}
-{{- if $workload -}}
-{{- $adminDir := printf "%s/" (dir $admin) -}}
-{{- $workloadDir := printf "%s/" (dir $workload) -}}
-{{- if or (not (regexMatch $canonical $workload)) (regexMatch "/\\.\\.?(/|$)" $workload) (hasPrefix $workloadDir $adminDir) (hasPrefix $adminDir $workloadDir) -}}
-{{- fail "experimental_supervisor_spiffe_delegation.admin_socket_path and provider_spiffe_workload_api_socket_path must be canonical paths in separate, non-nested directories" -}}
-{{- end -}}
 {{- end -}}
 {{- end }}
 
@@ -676,7 +668,7 @@ Validate chart values that Helm would otherwise accept silently.
 {{- fail "experimental_supervisor_topology=gateway does not support upstream proxy settings, or provider SPIFFE identity without experimental_supervisor_spiffe_delegation" -}}
 {{- end -}}
 {{- if $delegation -}}
-{{- include "openshell.validateSpiffeDelegation" (dict "delegation" $delegation "kubernetes" $kubernetes) -}}
+{{- include "openshell.validateSpiffeDelegation" (dict "delegation" $delegation) -}}
 {{- end -}}
 {{- if and (eq (get $kubernetes "workspace_mode" | default "shared") "operator") (not (regexMatch "^[A-Za-z0-9][-A-Za-z0-9_./]*==?[-A-Za-z0-9_.]*$" (get $kubernetes "operator_namespace_label" | default ""))) -}}
 {{- fail "experimental_supervisor_topology=gateway in operator workspace mode requires operator_namespace_label of the form key=value" -}}

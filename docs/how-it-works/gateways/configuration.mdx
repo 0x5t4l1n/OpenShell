@@ -918,10 +918,11 @@ A sandbox's SPIFFE ID is
 from the immutable sandbox ID, so it stays the same when the sandbox stops and
 starts, and a sandbox recreated with the same name gets a new sandbox ID and
 SPIFFE ID. The chart mounts the directory of `admin_socket_path` from the node
-into the shared supervisor Pod only, adds `admin_socket_group` (the group that owns the
-admin socket, never `0`) to its supplemental groups, and gives it a dedicated
-service account. The admin socket and the Workload API socket must be in
-separate, non-nested directories.
+into the shared supervisor Pod only, adds `admin_socket_group` (the group that
+owns the admin socket, never `0`) to its supplemental groups, and gives it a
+dedicated service account. Gateway session JWTs must expire: the supervisor
+rejects non-expiring tokens, so keep a positive
+`[openshell.gateway.gateway_jwt].ttl_secs` (the Helm default is 3600).
 
 You provision SPIRE:
 
@@ -954,8 +955,11 @@ sandbox and runtime generation, and confirms with the gateway that the
 generation is still current. It accepts exactly one SVID with the expected
 SPIFFE ID; a missing, duplicate, or mismatched entry fails the grant and never
 falls back to the supervisor's own identity. Cached provider tokens belong to
-one generation's session and are discarded when it ends. SVIDs and provider
-tokens already issued stay valid until they expire. The gateway session signing
+one generation's session. Each cache hit re-verifies the session's current
+gateway JWT locally, so a removed session's tokens are not served; the gateway
+confirmation runs only before new issuance, so a gateway-side revocation stops
+cache hits only once the session is removed or its JWT expires. SVIDs and
+provider tokens already issued stay valid until they expire. The gateway session signing
 key that verifies a session is fixed when the session starts; after rotating it,
 stop and start the affected sandboxes.
 
