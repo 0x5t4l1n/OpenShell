@@ -6875,6 +6875,7 @@ fn public_status_from_driver(
         endpoint_statuses: Vec::new(),
         configuration_admission: None,
         configuration_activated: None,
+        frozen_policy: None,
         provisioning: None,
         restart_count: 0,
         next_restart_time: None,
@@ -7025,6 +7026,9 @@ fn apply_driver_snapshot(
             .configuration_admission
             .clone_from(&current_status.configuration_admission);
         status.configuration_activated = current_status.configuration_activated;
+        status
+            .frozen_policy
+            .clone_from(&current_status.frozen_policy);
         status.provisioning.clone_from(&current_status.provisioning);
     }
     if old_phase != phase {
@@ -11402,10 +11406,15 @@ mod tests {
             destination_host: "api.example.com".to_string(),
             ..Default::default()
         });
+        let frozen_policy = openshell_core::proto::FrozenSandboxPolicy {
+            policy_hash: "accepted-policy".to_string(),
+            ..Default::default()
+        };
         sandbox.status = Some(SandboxStatus {
             phase: SandboxPhase::Ready as i32,
             endpoint_statuses: vec![endpoint.clone()],
             last_token_grant_failure: Some(grant_failure.clone()),
+            frozen_policy: Some(Box::new(frozen_policy.clone())),
             ..Default::default()
         });
         let incoming = ready_driver_sandbox("sandbox-id", "sandbox-name");
@@ -11416,6 +11425,7 @@ mod tests {
         let status = sandbox.status.expect("driver status applied");
         assert_eq!(status.endpoint_statuses, vec![endpoint]);
         assert_eq!(status.last_token_grant_failure, Some(grant_failure));
+        assert_eq!(status.frozen_policy.as_deref(), Some(&frozen_policy));
         assert!(
             status
                 .conditions

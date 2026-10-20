@@ -504,6 +504,7 @@ struct Cli {
 }
 
 #[derive(Subcommand, Debug)]
+#[allow(clippy::large_enum_variant)]
 enum Commands {
     // ===================================================================
     // SANDBOX COMMANDS
@@ -1531,6 +1532,10 @@ enum SandboxCommands {
         /// Overrides the built-in default and the `OPENSHELL_SANDBOX_POLICY` env var.
         #[arg(long, value_hint = ValueHint::FilePath)]
         policy: Option<String>,
+
+        /// Freeze the effective policy after initialization for this sandbox's lifetime.
+        #[arg(long)]
+        frozen: bool,
 
         /// Forward a local port to the sandbox before the initial command or shell starts.
         /// Accepts [`bind_address`:]port (e.g. 8080, 0.0.0.0:8080). Keeps the sandbox alive.
@@ -3372,6 +3377,7 @@ async fn run_async() -> Result<()> {
                     driver_config_json,
                     providers,
                     policy,
+                    frozen,
                     forward,
                     expose,
                     expose_authorization_mode,
@@ -3460,6 +3466,7 @@ async fn run_async() -> Result<()> {
                             editor,
                             providers: &providers,
                             policy: policy.as_deref(),
+                            frozen,
                             forward,
                             expose,
                             expose_authorization_mode: expose_authorization_mode.into(),
@@ -6230,6 +6237,38 @@ mod tests {
             ),
             other => panic!("expected SandboxCommands::Create, got: {other:?}"),
         }
+    }
+
+    #[test]
+    fn sandbox_create_frozen_supports_inline_and_named_templates() {
+        for args in [
+            vec!["openshell", "sandbox", "create", "--frozen"],
+            vec![
+                "openshell",
+                "sandbox",
+                "create",
+                "--template",
+                "agent",
+                "--frozen",
+            ],
+        ] {
+            let cli = Cli::try_parse_from(args).unwrap();
+            assert!(matches!(
+                cli.command,
+                Some(Commands::Sandbox {
+                    command: Some(SandboxCommands::Create { frozen: true, .. }),
+                    ..
+                })
+            ));
+        }
+        let cli = Cli::try_parse_from(["openshell", "sandbox", "create"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Sandbox {
+                command: Some(SandboxCommands::Create { frozen: false, .. }),
+                ..
+            })
+        ));
     }
 
     #[test]
