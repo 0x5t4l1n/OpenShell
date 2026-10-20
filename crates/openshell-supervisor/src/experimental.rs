@@ -36,6 +36,15 @@ struct Args {
     #[arg(long)]
     session_root: PathBuf,
 
+    /// SPIRE agent admin socket that authorizes this process to obtain
+    /// sandbox JWT-SVIDs through the Delegated Identity API.
+    #[arg(long, requires = "spiffe_delegation_id_prefix")]
+    spiffe_delegation_admin_socket: Option<PathBuf>,
+
+    /// Prefix of sandbox SPIFFE IDs: `<prefix>/gateway/<gateway-id>/sandbox/<sandbox-id>`.
+    #[arg(long, requires = "spiffe_delegation_admin_socket")]
+    spiffe_delegation_id_prefix: Option<String>,
+
     #[arg(long, default_value = "warn", env = openshell_core::sandbox_env::LOG_LEVEL)]
     log_level: String,
 }
@@ -100,12 +109,33 @@ fn run_platform(args: Args) -> Result<()> {
             &tls_file("ca.crt")?,
         )
         .map_err(|error| miette::miette!("{error}"))?;
+        let spiffe_delegation = args
+            .spiffe_delegation_admin_socket
+            .clone()
+            .zip(args.spiffe_delegation_id_prefix.as_deref())
+            .map(|(admin_socket, prefix)| {
+                if !admin_socket.is_absolute() {
+                    return Err(miette::miette!(
+                        "--spiffe-delegation-admin-socket must be an absolute path"
+                    ));
+                }
+                openshell_core::spiffe::SandboxSpiffeIdPrefix::parse(prefix)
+                    .map_err(|error| miette::miette!("{error}"))
+                    .map(
+                        |spiffe_id_prefix| openshell_supervisor::shared_host::SpiffeDelegation {
+                            admin_socket,
+                            spiffe_id_prefix,
+                        },
+                    )
+            })
+            .transpose()?;
         let host = openshell_supervisor::shared_host::SharedHost::start(
             openshell_supervisor::shared_host::SharedHostConfig {
                 gateway_endpoint: args.openshell_endpoint.clone(),
                 session_root: args.session_root.clone(),
                 runtime_listen: args.runtime_listen,
                 removal_grace: openshell_sandbox_backend::session_control::SESSION_REMOVAL_GRACE,
+                spiffe_delegation,
             },
         )?;
         let control = tokio::net::TcpListener::bind(args.session_control_listen)
@@ -123,6 +153,7 @@ fn run_platform(args: Args) -> Result<()> {
         tracing::info!(
             runtime = %host.runtime_addr(),
             control = %args.session_control_listen,
+            spiffe_delegation = args.spiffe_delegation_admin_socket.is_some(),
             "Shared supervisor ready for sessions"
         );
         let (stop, stopped) = tokio::sync::watch::channel(false);

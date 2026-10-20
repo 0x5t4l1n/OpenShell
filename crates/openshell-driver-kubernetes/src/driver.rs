@@ -5315,6 +5315,8 @@ fn shared_session_registration(
         })?,
         runtime_descriptor,
         auth: launch_authentication.supervisor.clone(),
+        gateway_id: launch_authentication.gateway_id.clone(),
+        verification_keys: launch_authentication.verification_keys.clone(),
         main_process_spec: required_sandbox_annotation(
             object,
             ANNOTATION_SANDBOX_RUNTIME_MAIN_PROCESS_SPEC,

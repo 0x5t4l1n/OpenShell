@@ -82,6 +82,11 @@ pub struct SessionRegistration {
     pub runtime_descriptor: SandboxRuntimeDescriptor,
     /// Gateway-issued credentials for exactly this generation.
     pub auth: openshell_core::jwt::SupervisorAuthBundle,
+    /// Issuer identity and public keys that verify `auth`'s gateway JWTs,
+    /// copied from the gateway's launch authentication. A session acting as
+    /// its sandbox's workload identity verifies its current JWT with them.
+    pub gateway_id: String,
+    pub verification_keys: Vec<openshell_core::jwt::SessionVerificationKey>,
     /// Encoded `MainProcessConfig` for the canonical process.
     pub main_process_spec: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -103,6 +108,15 @@ impl std::fmt::Debug for SessionRegistration {
             .field("sandbox_name", &self.sandbox_name)
             .field("runtime_descriptor", &self.runtime_descriptor)
             .field("auth", &self.auth)
+            .field("gateway_id", &self.gateway_id)
+            .field(
+                "verification_key_ids",
+                &self
+                    .verification_keys
+                    .iter()
+                    .map(|key| key.key_id.as_str())
+                    .collect::<Vec<_>>(),
+            )
             .field("workdir", &self.workdir)
             .field("container_image", &self.container_image)
             .finish_non_exhaustive()
@@ -139,6 +153,8 @@ impl SessionRegistration {
         self.auth
             .validate()
             .map_err(|error| BackendError::Descriptor(error.to_string()))?;
+        self.gateway_verifier()
+            .map_err(|error| BackendError::Descriptor(error.to_string()))?;
         openshell_core::sandbox_env::MainProcessConfig::decode(&self.main_process_spec)
             .map_err(BackendError::Descriptor)?;
         if self.proxy_ca.certificate_pem.is_empty()
@@ -149,6 +165,18 @@ impl SessionRegistration {
             ));
         }
         Ok(())
+    }
+
+    /// Strict verifier for this registration's gateway session JWTs.
+    pub fn gateway_verifier(
+        &self,
+    ) -> Result<openshell_core::jwt::SessionJwtVerifier, openshell_core::jwt::SessionJwtError> {
+        openshell_core::jwt::SessionJwtVerifier::new(
+            &self.gateway_id,
+            openshell_core::jwt::SessionTokenProfile::Gateway,
+            self.verification_keys.clone(),
+            Arc::new(openshell_core::jwt::SystemJwtClock),
+        )
     }
 }
 

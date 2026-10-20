@@ -25,6 +25,11 @@ depends = [
   "test:maintainer-approval",
 ]
 
+["test:spire-delegation"]
+description = "Test shared-supervisor SPIRE delegated sandbox identities against a real SPIRE server and agent"
+run = "tasks/scripts/test-spire-delegation.sh"
+run_windows = "echo Skipping test:spire-delegation: SPIRE delegation requires Linux."
+
 ["test:docs-website"]
 description = "Test the docs-website sync script"
 # --no-project skips installing the OpenShell package; --with supplies the test

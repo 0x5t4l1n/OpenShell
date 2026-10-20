@@ -47,6 +47,18 @@ pub struct SharedHostConfig {
     pub runtime_listen: SocketAddr,
     /// Time a removed session may take to stop its workload.
     pub removal_grace: Duration,
+    /// SPIRE delegation of sandbox identities for provider token grants.
+    /// Without it, grants that need a workload identity fail closed.
+    pub spiffe_delegation: Option<SpiffeDelegation>,
+}
+
+/// SPIRE agent that delegates sandbox identities to this supervisor.
+#[derive(Clone, Debug)]
+pub struct SpiffeDelegation {
+    /// Private admin socket of the SPIRE agent; never exposed to sandboxes.
+    pub admin_socket: PathBuf,
+    /// Prefix of every sandbox's stable SPIFFE ID.
+    pub spiffe_id_prefix: openshell_core::spiffe::SandboxSpiffeIdPrefix,
 }
 
 struct Registered {
@@ -300,6 +312,7 @@ impl SharedHost {
                 .as_bytes(),
         )
         .map_err(failure)?;
+        let provider_identity = self.provider_identity(&registration)?;
         let trust_dir = session_dir.join("trust");
         prepare_private_dir(&trust_dir).map_err(failure)?;
         let ssh_socket = session_dir.join("ssh.sock");
@@ -324,8 +337,8 @@ impl SharedHost {
                 shared_ssh_socket: false,
                 ocsf_json: openshell_ocsf::OcsfJsonSettings::default(),
                 // The Kubernetes driver refuses the gateway topology when an
-                // upstream proxy or provider workload identity is configured,
-                // and it configures no extra CA for dedicated supervisors.
+                // upstream proxy is configured, and it configures no extra CA
+                // for dedicated supervisors.
                 upstream_proxy_args:
                     openshell_supervisor_network::upstream_proxy::UpstreamProxyArgs::default(),
                 additional_ca_bundle: None,
@@ -342,9 +355,7 @@ impl SharedHost {
                         traceparent: context.traceparent,
                         tracestate: context.tracestate,
                     }),
-                // One process cannot hold a per-sandbox workload identity, so
-                // providers that need one fail closed.
-                provider_workload_api_socket: None,
+                provider_identity,
                 proxy_tls: openshell_supervisor_network::run::ProxyTlsFiles {
                     ca_certificate: Some(ca_certificate),
                     ca_private_key: Some(ca_private_key),
@@ -354,6 +365,46 @@ impl SharedHost {
             },
             container_image: registration.container_image,
         })
+    }
+}
+
+impl SharedHost {
+    /// The sandbox identity this session's provider token grants act as.
+    ///
+    /// The process's own Workload API identity names the shared supervisor,
+    /// so it is never used. With SPIRE delegation, the session acts as its
+    /// sandbox's stable identity, authorized by the registration's gateway
+    /// JWTs and verification keys; without it, grants fail closed.
+    fn provider_identity(
+        &self,
+        registration: &SessionRegistration,
+    ) -> Result<openshell_supervisor_network::run::ProviderIdentitySource, ControlError> {
+        let Some(delegation) = &self.config.spiffe_delegation else {
+            return Ok(openshell_supervisor_network::run::ProviderIdentitySource::None);
+        };
+        let invalid = |error: String| ControlError::Invalid(error);
+        delegation
+            .spiffe_id_prefix
+            .sandbox_spiffe_id(&registration.gateway_id, &registration.sandbox_id)
+            .map_err(invalid)?;
+        Ok(
+            openshell_supervisor_network::run::ProviderIdentitySource::Delegated(
+                openshell_supervisor_network::spiffe_delegation::DelegatedIdentityConfig {
+                    admin_socket: delegation.admin_socket.clone(),
+                    spiffe_id_prefix: delegation.spiffe_id_prefix.clone(),
+                    gateway_id: registration.gateway_id.clone(),
+                    gateway_verifier: registration
+                        .gateway_verifier()
+                        .map_err(|error| invalid(error.to_string()))?,
+                    sandbox_id: openshell_core::jwt::SandboxId::parse(
+                        registration.sandbox_id.clone(),
+                    )
+                    .map_err(|error| invalid(error.to_string()))?,
+                    runtime_generation: registration.auth.runtime_generation.clone(),
+                    auth_epoch: registration.auth.auth_epoch,
+                },
+            ),
+        )
     }
 }
 
@@ -590,6 +641,7 @@ mod tests {
             session_root: root.to_path_buf(),
             runtime_listen: "127.0.0.1:0".parse().unwrap(),
             removal_grace: Duration::from_secs(10),
+            spiffe_delegation: None,
         })
         .unwrap()
     }

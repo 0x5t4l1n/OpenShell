@@ -176,6 +176,22 @@ impl GatewayCredentials {
         self.inner.sandbox_bearer.clone()
     }
 
+    /// The gateway session JWT these credentials currently present, as last
+    /// renewed, or `None` once revoked. The value is unverified; callers that
+    /// act on its claims must verify it first.
+    #[cfg(feature = "jwt")]
+    #[must_use]
+    pub fn current_gateway_token(&self) -> Option<crate::jwt::SecretJwt> {
+        let bearer = self
+            .inner
+            .bearer
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()?;
+        let token = crate::auth::strip_bearer_scheme(bearer.to_str().ok()?)?;
+        crate::jwt::SecretJwt::parse(token).ok()
+    }
+
     /// Clear both credentials and stop renewal. Existing clients fail their
     /// next request locally instead of presenting a revoked identity.
     pub fn revoke(&self) {
@@ -1559,6 +1575,52 @@ pub async fn exchange_provider_subject_token(
     status.finish(provider_subject_token_exchange_result(
         response.into_inner(),
     ))
+}
+
+/// Confirm that the gateway still accepts this session's current credentials.
+///
+/// The gateway authenticates every sandbox RPC against the persisted runtime
+/// generation, credential epoch, gateway-token lineage, and an active sandbox
+/// phase, so a successful authenticated read proves the session is current
+/// right now, not only when its JWT was signed. The response is discarded.
+#[tracing::instrument(
+    name = "supervisor.gateway.confirm_session_authorization",
+    skip_all,
+    fields(otel.kind = "client", otel.status_code = tracing::field::Empty)
+)]
+pub async fn confirm_session_authorization(
+    gateway: &GatewayEndpoint,
+    sandbox_name: &str,
+) -> std::result::Result<(), TokenGrantFailure> {
+    let status = ClientSpanStatus::current();
+    let endpoint = token_grant_gateway_endpoint(gateway.url())?;
+    if sandbox_name.is_empty() {
+        return Err(gateway_grant_failure(TokenGrantFailureKind::Configuration));
+    }
+    let mut client = connect(&gateway.with_url(endpoint.as_str()))
+        .await
+        .map_err(|_| gateway_grant_failure(TokenGrantFailureKind::Unavailable))?;
+    let result = client
+        .get_sandbox_config(GetSandboxConfigRequest {
+            workspace_scope: None,
+            name: sandbox_name.to_string(),
+        })
+        .await
+        .map(drop)
+        .map_err(|status| {
+            gateway_grant_failure(match status.code() {
+                tonic::Code::Unauthenticated
+                | tonic::Code::PermissionDenied
+                | tonic::Code::NotFound
+                | tonic::Code::FailedPrecondition => {
+                    TokenGrantFailureKind::WorkloadIdentityRejected
+                }
+                tonic::Code::DeadlineExceeded => TokenGrantFailureKind::Timeout,
+                tonic::Code::Unavailable => TokenGrantFailureKind::Unavailable,
+                _ => TokenGrantFailureKind::Unclassified,
+            })
+        });
+    status.finish(result)
 }
 
 /// Attach the exchange's request ID as `x-request-id` gRPC metadata.

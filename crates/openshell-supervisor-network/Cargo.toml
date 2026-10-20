@@ -15,7 +15,7 @@ openshell-sandbox-backend = { path = "../openshell-sandbox-backend" }
 sha2 = { workspace = true }
 openshell-binary-identity = { path = "../openshell-binary-identity" }
 openshell-crypto = { workspace = true }
-openshell-core = { path = "../openshell-core", features = ["oauth"] }
+openshell-core = { path = "../openshell-core", features = ["jwt", "oauth"] }
 openshell-isolation-interface = { path = "../openshell-isolation-interface" }
 openshell-ocsf = { path = "../openshell-ocsf" }
 openshell-policy = { path = "../openshell-policy" }
@@ -38,6 +38,7 @@ hex = "0.4"
 hickory-proto = "0.26.1"
 ipnet = "2"
 miette = { workspace = true }
+prost = { workspace = true }
 prost-types = { workspace = true }
 rcgen = { workspace = true }
 regorus = { version = "0.9", default-features = false, features = ["std", "arc", "glob", "yaml"] }
@@ -55,6 +56,7 @@ thiserror = { workspace = true }
 tokio = { workspace = true }
 tokio-rustls = { workspace = true }
 tonic = { workspace = true }
+tonic-prost = { workspace = true }
 tower-mcp-types = { workspace = true }
 tracing = { workspace = true }
 uuid = { workspace = true }
@@ -68,6 +70,9 @@ bundled-ca-roots = ["dep:webpki-roots"]
 openshell-sandbox-backend = { path = "../openshell-sandbox-backend", features = ["test-support"] }
 
 openshell-driver-vm = { path = "../openshell-driver-vm", default-features = false, features = ["allocation-tracking"] }
+http-body-util = { workspace = true }
+hyper = { workspace = true }
+hyper-util = { workspace = true }
 openshell-ocsf = { path = "../openshell-ocsf", features = ["test-support"] }
 openshell-otel = { path = "../openshell-otel" }
 openshell-supervisor-middleware-builtins = { path = "../openshell-supervisor-middleware-builtins" }

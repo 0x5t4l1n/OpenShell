@@ -39,6 +39,7 @@ use crate::l7::token_grant_injection::SpiffeTokenGrantResolver;
 use crate::opa::OpaEngine;
 use crate::policy_local::{DenialLogSource, PolicyLocalContext};
 use crate::proxy::ProxyHandle;
+pub use crate::token_grant::ProviderIdentitySource;
 use crate::token_grant::SessionTokenGrants;
 use openshell_core::endpoint_status::EndpointObservationSender;
 use openshell_core::grpc_client::GatewayEndpoint;
@@ -203,9 +204,9 @@ pub struct NetworkSession {
     pub sandbox_name: Option<String>,
     /// Gateway access with this session's credentials.
     pub gateway: Option<GatewayEndpoint>,
-    /// SPIFFE Workload API socket for provider token grants. Without one,
-    /// grants fail closed.
-    pub provider_workload_api_socket: Option<std::path::PathBuf>,
+    /// Workload identity for provider token grants. Without one, grants
+    /// fail closed.
+    pub provider_identity: ProviderIdentitySource,
     /// Source served by `policy.local` `/v1/denials`.
     pub denial_log: DenialLogSource,
     /// Proxy interception CA and trust-file directory.
@@ -304,14 +305,15 @@ pub async fn run_networking(
         sandbox_id,
         sandbox_name,
         gateway,
-        provider_workload_api_socket,
+        provider_identity,
         denial_log,
         proxy_tls,
     } = session;
     let token_grants = SpiffeTokenGrantResolver::new(SessionTokenGrants::new(
         gateway.clone(),
         sandbox_id.clone(),
-        provider_workload_api_socket,
+        sandbox_name.clone(),
+        provider_identity,
     ));
     let policy_local_ctx = Arc::new(
         PolicyLocalContext::new(

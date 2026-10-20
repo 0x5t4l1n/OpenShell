@@ -30,9 +30,15 @@
 //! ## Session scope
 //!
 //! Each supervised sandbox owns a [`SessionTokenGrants`]: its token cache,
-//! HTTP client, gateway credentials, sandbox ID, and SPIFFE Workload API
-//! socket. A token is never served to another sandbox. Without a configured
-//! Workload API socket, grants fail closed with a configuration failure.
+//! HTTP client, gateway credentials, sandbox ID, and workload identity
+//! source. A token is never served to another sandbox. Without a configured
+//! identity source, grants fail closed with a configuration failure.
+//!
+//! A dedicated supervisor presents its own identity from a SPIFFE Workload
+//! API socket. A shared supervisor presents the sandbox's stable identity,
+//! which SPIRE delegates to it (see [`crate::spiffe_delegation`]); it
+//! re-authorizes the session before serving a cached token and before
+//! caching a new one, so a removed or superseded session reuses nothing.
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -50,6 +56,8 @@ use openshell_core::token_grant_failure::{
     TokenGrantFailure, TokenGrantFailureKind, TokenGrantStage,
 };
 use spiffe::{WorkloadApiClient, WorkloadApiError};
+
+use crate::spiffe_delegation::{DelegatedIdentityConfig, DelegatedSandboxIdentity};
 
 const DEFAULT_TOKEN_CACHE_TTL_SECONDS: i64 = 300;
 const TOKEN_CACHE_EXPIRY_SKEW_SECONDS: i64 = 30;
@@ -86,6 +94,13 @@ impl TokenCache {
         }
     }
 
+    /// Forget every cached token.
+    fn clear(&self) {
+        if let Ok(mut tokens) = self.tokens.write() {
+            tokens.clear();
+        }
+    }
+
     /// Store a token with expiration time.
     fn set(&self, provider_name: String, access_token: String, expires_at_ms: i64) {
         if let Ok(mut tokens) = self.tokens.write() {
@@ -100,10 +115,29 @@ impl TokenCache {
     }
 }
 
+/// Where a session's provider token grants obtain their JWT-SVID.
+#[derive(Debug, Default)]
+pub enum ProviderIdentitySource {
+    /// No workload identity; every grant fails closed.
+    #[default]
+    None,
+    /// The supervisor's own identity from a SPIFFE Workload API socket, for a
+    /// supervisor dedicated to one sandbox.
+    WorkloadApi(PathBuf),
+    /// The sandbox's stable identity, delegated to a shared supervisor.
+    Delegated(DelegatedIdentityConfig),
+}
+
+enum WorkloadIdentity {
+    Unavailable,
+    WorkloadApi(PathBuf),
+    Delegated(Box<DelegatedSandboxIdentity>),
+}
+
 /// Provider token grants owned by one supervised sandbox.
 ///
 /// The cache, HTTP connection pool, gateway credentials, sandbox ID, and
-/// workload identity socket all belong to this session, so a token acquired
+/// workload identity source all belong to this session, so a token acquired
 /// for one sandbox is never served to another.
 pub struct SessionTokenGrants {
     cache: TokenCache,
@@ -111,24 +145,60 @@ pub struct SessionTokenGrants {
     http_client: Result<TokenGrantClient, TokenGrantFailure>,
     gateway: Option<GatewayEndpoint>,
     sandbox_id: Option<String>,
-    workload_api_socket: Option<PathBuf>,
+    identity: WorkloadIdentity,
 }
 
 impl SessionTokenGrants {
-    /// Grants authenticated as `sandbox_id` through `gateway`. A missing
-    /// Workload API socket makes every grant fail closed.
+    /// Grants authenticated as `sandbox_id` through `gateway`. A missing or
+    /// unusable identity source makes every grant fail closed.
     #[must_use]
     pub fn new(
         gateway: Option<GatewayEndpoint>,
         sandbox_id: Option<String>,
-        workload_api_socket: Option<PathBuf>,
+        sandbox_name: Option<String>,
+        identity: ProviderIdentitySource,
     ) -> Self {
+        let identity = match identity {
+            ProviderIdentitySource::None => WorkloadIdentity::Unavailable,
+            ProviderIdentitySource::WorkloadApi(path) if path.as_os_str().is_empty() => {
+                WorkloadIdentity::Unavailable
+            }
+            ProviderIdentitySource::WorkloadApi(path) => WorkloadIdentity::WorkloadApi(path),
+            ProviderIdentitySource::Delegated(config) => gateway
+                .clone()
+                .zip(sandbox_name)
+                .and_then(|(gateway, sandbox_name)| {
+                    DelegatedSandboxIdentity::new(config, gateway, sandbox_name)
+                        .ok()
+                        .map(Box::new)
+                })
+                .map_or(WorkloadIdentity::Unavailable, WorkloadIdentity::Delegated),
+        };
         Self {
             cache: TokenCache::new(),
             http_client: TokenGrantClient::new(),
             gateway,
             sandbox_id: sandbox_id.filter(|value| !value.trim().is_empty()),
-            workload_api_socket: workload_api_socket.filter(|path| !path.as_os_str().is_empty()),
+            identity,
+        }
+    }
+
+    /// Confirm that a delegated identity's session is still authorized. On
+    /// failure, the session's cached tokens are discarded.
+    fn authorize_session(&self) -> Result<(), TokenGrantFailure> {
+        let WorkloadIdentity::Delegated(identity) = &self.identity else {
+            return Ok(());
+        };
+        identity.authorize().inspect_err(|_| self.cache.clear())
+    }
+
+    async fn fetch_jwt_svid(&self, audience: &str) -> Result<String, TokenGrantFailure> {
+        match &self.identity {
+            WorkloadIdentity::Unavailable => Err(configuration_failure()),
+            WorkloadIdentity::WorkloadApi(socket_path) => {
+                fetch_jwt_svid_from_socket(socket_path, audience).await
+            }
+            WorkloadIdentity::Delegated(identity) => identity.fetch_jwt_svid(audience).await,
         }
     }
 
@@ -156,7 +226,10 @@ impl SessionTokenGrants {
     ) -> Result<String, TokenGrantFailure> {
         let grant_type = ProviderCredentialTokenGrantType::try_from(request.grant_type)
             .map_err(|_| configuration_failure())?;
-        obtain_provider_token_with_grant(
+        // Neither a cached token nor a new acquisition outlives the session's
+        // authorization.
+        self.authorize_session()?;
+        let token = obtain_provider_token_with_grant(
             ObtainProviderTokenInput {
                 cache: &self.cache,
                 provider_name: request.provider_name,
@@ -187,15 +260,11 @@ impl SessionTokenGrants {
                     }
                 };
                 let http_client = self.http_client.as_ref().map_err(|failure| *failure)?;
-                let socket_path = self
-                    .workload_api_socket
-                    .as_deref()
-                    .ok_or_else(configuration_failure)?;
                 // Fetch JWT-SVID with authorization server as audience
                 // For RFC 7523, the JWT assertion's aud claim identifies the issuer/realm
-                let jwt_svid = fetch_jwt_svid_from_socket(socket_path, &jwt_audience).await?;
+                let jwt_svid = self.fetch_jwt_svid(&jwt_audience).await?;
 
-                match exchange_context {
+                let response = match exchange_context {
                     None => {
                         // Perform OAuth2 JWT client assertion grant. The audience
                         // parameter in the token request specifies the resource server.
@@ -224,6 +293,7 @@ impl SessionTokenGrants {
                         validate_access_token(&intermediate.access_token).map_err(|failure| {
                             failure.at_stage(TokenGrantStage::IntermediateExchange)
                         })?;
+                        self.authorize_session()?;
                         perform_token_exchange(
                             http_client,
                             request.token_endpoint,
@@ -240,10 +310,15 @@ impl SessionTokenGrants {
                         )
                         .await
                     }
-                }
+                }?;
+                // Nothing is cached for a session that ended during the exchange.
+                self.authorize_session()?;
+                Ok(response)
             },
         )
-        .await
+        .await?;
+        self.authorize_session()?;
+        Ok(token)
     }
 }
 
