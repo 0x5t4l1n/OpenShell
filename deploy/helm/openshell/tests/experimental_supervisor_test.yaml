@@ -245,7 +245,127 @@ tests:
           experimental_supervisor_topology: gateway
     asserts:
       - failedTemplate:
-          errorMessage: experimental_supervisor_topology=gateway does not support upstream proxy settings or provider SPIFFE identity
+          errorMessage: experimental_supervisor_topology=gateway does not support upstream proxy settings, or provider SPIFFE identity without experimental_supervisor_spiffe_delegation
+  - it: rejects provider SPIFFE identity without delegation
+    template: templates/experimental-supervisor.yaml
+    set:
+      gatewayConfig:
+        openshell.drivers.kubernetes:
+          experimental_supervisor_topology: gateway
+          provider_spiffe_workload_api_socket_path: /spiffe-workload-api/spire-agent.sock
+    asserts:
+      - failedTemplate:
+          errorMessage: experimental_supervisor_topology=gateway does not support upstream proxy settings, or provider SPIFFE identity without experimental_supervisor_spiffe_delegation
+  - it: mounts the SPIRE agent admin socket only into the shared supervisor
+    template: templates/experimental-supervisor.yaml
+    set:
+      gatewayConfig:
+        openshell.drivers.kubernetes:
+          experimental_supervisor_topology: gateway
+          provider_spiffe_workload_api_socket_path: /spiffe-workload-api/spire-agent.sock
+          experimental_supervisor_spiffe_delegation:
+            admin_socket_path: /run/spire/agent/sockets/csi.spiffe.io/admin/admin.sock
+            spiffe_id_prefix: spiffe://example.org/openshell
+            admin_socket_group: 10035
+    asserts:
+      - hasDocuments:
+          count: 4
+      - equal:
+          path: spec.template.spec.securityContext.supplementalGroups
+          value: [10035]
+        documentIndex: 1
+      - equal:
+          path: kind
+          value: ServiceAccount
+        documentIndex: 0
+      - equal:
+          path: automountServiceAccountToken
+          value: false
+        documentIndex: 0
+      - equal:
+          path: spec.template.spec.serviceAccountName
+          value: openshell-experimental-supervisor
+        documentIndex: 1
+      - equal:
+          path: spec.template.spec.automountServiceAccountToken
+          value: false
+        documentIndex: 1
+      - contains:
+          path: spec.template.spec.containers[0].args
+          content: --spiffe-delegation-admin-socket
+        documentIndex: 1
+      - contains:
+          path: spec.template.spec.containers[0].args
+          content: /run/spire/agent/sockets/csi.spiffe.io/admin/admin.sock
+        documentIndex: 1
+      - contains:
+          path: spec.template.spec.containers[0].args
+          content: spiffe://example.org/openshell
+        documentIndex: 1
+      - contains:
+          path: spec.template.spec.containers[0].volumeMounts
+          content:
+            name: spire-agent-admin
+            mountPath: /run/spire/agent/sockets/csi.spiffe.io/admin
+            readOnly: true
+        documentIndex: 1
+      - contains:
+          path: spec.template.spec.volumes
+          content:
+            name: spire-agent-admin
+            hostPath:
+              path: /run/spire/agent/sockets/csi.spiffe.io/admin
+              type: Directory
+        documentIndex: 1
+  - it: rejects SPIRE delegation outside the gateway topology
+    template: templates/experimental-supervisor.yaml
+    set:
+      gatewayConfig:
+        openshell.drivers.kubernetes:
+          experimental_supervisor_spiffe_delegation:
+            admin_socket_path: /run/spire/admin/admin.sock
+            spiffe_id_prefix: spiffe://example.org/openshell
+    asserts:
+      - failedTemplate:
+          errorMessage: experimental_supervisor_spiffe_delegation requires experimental_supervisor_topology=gateway
+  - it: rejects an admin socket the gateway's Workload API mount would expose
+    template: templates/experimental-supervisor.yaml
+    set:
+      gatewayConfig:
+        openshell.drivers.kubernetes:
+          experimental_supervisor_topology: gateway
+          provider_spiffe_workload_api_socket_path: /run/spire/api.sock
+          experimental_supervisor_spiffe_delegation:
+            admin_socket_path: /run/spire/private/admin.sock
+            spiffe_id_prefix: spiffe://example.org/openshell
+    asserts:
+      - failedTemplate:
+          errorMessage: experimental_supervisor_spiffe_delegation.admin_socket_path and provider_spiffe_workload_api_socket_path must be canonical paths in separate, non-nested directories
+  - it: never adds the root group for the admin socket
+    template: templates/experimental-supervisor.yaml
+    set:
+      gatewayConfig:
+        openshell.drivers.kubernetes:
+          experimental_supervisor_topology: gateway
+          experimental_supervisor_spiffe_delegation:
+            admin_socket_path: /run/spire/admin/admin.sock
+            spiffe_id_prefix: spiffe://example.org/openshell
+            admin_socket_group: 0
+    asserts:
+      - failedTemplate:
+          errorMessage: experimental_supervisor_spiffe_delegation.admin_socket_group must be a positive group ID
+  - it: rejects a non-canonical admin socket path
+    template: templates/experimental-supervisor.yaml
+    set:
+      gatewayConfig:
+        openshell.drivers.kubernetes:
+          experimental_supervisor_topology: gateway
+          experimental_supervisor_spiffe_delegation:
+            admin_socket_path: /run/spire/../admin/admin.sock
+            spiffe_id_prefix: spiffe://example.org/openshell
+    asserts:
+      - failedTemplate:
+          errorMessage: experimental_supervisor_spiffe_delegation.admin_socket_path must be a canonical absolute UNIX socket path below a dedicated directory
   - it: rejects workspace until implemented
     template: templates/experimental-supervisor.yaml
     set:

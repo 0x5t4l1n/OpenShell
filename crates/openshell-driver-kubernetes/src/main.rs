@@ -262,6 +262,7 @@ async fn main() -> Result<()> {
         KubernetesComputeConfig {
             experimental_supervisor_topology: None,
             experimental_shared_supervisor: None,
+            experimental_supervisor_spiffe_delegation: None,
             allow_driver_config: args.admission_config_json.allow_driver_config,
             resource_admission: args.admission_config_json.resource_admission.clone(),
             workspace_mode: args.workspace_mode,

@@ -12,6 +12,22 @@
 {{- $endpoint := get $kubernetes "grpc_endpoint" }}
 {{- $endpointUrl := urlParse $endpoint }}
 {{- $gatewayTls := and (not .Values.server.disableTls) .Values.server.tls.clientTlsSecretName }}
+{{- $delegation := get $kubernetes "experimental_supervisor_spiffe_delegation" }}
+{{- if $delegation }}
+# A service account of its own gives the shared supervisor a SPIFFE identity
+# no other Pod shares, for the SPIRE agent's authorized delegates. It holds
+# no Kubernetes permissions and no token is mounted.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ $name }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "openshell.labels" . | nindent 4 }}
+    app.kubernetes.io/component: experimental-supervisor
+automountServiceAccountToken: false
+---
+{{- end }}
 # One supervisor process hosting a session per sandbox generation. Sessions
 # are registered only by the gateway, over a mutually authenticated API whose
 # client credential only the gateway mounts. The Pod holds no Kubernetes or
@@ -38,6 +54,9 @@ spec:
       labels:
         {{- include "openshell.experimentalSupervisorSelectorLabels" . | nindent 8 }}
     spec:
+      {{- if $delegation }}
+      serviceAccountName: {{ $name }}
+      {{- end }}
       automountServiceAccountToken: false
       enableServiceLinks: false
       terminationGracePeriodSeconds: 30
@@ -52,6 +71,11 @@ spec:
         runAsUser: 65534
         runAsGroup: 65534
         fsGroup: 65534
+        {{- with ($delegation | default dict).admin_socket_group }}
+        # Opens the SPIRE agent admin socket, owned by this group.
+        supplementalGroups:
+          - {{ int64 . }}
+        {{- end }}
         seccompProfile:
           type: RuntimeDefault
       containers:
@@ -70,6 +94,12 @@ spec:
             - 0.0.0.0:{{ get $shared "runtime_port" }}
             - --session-root
             - /run/openshell/sessions
+            {{- if $delegation }}
+            - --spiffe-delegation-admin-socket
+            - {{ get $delegation "admin_socket_path" | quote }}
+            - --spiffe-delegation-id-prefix
+            - {{ get $delegation "spiffe_id_prefix" | quote }}
+            {{- end }}
           env:
             - name: OPENSHELL_ENDPOINT
               value: {{ $endpoint | quote }}
@@ -122,6 +152,11 @@ spec:
               mountPath: /var/run/secrets/openshell-tls
               readOnly: true
             {{- end }}
+            {{- if $delegation }}
+            - name: spire-agent-admin
+              mountPath: {{ dir (get $delegation "admin_socket_path") | quote }}
+              readOnly: true
+            {{- end }}
       volumes:
         - name: run
           emptyDir: {}
@@ -137,6 +172,14 @@ spec:
             items:
               - key: ca.crt
                 path: ca.crt
+        {{- end }}
+        {{- if $delegation }}
+        # The node's SPIRE agent admin socket. Only this Pod mounts it; the
+        # agent authorizes delegation by attesting this process.
+        - name: spire-agent-admin
+          hostPath:
+            path: {{ dir (get $delegation "admin_socket_path") | quote }}
+            type: Directory
         {{- end }}
 ---
 apiVersion: v1

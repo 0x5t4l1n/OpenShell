@@ -379,6 +379,36 @@ fullname, so the name never collapses into another release resource's name.
 {{- end }}
 
 {{/*
+SPIRE delegation of sandbox identities to the shared supervisor. The admin
+socket directory is mounted into the shared supervisor only and the Workload
+API directory into gateway Pods, so the two must be canonical, separate, and
+non-nested. The gateway compute driver repeats these checks at startup.
+*/}}
+{{- define "openshell.validateSpiffeDelegation" -}}
+{{- $delegation := .delegation -}}
+{{- $admin := get $delegation "admin_socket_path" | default "" -}}
+{{- $prefix := get $delegation "spiffe_id_prefix" | default "" -}}
+{{- $canonical := "^(/[A-Za-z0-9_.-]+){2,}$" -}}
+{{- if or (not (regexMatch $canonical $admin)) (regexMatch "/\\.\\.?(/|$)" $admin) -}}
+{{- fail "experimental_supervisor_spiffe_delegation.admin_socket_path must be a canonical absolute UNIX socket path below a dedicated directory" -}}
+{{- end -}}
+{{- if and (hasKey $delegation "admin_socket_group") (not (regexMatch "^[1-9][0-9]*$" (toString (get $delegation "admin_socket_group")))) -}}
+{{- fail "experimental_supervisor_spiffe_delegation.admin_socket_group must be a positive group ID" -}}
+{{- end -}}
+{{- if not (regexMatch "^spiffe://[a-z0-9._-]+(/[A-Za-z0-9._-]+)*$" $prefix) -}}
+{{- fail "experimental_supervisor_spiffe_delegation.spiffe_id_prefix must be spiffe://<trust-domain>[/<segment>...]" -}}
+{{- end -}}
+{{- $workload := get .kubernetes "provider_spiffe_workload_api_socket_path" | default "" -}}
+{{- if $workload -}}
+{{- $adminDir := printf "%s/" (dir $admin) -}}
+{{- $workloadDir := printf "%s/" (dir $workload) -}}
+{{- if or (not (regexMatch $canonical $workload)) (regexMatch "/\\.\\.?(/|$)" $workload) (hasPrefix $workloadDir $adminDir) (hasPrefix $adminDir $workloadDir) -}}
+{{- fail "experimental_supervisor_spiffe_delegation.admin_socket_path and provider_spiffe_workload_api_socket_path must be canonical paths in separate, non-nested directories" -}}
+{{- end -}}
+{{- end -}}
+{{- end }}
+
+{{/*
 Pod labels of the shared supervisor; its Service selects exactly these.
 */}}
 {{- define "openshell.experimentalSupervisorSelectorLabels" -}}
@@ -641,12 +671,19 @@ Validate chart values that Helm would otherwise accept silently.
 {{- if ne (get $gateway "compute_driver" | default "kubernetes") "kubernetes" -}}
 {{- fail "experimental_supervisor_topology requires the kubernetes compute driver" -}}
 {{- end -}}
-{{- if or (get $kubernetes "https_proxy") (get $kubernetes "proxy_ca_bundle") (get $kubernetes "proxy_auth_secret_name") (get $kubernetes "provider_spiffe_workload_api_socket_path") -}}
-{{- fail "experimental_supervisor_topology=gateway does not support upstream proxy settings or provider SPIFFE identity" -}}
+{{- $delegation := get $kubernetes "experimental_supervisor_spiffe_delegation" -}}
+{{- if or (get $kubernetes "https_proxy") (get $kubernetes "proxy_ca_bundle") (get $kubernetes "proxy_auth_secret_name") (and (get $kubernetes "provider_spiffe_workload_api_socket_path") (not $delegation)) -}}
+{{- fail "experimental_supervisor_topology=gateway does not support upstream proxy settings, or provider SPIFFE identity without experimental_supervisor_spiffe_delegation" -}}
+{{- end -}}
+{{- if $delegation -}}
+{{- include "openshell.validateSpiffeDelegation" (dict "delegation" $delegation "kubernetes" $kubernetes) -}}
 {{- end -}}
 {{- if and (eq (get $kubernetes "workspace_mode" | default "shared") "operator") (not (regexMatch "^[A-Za-z0-9][-A-Za-z0-9_./]*==?[-A-Za-z0-9_.]*$" (get $kubernetes "operator_namespace_label" | default ""))) -}}
 {{- fail "experimental_supervisor_topology=gateway in operator workspace mode requires operator_namespace_label of the form key=value" -}}
 {{- end -}}
+{{- end -}}
+{{- if and (get $kubernetes "experimental_supervisor_spiffe_delegation") (ne (get $kubernetes "experimental_supervisor_topology" | default "") "gateway") -}}
+{{- fail "experimental_supervisor_spiffe_delegation requires experimental_supervisor_topology=gateway" -}}
 {{- end -}}
 {{- if hasKey (get (.Values.gatewayConfig | default dict) "openshell.drivers.kubernetes" | default dict) "experimental_shared_supervisor" -}}
 {{- fail "experimental_shared_supervisor is rendered by the chart; set only experimental_supervisor_topology" -}}
