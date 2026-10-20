@@ -27,9 +27,8 @@ use openshell_isolation_interface::contract::{
     BackendDescriptor, BackendError, BinaryIdentity, BoundaryConfirmation, BoundaryExitStatus,
     BoundarySignal, ExecSpec, ExecutableIdentity, ProvisioningEvidence, ResolveError, ShellSpec,
 };
-use rcgen::{CertificateParams, DnType, ExtendedKeyUsagePurpose, IsCa, KeyPair, KeyUsagePurpose};
+use rcgen::{CertificateParams, DnType, ExtendedKeyUsagePurpose, IsCa, KeyUsagePurpose};
 use serde::{Deserialize, Serialize};
-use sha2::{Digest as _, Sha256};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 pub const MAX_CONTROL_FRAME_BYTES: usize = 1024 * 1024;
@@ -296,7 +295,7 @@ pub fn generate_sandbox_tls_material(
     session_id: SandboxSessionId,
 ) -> Result<SandboxTlsMaterial, BackendError> {
     let server_name = format!("sandbox.{session_id}.openshell.internal");
-    let ca_key = KeyPair::generate_for(&rcgen::PKCS_ED25519)
+    let ca_key = openshell_crypto::pki::generate_keypair_for(&rcgen::PKCS_ED25519)
         .map_err(|error| BackendError::Descriptor(format!("generate sandbox CA key: {error}")))?;
     let mut ca_params = CertificateParams::default();
     ca_params.not_before = rcgen::date_time_ymd(1975, 1, 1);
@@ -306,13 +305,14 @@ pub fn generate_sandbox_tls_material(
         .distinguished_name
         .push(DnType::CommonName, "OpenShell sandbox session CA");
     ca_params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
-    let ca = ca_params.self_signed(&ca_key).map_err(|error| {
+    let ca = openshell_crypto::pki::self_signed(ca_params, &ca_key).map_err(|error| {
         BackendError::Descriptor(format!("generate sandbox CA certificate: {error}"))
     })?;
 
-    let sandbox_key = KeyPair::generate_for(&rcgen::PKCS_ED25519).map_err(|error| {
-        BackendError::Descriptor(format!("generate sandbox TLS server key: {error}"))
-    })?;
+    let sandbox_key =
+        openshell_crypto::pki::generate_keypair_for(&rcgen::PKCS_ED25519).map_err(|error| {
+            BackendError::Descriptor(format!("generate sandbox TLS server key: {error}"))
+        })?;
     let mut sandbox_params = CertificateParams::new(vec![server_name.clone()])
         .map_err(|error| BackendError::Descriptor(format!("build sandbox certificate: {error}")))?;
     sandbox_params.not_before = rcgen::date_time_ymd(1975, 1, 1);
@@ -321,8 +321,7 @@ pub fn generate_sandbox_tls_material(
         .distinguished_name
         .push(DnType::CommonName, "OpenShell sandbox runtime");
     sandbox_params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
-    let sandbox = sandbox_params
-        .signed_by(&sandbox_key, &ca, &ca_key)
+    let sandbox = openshell_crypto::pki::signed_by(sandbox_params, &sandbox_key, &ca, &ca_key)
         .map_err(|error| {
             BackendError::Descriptor(format!("sign sandbox TLS server certificate: {error}"))
         })?;
@@ -331,7 +330,9 @@ pub fn generate_sandbox_tls_material(
         server_name,
         trust_anchor_pem: ca.pem(),
         certificate_chain_pem: sandbox.pem(),
-        private_key_pem: sandbox_key.serialize_pem(),
+        private_key_pem: sandbox_key
+            .serialize_pem()
+            .map_err(|error| BackendError::Descriptor(format!("export sandbox key: {error}")))?,
     })
 }
 
@@ -592,7 +593,9 @@ impl RequestEnvelope {
         };
         let payload_digest = request_envelope_digest(&request, exec_admission_deadline_unix_ms)?;
         Ok(Self {
-            request_id: uuid::Uuid::new_v4().to_string(),
+            request_id: uuid::Builder::from_random_bytes(openshell_crypto::random_bytes::<16>()?)
+                .into_uuid()
+                .to_string(),
             payload_digest,
             exec_admission_deadline_unix_ms,
             request,
@@ -623,6 +626,8 @@ pub(crate) fn request_envelope_digest(
     request: &Request,
     exec_admission_deadline_unix_ms: Option<u64>,
 ) -> Result<String, FrameError> {
+    use std::fmt::Write as _;
+
     // Stable local replay fingerprint of decoded protobuf fields. Maps use
     // BTreeMap in generated messages; neither clients nor the wire carry this.
     let envelope = RequestEnvelope {
@@ -632,8 +637,12 @@ pub(crate) fn request_envelope_digest(
         request: request.clone(),
     };
     let payload = crate::protobuf::encode(&envelope)?;
-    let digest = Sha256::digest(payload);
-    Ok(format!("{digest:x}"))
+    let digest = openshell_crypto::sha256(&payload)?;
+    let mut encoded = String::with_capacity(64);
+    for byte in digest {
+        write!(&mut encoded, "{byte:02x}").expect("writing to String cannot fail");
+    }
+    Ok(encoded)
 }
 
 impl fmt::Debug for RequestEnvelope {
@@ -1384,6 +1393,8 @@ where
 
 #[derive(Debug, thiserror::Error)]
 pub enum FrameError {
+    #[error("control frame cryptography failed: {0}")]
+    Crypto(#[from] openshell_crypto::CryptoError),
     #[error("invalid protobuf message: {0}")]
     Protobuf(String),
     #[error("control frame is truncated")]

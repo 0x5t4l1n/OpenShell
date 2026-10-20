@@ -27,7 +27,6 @@ use openshell_isolation_interface::contract::{
     MediationTiming, PendingDnsQuery, PendingTcpOpen, ProviderEnvironmentInstallation,
     ResolvedWorkloadIdentity, SandboxContext, TcpOpenDecision, TcpOpenDenial,
 };
-use sha2::{Digest as _, Sha256};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 #[cfg(unix)]
 use tokio::net::UnixStream;
@@ -305,7 +304,7 @@ fn validate_client_tls(tls: &SandboxTlsClientConfig) -> Result<(), BackendError>
 }
 
 fn tls_client_config(tls: &SandboxTlsClientConfig) -> Result<rustls::ClientConfig, BackendError> {
-    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    openshell_crypto::tls::ensure_default_provider();
     let certificates = rustls_pemfile::certs(&mut tls.trust_anchor_pem.as_bytes())
         .collect::<Result<Vec<_>, _>>()
         .map_err(|error| {
@@ -323,7 +322,7 @@ fn tls_client_config(tls: &SandboxTlsClientConfig) -> Result<rustls::ClientConfi
         })?;
     }
     let mut config =
-        rustls::ClientConfig::builder_with_protocol_versions(&[&rustls::version::TLS13])
+        openshell_crypto::tls::client_builder_with_protocol_versions(&[&rustls::version::TLS13])
             .with_root_certificates(roots)
             .with_no_client_auth();
     config.alpn_protocols = vec![b"h2".to_vec()];
@@ -1208,7 +1207,8 @@ impl BoundaryCredential {
             })?;
             // Epochs are monotonic; retry if authorization crossed an epoch change.
             if slot.credential_epoch() == Some(epoch) {
-                let fingerprint = Sha256::digest(authorization.as_encoded_bytes()).into();
+                let fingerprint = openshell_crypto::sha256(authorization.as_encoded_bytes())
+                    .map_err(|error| BackendError::Unavailable(error.to_string()))?;
                 return Ok(Self {
                     epoch,
                     authorization,
@@ -3152,7 +3152,7 @@ mod tests {
     fn test_certificate_with_protocol_versions(
         protocol_versions: &[&'static rustls::SupportedProtocolVersion],
     ) -> TestCertificate {
-        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        openshell_crypto::tls::ensure_default_provider();
         let material =
             generate_sandbox_tls_material(test_session_id()).expect("generate test material");
         let certificates = rustls_pemfile::certs(&mut material.certificate_chain_pem.as_bytes())
@@ -3162,7 +3162,7 @@ mod tests {
             .expect("parse server private key")
             .expect("server private key");
         let mut server_config =
-            rustls::ServerConfig::builder_with_protocol_versions(protocol_versions)
+            openshell_crypto::tls::server_builder_with_protocol_versions(protocol_versions)
                 .with_no_client_auth()
                 .with_single_cert(certificates, private_key)
                 .expect("build test TLS server config");
