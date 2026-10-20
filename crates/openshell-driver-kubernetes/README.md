@@ -213,8 +213,19 @@ fails closed.
   credentials. Sandboxes cannot reach session control, and the routing preface
   only selects which generation-pinned TLS identity the supervisor demands.
 
-The topology does not support upstream proxies or provider SPIFFE identity, and
-the shared supervisor is a single point of failure for the sandboxes it hosts.
+- **Workload identity.** A registration also carries the gateway ID and
+  session verification keys from the generation's launch authentication. With
+  `experimental_supervisor_spiffe_delegation`, the supervisor uses them to
+  authorize acting as the sandbox's SPIRE-delegated SPIFFE ID; the driver mounts
+  nothing SPIFFE-related into workload Pods. The table is accepted only with the
+  gateway topology, its admin socket must be canonical and outside the
+  `provider_spiffe_workload_api_socket_path` directory, and the gateway ID must
+  be a SPIFFE path segment. `provider_spiffe_workload_api_socket_path` is
+  accepted with the topology only alongside delegation, for the gateway's own
+  identity.
+
+The topology does not support upstream proxies, and the shared supervisor is a
+single point of failure for the sandboxes it hosts.
 Shared sessions export no supervisor OTLP traces or OCSF events; the driver
 warns at startup when the gateway configures that export.
 When the setting is removed, reconciliation suspends shared generations, and a

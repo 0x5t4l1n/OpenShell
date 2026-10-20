@@ -136,7 +136,9 @@ session waits up to five minutes for its first connection, since it is
 registered before its workload Pod is scheduled, and the usual connect window
 afterwards. `session_control` defines the registration, status, and removal
 contract between a compute driver and the shared supervisor, including its
-mutually authenticated TLS configuration.
+mutually authenticated TLS configuration. A registration carries the gateway ID
+and session verification keys from the gateway's launch authentication, so the
+supervisor can verify the session's gateway JWTs itself.
 
 Runtime-initiated transport supports TCP, protected Unix sockets, and host
 vsock listeners. These share bounded TLS handshakes, the authenticated spare

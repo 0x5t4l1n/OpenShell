@@ -124,9 +124,16 @@ one process for the Kubernetes gateway topology experiment. It is Unix-only.
   session control. SIGTERM and SIGINT stop every session, which ends their
   workloads' supervision.
 
-Sessions get no upstream proxy, extra CA bundle, or provider workload identity:
-the Kubernetes driver refuses the topology when an upstream proxy or provider
-SPIFFE identity is configured, so a workload never silently loses them. The
+Sessions get no upstream proxy or extra CA bundle: the Kubernetes driver
+refuses the topology when an upstream proxy is configured, so a workload never
+silently loses it. The process's own SPIFFE identity never stands in for a
+sandbox. With `--spiffe-delegation-admin-socket` and
+`--spiffe-delegation-id-prefix`, a session's provider token grants act as its
+sandbox's stable SPIFFE ID, `<prefix>/gateway/<gateway-id>/sandbox/<sandbox-id>`,
+which the SPIRE agent delegates to this process through its admin socket (see
+`openshell-supervisor-network` `spiffe_delegation`). The registration carries
+the gateway ID and session verification keys that authorize it. Without
+delegation, grants that need a workload identity fail closed. The
 host also initializes no OTLP trace or OCSF exporters, because one process
 cannot export each session's records with that session's collector headers and
 identity. Its console logs and each session's gateway log push remain, and the

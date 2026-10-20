@@ -879,7 +879,8 @@ The shared supervisor is a single point of failure: when it restarts, the
 sessions it hosted end and reconciliation suspends their sandboxes, which you
 then start again. Removing the setting does the same for every shared sandbox,
 and starting one again gives it a dedicated supervisor. The gateway refuses the
-topology together with upstream proxy settings or provider SPIFFE identity. In
+topology together with upstream proxy settings, and provider SPIFFE identity
+requires SPIRE delegation (below). In
 `operator` workspace mode, the chart requires `operator_namespace_label` in
 `key=value` form, because the supervisor accepts runtime connections only from
 those namespaces. Shared sessions do not export supervisor traces or OCSF events
@@ -892,6 +893,71 @@ Helm, `experimental_shared_supervisor` takes `service_name`,
 directory holding the session-control client `tls.crt` and `tls.key` and the
 `ca.crt` that issued the supervisor's certificate; you then deploy and secure
 the matching supervisor yourself.
+
+#### SPIRE-delegated sandbox identity (experimental)
+
+Provider token grants on the shared supervisor can use each sandbox's own
+SPIFFE identity, which a SPIRE agent delegates to the supervisor through its
+Delegated Identity API. The sandbox workload receives no SPIFFE socket, SVID, or
+provider token. Configure it with the gateway topology:
+
+```yaml
+gatewayConfig:
+  openshell.drivers.kubernetes:
+    experimental_supervisor_topology: gateway
+    # Optional: the gateway's own Workload API, for token-exchange profiles.
+    provider_spiffe_workload_api_socket_path: /spiffe-workload-api/spire-agent.sock
+    experimental_supervisor_spiffe_delegation:
+      admin_socket_path: /run/spire/agent/sockets/csi.spiffe.io/admin/admin.sock
+      spiffe_id_prefix: spiffe://example.org/openshell
+      admin_socket_group: 10035
+```
+
+A sandbox's SPIFFE ID is
+`<spiffe_id_prefix>/gateway/<gateway-id>/sandbox/<sandbox-id>`. It is derived
+from the immutable sandbox ID, so it stays the same when the sandbox stops and
+starts, and a sandbox recreated with the same name gets a new sandbox ID and
+SPIFFE ID. The chart mounts the directory of `admin_socket_path` from the node
+into the shared supervisor Pod only, adds `admin_socket_group` (the group that owns the
+admin socket, never `0`) to its supplemental groups, and gives it a dedicated
+service account. The admin socket and the Workload API socket must be in
+separate, non-nested directories.
+
+You provision SPIRE:
+
+- Enable the agent admin socket in a directory other than the Workload API
+  socket's, and list the shared supervisor's SPIFFE ID in the agent's
+  `authorized_delegates`. With the SPIRE Controller Manager's default
+  identity, that ID is
+  `spiffe://<trust-domain>/ns/<release-namespace>/sa/<release-fullname>-experimental-supervisor`.
+- Register one entry per sandbox with the selector
+  `openshell:sandbox:<gateway-id>:<sandbox-id>`, the sandbox's SPIFFE ID, and a
+  parent ID that is the agent on the supervisor's node or a node alias covering
+  every node it may run on. For example, with the SPIRE Controller Manager:
+
+  ```yaml
+  apiVersion: spire.spiffe.io/v1alpha1
+  kind: ClusterStaticEntry
+  metadata:
+    name: openshell-sandbox-<sandbox-id>
+  spec:
+    className: <controller-manager-class>
+    spiffeID: spiffe://example.org/openshell/gateway/<gateway-id>/sandbox/<sandbox-id>
+    parentID: spiffe://example.org/spire/agent/k8s_psat/<cluster>/<node-uid>
+    selectors:
+      - openshell:sandbox:<gateway-id>:<sandbox-id>
+  ```
+
+Before each new identity, the supervisor verifies the session's current gateway
+JWT against the gateway's session keys, requires it to name the registered
+sandbox and runtime generation, and confirms with the gateway that the
+generation is still current. It accepts exactly one SVID with the expected
+SPIFFE ID; a missing, duplicate, or mismatched entry fails the grant and never
+falls back to the supervisor's own identity. Cached provider tokens belong to
+one generation's session and are discarded when it ends. SVIDs and provider
+tokens already issued stay valid until they expire. The gateway session signing
+key that verifies a session is fixed when the session starts; after rotating it,
+stop and start the affected sandboxes.
 
 The gateway runs as a Pod and creates paired workload and supervisor Pods in another namespace. The gateway CA is projected from a Kubernetes Secret into supervisor Pods; user client certificate and key entries in that Secret are not exposed to either Pod.
 

@@ -78,6 +78,13 @@ and rejected. Omit the field to disable it. `mise run
 e2e:kubernetes:shared-supervisor` runs the focused e2e
 (`ci/values-experimental-supervisor.yaml`); layer a workspace-mode overlay
 through `OPENSHELL_E2E_KUBE_EXTRA_VALUES` to cover managed namespaces.
+`mise run e2e:kubernetes:shared-supervisor-spiffe` installs pinned SPIRE charts
+(`ci/values-spire-delegation-stack.yaml`, removed again on exit) and the
+`experimental_supervisor_spiffe_delegation` overlay
+(`ci/values-experimental-supervisor-spiffe.yaml`), then registers sandbox
+identities with `ClusterStaticEntry` resources. `mise run test:spire-delegation`
+covers the same authorization rules against a local SPIRE server and agent
+without a cluster.
 
 ### 2. Deploy OpenShell
 

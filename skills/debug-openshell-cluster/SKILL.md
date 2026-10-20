@@ -78,10 +78,33 @@ them. Its probes report process health, not sandbox readiness.
 - Shared sessions export no supervisor OTLP traces or OCSF events, even when the
   gateway's `[openshell.gateway.otlp]` table configures them; use the sandbox
   logs the gateway collects instead.
-- The gateway refuses this topology with upstream proxy settings or provider
-  SPIFFE identity. In operator workspace mode the chart requires
+- The gateway refuses this topology with upstream proxy settings, and accepts
+  provider SPIFFE identity only with `experimental_supervisor_spiffe_delegation`.
+  In operator workspace mode the chart requires
   `operator_namespace_label` as `key=value`, because the supervisor's
   NetworkPolicy admits runtime connections only from those namespaces.
+
+With `experimental_supervisor_spiffe_delegation`, sessions act as each
+sandbox's SPIRE-delegated SPIFFE ID
+(`<spiffe_id_prefix>/gateway/<gateway-id>/sandbox/<sandbox-id>`). Only the
+supervisor Pod mounts the agent's admin socket directory (`spire-agent-admin`
+hostPath) and runs as the `<fullname>-experimental-supervisor` service account;
+workload Pods carry no SPIFFE volume or environment. When provider requests
+fail with `workload_identity_rejected`:
+
+- The node's SPIRE agent must list the supervisor's SPIFFE ID in
+  `authorized_delegates`, and its admin socket must be owned by
+  `admin_socket_group` (mode `0770`). `permission denied` or `unavailable` in
+  the supervisor logs points at the socket mount, group, or delegate list.
+- Each sandbox needs exactly one registration entry with selector
+  `openshell:sandbox:<gateway-id>:<sandbox-id>`, the expected SPIFFE ID, and a
+  parent ID covering the supervisor's node. A missing, duplicate, or
+  mismatched entry fails closed; new entries reach the agent on its next sync.
+  Check with `kubectl -n <spire-namespace> exec spire-server-0 -c spire-server
+  -- /opt/spire/bin/spire-server entry show -selector
+  openshell:sandbox:<gateway-id>:<sandbox-id>`.
+- A recreated sandbox has a new sandbox ID and needs a new entry. A stopped and
+  started sandbox keeps its entry.
 
 To leave the experiment, omit the setting and upgrade the release.
 Reconciliation suspends the sandboxes the shared supervisor hosted; start each
