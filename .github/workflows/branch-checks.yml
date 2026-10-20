@@ -240,7 +240,9 @@ jobs:
 
       - name: Verify Cargo lockfiles
         shell: nix develop -c bash -euo pipefail {0}
-        run: tasks/scripts/check-cargo-lockfiles.sh
+        run: |
+          tasks/scripts/check-cargo-lockfiles.sh
+          uv run tasks/scripts/check_cargo_lockfile_alignment.py
 
   rust-lint:
     name: Rust lint (${{ matrix.system }})

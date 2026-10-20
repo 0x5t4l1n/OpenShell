@@ -17,6 +17,7 @@ python/openshell/      # Python unit tests (*_test.py suffix)
 e2e/python/            # Python E2E tests (test_*.py prefix)
 e2e/rust/              # Rust CLI E2E tests
 tests/testkit/         # Support library for SDK-driven E2E suites
+tests/suites/sandbox/  # E2E suites written on testkit
 ```
 
 ## Rust Tests
@@ -140,10 +141,30 @@ by `OPENSHELL_BIN`. See
 [tests/testkit/README.md](tests/testkit/README.md) for how to write and run
 tests.
 
-The `testkit-e2e` job in Branch E2E (`test:e2e` label) runs the suites under
-`tests/suites/sandbox` against a Docker-backed gateway with
-`mise run e2e:testkit`. The same task works locally. It isn't part of the Core
-E2E result yet.
+**New end-to-end tests go in testkit.** The older suites under
+`tests/suites/conformance`, `features` and `drivers` and the `e2e/` suites take
+fixes only. Suites live under `tests/suites/<family>/`, for example
+`tests/suites/sandbox/`, and each family is its own Cargo workspace with its own
+lockfile. Run them against a local Docker gateway with:
+
+```shell
+mise run e2e:testkit
+```
+
+CI runs them in two Branch E2E jobs (label `test:e2e`). `testkit-e2e` runs
+`mise run e2e:testkit` against a Docker-backed gateway. `testkit-integration`
+runs them through a tmachine lane that installs the Debian package. The suite's playbook
+fails the lane if fewer tests run than it expects, so raise
+`suite_expected_tests` in
+`tests/ansible/playbooks/suites/sandbox-lifecycle.yaml` when you add a
+test.
+
+Workspaces that build root crates through path dependencies must lock shared
+crates at the versions in the root `Cargo.lock`; otherwise CI can build against
+dependencies the Nix toolchain doesn't support. `mise run rust:lockfiles:check`
+verifies this, and `uv run tasks/scripts/check_cargo_lockfile_alignment.py --fix`
+re-locks a workspace from the root lockfile. Add new testkit workspaces to
+`ALIGNED_WORKSPACES` in that script.
 
 ### Python E2E (`e2e/python/`)
 

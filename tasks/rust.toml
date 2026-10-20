@@ -18,8 +18,11 @@ run_windows = "powershell -NoProfile -ExecutionPolicy Bypass -File tasks/scripts
 hide = true
 
 ["rust:lockfiles:check"]
-description = "Verify all tracked Cargo lockfiles are current"
-run = "tasks/scripts/check-cargo-lockfiles.sh"
+description = "Verify all tracked Cargo lockfiles are current and aligned with the root"
+run = [
+  "tasks/scripts/check-cargo-lockfiles.sh",
+  "uv run tasks/scripts/check_cargo_lockfile_alignment.py",
+]
 run_windows = "powershell -NoProfile -ExecutionPolicy Bypass -File tasks/scripts/check-cargo-lockfiles.ps1"
 hide = true
 

@@ -58,6 +58,7 @@ let
         mkdir -p "$(dirname "$output")"
         cd "$root"
         cargo nextest archive \
+          --locked \
           --manifest-path "$manifest_path" \
           --target ${target} \
           -p ${package} \
@@ -89,6 +90,14 @@ let
     package = "openshell-test-conformance-cli";
     target = muslToolchain.target;
     output = "artifacts/test-archives/${muslToolchain.target}/openshell-conformance-tests.tar";
+  };
+  sandboxLifecycleArchive = mkTestArchive {
+    name = "sandbox-lifecycle";
+    workspacePath = "tests/suites/sandbox";
+    manifestPath = "tests/suites/sandbox/Cargo.toml";
+    package = "openshell-test-sandbox-lifecycle";
+    target = muslToolchain.target;
+    output = "artifacts/test-archives/${muslToolchain.target}/sandbox-lifecycle-tests.tar";
   };
   providerRefreshKeycloakArchive = mkTestArchive {
     name = "provider-refresh-keycloak";
@@ -317,6 +326,7 @@ rec {
     name = "build-artifacts-test-archives";
     runtimeInputs = [
       conformanceTestArchive
+      sandboxLifecycleArchive
       providerRefreshKeycloakArchive
       ociImageArchive
       podmanDriverArchive
@@ -324,6 +334,7 @@ rec {
     ];
     text = ''
       build-openshell-conformance-test-archive
+      build-sandbox-lifecycle-test-archive
       build-provider-refresh-keycloak-test-archive
       build-oci-image-test-archive
       build-podman-driver-test-archive

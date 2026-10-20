@@ -163,6 +163,13 @@ let
         };
       }
       {
+        name = "sandbox-lifecycle";
+        playbooks = [ "ansible/playbooks/suites/sandbox-lifecycle.yaml" ];
+        inputs = {
+          sandbox_lifecycle_test_bundle = "../artifacts/test-archives/${muslTarget}/sandbox-lifecycle-tests.tar";
+        };
+      }
+      {
         name = "policy-advisor";
         playbooks = [ "ansible/playbooks/conformance/policy-advisor.yaml" ];
         inputs = {
