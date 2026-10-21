@@ -1220,7 +1220,7 @@ where
                 engine.middleware_runner(),
                 &chain,
                 ctx,
-                openshell_core::proto::UninspectableTrafficReason::SqlPassthrough,
+                openshell_core::proto::UninspectableNetworkReason::SqlPassthrough,
             )
             .await
             {

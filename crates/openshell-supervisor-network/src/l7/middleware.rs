@@ -227,7 +227,7 @@ pub async fn uninspectable_traffic_decision(
     runner: &openshell_supervisor_middleware::ChainRunner,
     chain: &[openshell_supervisor_middleware::ChainEntry],
     ctx: &L7EvalContext,
-    reason: openshell_core::proto::UninspectableTrafficReason,
+    reason: openshell_core::proto::UninspectableNetworkReason,
 ) -> UninspectableTrafficGate {
     if chain.is_empty() {
         return UninspectableTrafficGate::Unrestricted;
@@ -281,13 +281,13 @@ pub fn middleware_request_context(
 /// text.
 pub(super) fn uninspectable_decision_events(
     ctx: &L7EvalContext,
-    reason: openshell_core::proto::UninspectableTrafficReason,
+    reason: openshell_core::proto::UninspectableNetworkReason,
     outcome: &openshell_supervisor_middleware::UninspectableOutcome,
 ) -> Vec<openshell_ocsf::OcsfEvent> {
     use openshell_supervisor_middleware::UninspectableInvocationOutcome;
     let traffic = reason
         .as_str_name()
-        .trim_start_matches("UNINSPECTABLE_TRAFFIC_REASON_")
+        .trim_start_matches("UNINSPECTABLE_NETWORK_REASON_")
         .to_ascii_lowercase();
     let mut events: Vec<_> = outcome
         .invocations
@@ -2540,7 +2540,7 @@ mod tests {
         ] {
             let events = uninspectable_decision_events(
                 &ctx,
-                openshell_core::proto::UninspectableTrafficReason::TlsSkip,
+                openshell_core::proto::UninspectableNetworkReason::TlsSkip,
                 &UninspectableOutcome {
                     invocations: vec![UninspectableInvocation {
                         config_name: "guard".into(),

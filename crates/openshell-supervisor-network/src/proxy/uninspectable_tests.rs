@@ -6,7 +6,7 @@ use openshell_core::middleware::{HttpRequestView, InProcessMiddleware};
 use openshell_core::proto::{
     EvaluateUninspectableNetworkRequest, EvaluateUninspectableNetworkResponse, HttpRequestResult,
     MiddlewareBinding, MiddlewareManifest, SupervisorMiddlewareOperation,
-    SupervisorMiddlewarePhase, UninspectableNetworkDecision, UninspectableTrafficReason,
+    SupervisorMiddlewarePhase, UninspectableNetworkDecision, UninspectableNetworkReason,
 };
 use openshell_supervisor_middleware::ChainRunner;
 use std::sync::Mutex;
@@ -118,10 +118,10 @@ fn fixture(
 async fn connection_routes_supply_reason_and_process_context() {
     let (engine, service, ctx) = fixture(false);
     for reason in [
-        UninspectableTrafficReason::TlsSkip,
-        UninspectableTrafficReason::RawTcp,
-        UninspectableTrafficReason::H2c,
-        UninspectableTrafficReason::UnsupportedTunnel,
+        UninspectableNetworkReason::TlsSkip,
+        UninspectableNetworkReason::RawTcp,
+        UninspectableNetworkReason::H2c,
+        UninspectableNetworkReason::UnsupportedTunnel,
     ] {
         let result = middleware_uninspectable_gate(&engine, &ctx, reason)
             .await
@@ -172,7 +172,7 @@ async fn sql_passthrough_waits_for_approval() {
         let calls = service.calls.lock().unwrap();
         assert_eq!(
             calls[0].reason,
-            UninspectableTrafficReason::SqlPassthrough as i32
+            UninspectableNetworkReason::SqlPassthrough as i32
         );
     }
     service.release.notify_one();

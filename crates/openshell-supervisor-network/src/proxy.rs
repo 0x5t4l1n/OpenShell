@@ -1240,7 +1240,7 @@ async fn handle_transparent_tcp_connection(
     let middleware_gate = middleware_uninspectable_gate(
         &opa_engine,
         &ctx,
-        openshell_core::proto::UninspectableTrafficReason::RawTcp,
+        openshell_core::proto::UninspectableNetworkReason::RawTcp,
     )
     .await?;
     if middleware_gate == crate::l7::middleware::UninspectableTrafficGate::Deny {
@@ -1717,7 +1717,7 @@ fn unsupported_l7_tunnel_protocol_detail(
 async fn middleware_uninspectable_gate(
     opa_engine: &OpaEngine,
     ctx: &crate::l7::relay::L7EvalContext,
-    reason: openshell_core::proto::UninspectableTrafficReason,
+    reason: openshell_core::proto::UninspectableNetworkReason,
 ) -> Result<crate::l7::middleware::UninspectableTrafficGate> {
     let input = crate::l7::middleware::middleware_network_input(ctx);
     let (chain, _generation) = opa_engine.query_middleware_chain_with_generation(&input)?;
@@ -2995,7 +2995,7 @@ async fn handle_mediated_connection(
         match middleware_uninspectable_gate(
             &opa_engine,
             &ctx,
-            openshell_core::proto::UninspectableTrafficReason::TlsSkip,
+            openshell_core::proto::UninspectableNetworkReason::TlsSkip,
         )
         .await?
         {
@@ -3256,9 +3256,9 @@ async fn handle_mediated_connection(
             &opa_engine,
             &ctx,
             if tunnel_protocol == TunnelProtocol::H2cPriorKnowledge {
-                openshell_core::proto::UninspectableTrafficReason::H2c
+                openshell_core::proto::UninspectableNetworkReason::H2c
             } else {
-                openshell_core::proto::UninspectableTrafficReason::UnsupportedTunnel
+                openshell_core::proto::UninspectableNetworkReason::UnsupportedTunnel
             },
         )
         .await?;

@@ -846,7 +846,7 @@ async fn handwritten_default_callback_refuses_even_when_fail_open() {
                 context: RequestContext::default(),
                 host: "example.test".into(),
                 port: 443,
-                reason: openshell_core::proto::UninspectableTrafficReason::TlsSkip,
+                reason: openshell_core::proto::UninspectableNetworkReason::TlsSkip,
             },
         )
         .await;

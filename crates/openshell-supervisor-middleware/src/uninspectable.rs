@@ -14,7 +14,7 @@
 use openshell_core::proto::{
     EvaluateUninspectableNetworkRequest, MiddlewareDiagnostics, RequestContext,
     SupervisorMiddlewareOperation as Operation, SupervisorMiddlewarePhase as Phase,
-    UninspectableNetworkDecision, UninspectableTrafficReason,
+    UninspectableNetworkDecision, UninspectableNetworkReason,
 };
 use prost::Message;
 
@@ -33,7 +33,7 @@ pub struct UninspectableTrafficInput {
     pub context: RequestContext,
     pub host: String,
     pub port: u16,
-    pub reason: UninspectableTrafficReason,
+    pub reason: UninspectableNetworkReason,
 }
 
 /// What one entry decided about an uninspectable connection.
@@ -401,7 +401,7 @@ mod tests {
             },
             host: "example.test".into(),
             port: 443,
-            reason: UninspectableTrafficReason::TlsSkip,
+            reason: UninspectableNetworkReason::TlsSkip,
         }
     }
 
@@ -429,7 +429,7 @@ mod tests {
             let calls = service.calls.lock().unwrap();
             assert_eq!(calls.len(), 1);
             assert_eq!(calls[0].middleware_name, "test/guard");
-            assert_eq!(calls[0].reason, UninspectableTrafficReason::TlsSkip as i32);
+            assert_eq!(calls[0].reason, UninspectableNetworkReason::TlsSkip as i32);
             assert_eq!(
                 calls[0].context.as_ref().unwrap().request_id,
                 "connection-1"
