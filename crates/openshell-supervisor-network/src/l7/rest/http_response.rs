@@ -25,6 +25,24 @@ pub struct HttpResponseMiddlewareRelay<'a> {
     pub(crate) client_accepts_chunked: bool,
 }
 
+impl HttpResponseMiddlewareRelay<'_> {
+    /// Whether a session hook stage of this response chain may inspect bodies.
+    ///
+    /// A chain that cannot be described fails when the response arrives, so
+    /// the request is left unchanged.
+    pub(super) async fn inspects_bodies(&self) -> bool {
+        if self.chain.is_empty() {
+            return false;
+        }
+        self.runner
+            .describe_http_response_chain(self.chain)
+            .await
+            .is_ok_and(|described| {
+                openshell_supervisor_middleware::chain_inspects_http_response_bodies(&described)
+            })
+    }
+}
+
 #[derive(Clone)]
 pub(super) struct RelayResponseOptions<'a> {
     pub(super) websocket_extensions: WebSocketExtensionMode,

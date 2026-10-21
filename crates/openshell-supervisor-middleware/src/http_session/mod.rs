@@ -67,6 +67,17 @@ pub fn chain_http_hook_version(entries: &[DescribedChainEntry]) -> ChainHttpHook
     }
 }
 
+/// True when a session hook stage of a described response chain may inspect bodies.
+///
+/// No body mode is offered for an encoded response, so the relay then asks the
+/// upstream for an identity-coded one.
+#[must_use]
+pub fn chain_inspects_http_response_bodies(entries: &[DescribedChainEntry]) -> bool {
+    entries.iter().any(|entry| {
+        entry.http_hook_version() == Some(HttpHookVersion::Session) && entry.max_payload_bytes() > 0
+    })
+}
+
 /// True when `headers` declare a content coding other than `identity`.
 /// Middleware would only see the encoded body.
 fn has_content_coding(headers: &[HttpHeader]) -> bool {

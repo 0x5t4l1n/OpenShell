@@ -69,6 +69,8 @@ To stop the response from reaching the sandbox, return `block_delivery` at prefl
 
 Interim `1xx` responses pass through unchanged. A `101` protocol upgrade skips response middleware.
 
+When a response stage might inspect the body, OpenShell sends `Accept-Encoding: identity` upstream in place of the sandbox's value, so the response arrives uncompressed. Request middleware still sees the sandbox's value. A binding with `max_payload_bytes: 0` never inspects bodies, so it leaves the header unchanged.
+
 ### Body Inspection
 
 OpenShell opens one bidirectional stream per HTTP message and middleware stage. Request and response streams are separate. Each stage receives its preflight after the preceding stage establishes its output headers. For a buffered stage, this happens at `buffered_result`; for a streaming stage, at `output_start`. A stage that continues without inspection passes its updated headers immediately. Later stages therefore choose inspection using the representation they will receive.
@@ -99,6 +101,8 @@ OpenShell removes body modes that cannot safely inspect or transform the message
 | Request or response is not HTTP/1.1 | No additional restriction | No STREAM |
 
 A BUFFERED body that exceeds the selected limit fails closed. OpenShell does not switch it to STREAM. If no mode suits your service, continue without inspection or deny the message with a reason code that says why.
+
+The sandbox chooses a request's content encoding, so a service that must see request bodies should deny an encoded request rather than let it continue. An encoded response means the upstream ignored `Accept-Encoding: identity`.
 
 ### Header and Trailer Changes
 

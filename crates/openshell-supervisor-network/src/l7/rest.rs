@@ -761,6 +761,7 @@ where
             websocket_extensions: WebSocketExtensionMode::Preserve,
             request_body_credential_rewrite: false,
             deny_uninspected_credentials: false,
+            identity_response_coding: false,
             credential_signing: crate::l7::CredentialSigning::None,
             signing_service: "",
             signing_region: "",
@@ -789,6 +790,11 @@ pub(crate) struct RelayRequestOptions<'a> {
     pub(crate) websocket_extensions: WebSocketExtensionMode,
     pub(crate) request_body_credential_rewrite: bool,
     pub(crate) deny_uninspected_credentials: bool,
+    /// Ask the upstream for an identity-coded response.
+    ///
+    /// The relay sets it when an HTTP session hook response stage may inspect
+    /// the body.
+    pub(crate) identity_response_coding: bool,
     pub(crate) credential_signing: crate::l7::CredentialSigning,
     pub(crate) signing_service: &'a str,
     pub(crate) signing_region: &'a str,
@@ -936,6 +942,10 @@ where
 {
     let mut observed_upstream = ObservedUpstream { upstream, observer };
     let upstream = &mut observed_upstream;
+    let mut options = options;
+    if let Some(middleware) = response_middleware.as_ref() {
+        options.identity_response_coding = middleware.inspects_bodies().await;
+    }
     ensure_credential_generation_current(options)?;
     let header_end = req
         .raw_header
@@ -1001,7 +1011,10 @@ where
         options.websocket_extensions,
         websocket_request.is_some(),
     )?;
-    let header_bytes = strip_connection_nominated_headers(&header_bytes, is_websocket_request)?;
+    let mut header_bytes = strip_connection_nominated_headers(&header_bytes, is_websocket_request)?;
+    if options.identity_response_coding {
+        header_bytes = require_identity_response_coding(&header_bytes)?;
+    }
     let websocket_response =
         websocket_request
             .as_ref()
@@ -2389,6 +2402,15 @@ fn strip_connection_nominated_headers(
         out = append_header(&out, "Upgrade", "websocket");
     }
     Ok(out)
+}
+
+/// Replace every `Accept-Encoding` field with `identity`.
+///
+/// A request without the field lets the server choose any content coding, so
+/// the field is set rather than removed.
+fn require_identity_response_coding(headers: &[u8]) -> Result<Vec<u8>> {
+    let headers = strip_header(headers, "accept-encoding")?;
+    Ok(append_header(&headers, "Accept-Encoding", "identity"))
 }
 
 fn append_header(headers: &[u8], name: &str, value: &str) -> Vec<u8> {
@@ -5388,6 +5410,23 @@ mod tests {
         assert!(!sanitized.to_ascii_lowercase().contains("keep-alive:"));
         assert!(!sanitized.to_ascii_lowercase().contains("connection:"));
         assert!(sanitized.contains("X-Visible: yes\r\n"));
+    }
+
+    #[test]
+    fn identity_response_coding_replaces_every_accept_encoding_field() {
+        for raw in [
+            &b"GET /api HTTP/1.1\r\nHost: x\r\nAccept-Encoding: gzip, br\r\naccept-encoding: zstd;q=0.5\r\nX-Visible: yes\r\n\r\n"[..],
+            // Without the field the server may choose any coding.
+            b"GET /api HTTP/1.1\r\nHost: x\r\nX-Visible: yes\r\n\r\n",
+        ] {
+            let rewritten = require_identity_response_coding(raw).expect("rewrite request head");
+            let rewritten = String::from_utf8(rewritten).unwrap();
+
+            assert_eq!(
+                rewritten,
+                "GET /api HTTP/1.1\r\nHost: x\r\nX-Visible: yes\r\nAccept-Encoding: identity\r\n\r\n"
+            );
+        }
     }
 
     #[test]

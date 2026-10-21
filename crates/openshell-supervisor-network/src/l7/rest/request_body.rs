@@ -816,8 +816,12 @@ where
                     let head = commit_live_head(head, &header_mutations, output_body_bytes)
                         .and_then(|head| injected.apply(&head))
                         .map_err(LiveWriteError::Failed)?;
-                    let head = strip_connection_nominated_headers(&head, false)
+                    let mut head = strip_connection_nominated_headers(&head, false)
                         .map_err(LiveWriteError::Failed)?;
+                    if options.identity_response_coding {
+                        head = require_identity_response_coding(&head)
+                            .map_err(LiveWriteError::Failed)?;
+                    }
                     let head = rewrite_http_header_block(&head, options.resolver)
                         .map_err(|error| LiveWriteError::Failed(miette::Report::new(error)))?
                         .rewritten;

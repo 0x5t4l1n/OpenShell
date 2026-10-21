@@ -281,6 +281,7 @@ url = "2"
 nix = { version = "0.29", features = ["process", "signal", "term", "user"] }
 
 [dev-dependencies]
+flate2 = "1"
 serial_test = "3"
 
 [lints.rust]

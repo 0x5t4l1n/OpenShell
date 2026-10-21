@@ -22,7 +22,7 @@ pub use http_session::{
     HttpResponseDelivery, HttpResponsePipelinePreflight, HttpResponsePipelineSession,
     HttpStageDiagnostics, HttpStageInvocation, HttpStageOutcome, MAX_HTTP_REQUEST_WITHHELD_BYTES,
     MAX_HTTP_STREAM_UNIT_BYTES, MIDDLEWARE_CANNOT_INSPECT, MIDDLEWARE_HOOK_VERSIONS_MIXED,
-    MiddlewareFailureDetail, chain_http_hook_version,
+    MiddlewareFailureDetail, chain_http_hook_version, chain_inspects_http_response_bodies,
 };
 
 pub use response::{

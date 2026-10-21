@@ -15,6 +15,9 @@
 //! The test registers the service in the managed gateway config, restarts
 //! the gateway (which describes it), and checks with sandboxes that:
 //! - BUFFERED redacts and denies request and response bodies;
+//! - a response stage inspects the body of a server that compresses, because
+//!   OpenShell asks for an identity-coded response when the workload asks for
+//!   gzip;
 //! - STREAM carries a request body larger than any BUFFERED limit;
 //! - STREAM delivers server-sent events one by one;
 //! - a preflight rejection never contacts the upstream;
@@ -181,14 +184,22 @@ async fn restart_gateway() {
         .expect("gateway healthy with the middleware registered");
 }
 
-/// `(request target, request body)` for every request the upstream served.
-type Received = Arc<Mutex<Vec<(String, Vec<u8>)>>>;
+/// One request the upstream served.
+struct ReceivedRequest {
+    target: String,
+    accept_encoding: Option<String>,
+    body: Vec<u8>,
+}
+
+type Received = Arc<Mutex<Vec<ReceivedRequest>>>;
 
 /// Minimal HTTP/1.1 upstream on the host. It accepts `Content-Length` and
 /// chunked request bodies, and every response closes its connection.
 ///
 /// - `POST /echo` returns the request body.
 /// - `GET /sensitive` and `GET /clean` return fixed text.
+/// - `GET /compressible` returns the `/sensitive` text, gzip-coded when the
+///   request accepts gzip, as a typical server does.
 /// - `GET /events` streams two server-sent events. It sends the second only
 ///   after `POST /ack`, or marks it `late` after a timeout, so a client that
 ///   acknowledges the first event proves it arrived on its own.
@@ -228,7 +239,7 @@ impl Upstream {
             .lock()
             .unwrap()
             .iter()
-            .map(|(target, _)| target.clone())
+            .map(|request| request.target.clone())
             .collect()
     }
 
@@ -237,8 +248,18 @@ impl Upstream {
             .lock()
             .unwrap()
             .iter()
-            .filter(|(received, _)| received == target)
-            .map(|(_, body)| body.clone())
+            .filter(|request| request.target == target)
+            .map(|request| request.body.clone())
+            .collect()
+    }
+
+    fn accept_encodings(&self, target: &str) -> Vec<Option<String>> {
+        self.received
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|request| request.target == target)
+            .map(|request| request.accept_encoding.clone())
             .collect()
     }
 }
@@ -251,7 +272,7 @@ impl Drop for Upstream {
 
 async fn read_request(
     stream: &mut BufReader<TcpStream>,
-) -> std::io::Result<Option<(String, Vec<u8>)>> {
+) -> std::io::Result<Option<ReceivedRequest>> {
     let mut request_line = String::new();
     if stream.read_line(&mut request_line).await? == 0 {
         return Ok(None);
@@ -263,6 +284,7 @@ async fn read_request(
         .to_string();
     let mut length = 0;
     let mut chunked = false;
+    let mut accept_encoding = None;
     loop {
         let mut line = String::new();
         stream.read_line(&mut line).await?;
@@ -276,6 +298,9 @@ async fn read_request(
         }
         if lower.starts_with("transfer-encoding:") && lower.contains("chunked") {
             chunked = true;
+        }
+        if let Some(value) = lower.strip_prefix("accept-encoding:") {
+            accept_encoding = Some(value.trim().to_string());
         }
     }
     let mut body = Vec::new();
@@ -304,7 +329,25 @@ async fn read_request(
         body.resize(length, 0);
         stream.read_exact(&mut body).await?;
     }
-    Ok(Some((target, body)))
+    Ok(Some(ReceivedRequest {
+        target,
+        accept_encoding,
+        body,
+    }))
+}
+
+fn accepts_gzip(accept_encoding: Option<&str>) -> bool {
+    accept_encoding.is_some_and(|value| {
+        value
+            .split(',')
+            .any(|coding| coding.split(';').next().unwrap_or_default().trim() == "gzip")
+    })
+}
+
+fn gzip(data: &[u8]) -> Vec<u8> {
+    let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    encoder.write_all(data).expect("gzip response body");
+    encoder.finish().expect("finish gzip response body")
 }
 
 async fn serve_one(
@@ -313,13 +356,13 @@ async fn serve_one(
     acknowledged: Arc<Notify>,
 ) -> std::io::Result<()> {
     let mut stream = BufReader::new(stream);
-    let Some((target, body)) = read_request(&mut stream).await? else {
+    let Some(request) = read_request(&mut stream).await? else {
         return Ok(());
     };
-    received
-        .lock()
-        .unwrap()
-        .push((target.clone(), body.clone()));
+    let target = request.target.clone();
+    let body = request.body.clone();
+    let compress = target == "/compressible" && accepts_gzip(request.accept_encoding.as_deref());
+    received.lock().unwrap().push(request);
     let mut stream = stream.into_inner();
     if target == "/events" {
         stream
@@ -344,11 +387,16 @@ async fn serve_one(
     }
     let (content_type, response_body) = match target.as_str() {
         "/echo" => ("application/octet-stream", body),
-        "/sensitive" => ("text/plain", SENSITIVE_BODY.as_bytes().to_vec()),
+        "/sensitive" | "/compressible" => ("text/plain", SENSITIVE_BODY.as_bytes().to_vec()),
         _ => ("text/plain", CLEAN_BODY.as_bytes().to_vec()),
     };
+    let (content_encoding, response_body) = if compress {
+        ("Content-Encoding: gzip\r\n", gzip(&response_body))
+    } else {
+        ("", response_body)
+    };
     let head = format!(
-        "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\n{content_encoding}Content-Length: {}\r\nConnection: close\r\n\r\n",
         response_body.len()
     );
     stream.write_all(head.as_bytes()).await?;
@@ -504,6 +552,9 @@ network_policies:
               path: /clean
           - allow:
               method: GET
+              path: /compressible
+          - allow:
+              method: GET
               path: /events
 {PRIVATE_ALLOWED_IPS}
 {tls_skip_endpoint}    binaries:
@@ -525,6 +576,7 @@ const LARGE_UPLOAD_LINES: usize = 600;
 fn workload_script(upstream_port: u16, case: &PolicyCase<'_>) -> String {
     format!(
         r#"
+import gzip
 import http.client
 import json
 import socket
@@ -534,20 +586,26 @@ PORT = {upstream_port}
 TLS_SKIP_PORT = {tls_skip_port}
 STREAM = {stream}
 
-def call(method, path, body=None):
+def call(method, path, body=None, headers=None):
     conn = http.client.HTTPConnection(HOST, PORT, timeout=60)
-    headers = {{"Content-Type": "application/octet-stream"}} if body is not None else {{}}
-    conn.request(method, path, body=body, headers=headers)
+    request_headers = {{"Content-Type": "application/octet-stream"}} if body is not None else {{}}
+    request_headers.update(headers or {{}})
+    conn.request(method, path, body=body, headers=request_headers)
     response = conn.getresponse()
     data = response.read()
+    encoding = response.getheader("Content-Encoding", "")
+    if encoding == "gzip":
+        data = gzip.decompress(data)
     conn.close()
-    return {{"status": response.status, "body": data.decode("latin-1")}}
+    return {{"status": response.status, "body": data.decode("latin-1"), "encoding": encoding}}
 
 results = {{
     "echo_term": call("POST", "/echo", b'{{"note":"prototype-secret"}}'),
     "sensitive": call("GET", "/sensitive"),
     "clean": call("GET", "/clean"),
     "target_term": call("GET", "/clean?q=prototype-secret"),
+    # Ask for gzip by default, as requests, httpx, and fetch do.
+    "compressible": call("GET", "/compressible", headers={{"Accept-Encoding": "gzip, deflate"}}),
 }}
 
 if STREAM:
@@ -701,6 +759,23 @@ async fn http_session_hook_content_guard_runs_against_the_gateway_and_supervisor
         "contains [FILTERED] and [FILTERED]",
     );
     assert_response(&redact, "clean", 200, CLEAN_BODY);
+    // The workload asked for gzip. A response stage that may inspect bodies
+    // makes OpenShell ask for identity instead, so the guard can redact.
+    assert_response(
+        &redact,
+        "compressible",
+        200,
+        "contains [FILTERED] and [FILTERED]",
+    );
+    assert_eq!(redact["compressible"]["encoding"], "", "{redact}");
+    let codings = upstream.accept_encodings("/compressible");
+    assert!(
+        !codings.is_empty()
+            && codings
+                .iter()
+                .all(|coding| coding.as_deref() == Some("identity")),
+        "OpenShell asks the upstream for an identity-coded response: {codings:?}"
+    );
     assert!(
         upstream
             .bodies("/echo")
@@ -735,7 +810,7 @@ async fn http_session_hook_content_guard_runs_against_the_gateway_and_supervisor
         },
     )
     .await;
-    for name in ["echo_term", "sensitive"] {
+    for name in ["echo_term", "sensitive", "compressible"] {
         let body = assert_platform_error(&deny, name, 403, "middleware_denied");
         assert_eq!(body["reason_code"], "content_match", "{name}: {body}");
         assert!(!body.to_string().contains("prototype-secret"), "{body}");

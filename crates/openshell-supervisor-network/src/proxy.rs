@@ -5301,6 +5301,7 @@ where
             websocket_extensions: options.websocket_extensions,
             request_body_credential_rewrite: options.request_body_credential_rewrite,
             deny_uninspected_credentials: options.deny_uninspected_credentials,
+            identity_response_coding: false,
             credential_signing: options.credential_signing,
             signing_service: options.signing_service,
             signing_region: options.signing_region,

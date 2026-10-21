@@ -248,7 +248,11 @@ enum HttpBodyUnavailableReason {
   // Cache-Control no-transform forbids changing the response body.
   HTTP_BODY_UNAVAILABLE_REASON_NO_TRANSFORM = 3;
   // The request or response body has a content coding other than identity.
-  // Middleware would only see the encoded bytes.
+  // Middleware would only see the encoded bytes. The sandbox chooses a
+  // request's coding, so a stage that must see request bodies denies an
+  // encoded one. When a response stage may select a body mode, OpenShell
+  // sends Accept-Encoding: identity upstream, so an encoded response means
+  // the upstream ignored it.
   HTTP_BODY_UNAVAILABLE_REASON_ENCODED = 4;
   // The declared body length exceeds the stage's payload limit.
   HTTP_BODY_UNAVAILABLE_REASON_OVER_LIMIT = 5;

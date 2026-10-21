@@ -737,6 +737,7 @@ where
                 && config.request_body_credential_rewrite,
             deny_uninspected_credentials: config
                 .deny_uninspected_body_credentials(ctx.secret_resolver.is_some()),
+            identity_response_coding: false,
             credential_signing: config.credential_signing,
             signing_service: &config.signing_service,
             signing_region: &config.signing_region,
@@ -12162,6 +12163,255 @@ network_policies:
                 assert!(response.starts_with("HTTP/1.1 403"), "{response}");
                 assert!(response.contains("body_over_limit"), "{response}");
             }
+        }
+    }
+
+    /// Session hook service whose response stage continues without the body.
+    ///
+    /// The response binding advertises `response_payload_bytes`, and 0 offers
+    /// the stage no body mode. With `stream_request`, a
+    /// [`SessionEchoRequestStage`] streams the request body, so the request
+    /// takes the live body path.
+    struct ResponseCodingStage {
+        stream_request: bool,
+        response_payload_bytes: u64,
+    }
+
+    #[tonic::async_trait]
+    impl openshell_core::middleware::InProcessMiddleware for ResponseCodingStage {
+        async fn describe(&self) -> openshell_core::proto::MiddlewareManifest {
+            use openshell_core::proto::{
+                MiddlewareBinding, SupervisorMiddlewareOperation, SupervisorMiddlewarePhase,
+            };
+            let mut bindings = vec![MiddlewareBinding {
+                operation: SupervisorMiddlewareOperation::HttpResponse as i32,
+                phase: SupervisorMiddlewarePhase::PreReturn as i32,
+                max_payload_bytes: self.response_payload_bytes,
+                request_timeout: None,
+            }];
+            if self.stream_request {
+                bindings.push(MiddlewareBinding {
+                    operation: SupervisorMiddlewareOperation::HttpRequest as i32,
+                    phase: SupervisorMiddlewarePhase::PreCredentials as i32,
+                    max_payload_bytes: 4096,
+                    request_timeout: None,
+                });
+            }
+            openshell_core::proto::MiddlewareManifest {
+                name: "test/session-echo".into(),
+                service_version: "test".into(),
+                bindings,
+                expected_audience: String::new(),
+                extension: Some(
+                    openshell_core::extension_protocol::http_session_middleware_metadata(
+                        "openshell/test-session-echo",
+                        "test",
+                    ),
+                ),
+            }
+        }
+
+        async fn validate_config(
+            &self,
+            _middleware_name: &str,
+            _config: &prost_types::Struct,
+        ) -> Result<()> {
+            Ok(())
+        }
+
+        async fn evaluate_http_request(
+            &self,
+            _request: openshell_core::middleware::HttpRequestView<'_>,
+        ) -> Result<openshell_core::proto::HttpRequestResult> {
+            Err(miette!("HTTP session hook test stage"))
+        }
+
+        async fn open_http_request_session(
+            &self,
+            events: tokio::sync::mpsc::Receiver<openshell_core::proto::HttpRequestSessionEvent>,
+        ) -> std::result::Result<
+            openshell_core::middleware::HttpRequestSessionResultStream,
+            tonic::Status,
+        > {
+            SessionEchoRequestStage {
+                drop_body: false,
+                reject: false,
+                preflights: Arc::default(),
+            }
+            .open_http_request_session(events)
+            .await
+        }
+
+        async fn open_http_response_session(
+            &self,
+            mut events: tokio::sync::mpsc::Receiver<
+                openshell_core::proto::HttpResponseSessionEvent,
+            >,
+        ) -> std::result::Result<
+            openshell_core::middleware::HttpResponseSessionResultStream,
+            tonic::Status,
+        > {
+            use openshell_core::proto::{
+                HttpContinue, HttpPreflightResult, HttpResponseSessionResult,
+                http_preflight_result, http_response_session_event, http_response_session_result,
+            };
+            let (sender, receiver) = tokio::sync::mpsc::channel(4);
+            tokio::spawn(async move {
+                while let Some(event) = events.recv().await {
+                    if let Some(http_response_session_event::Event::Preflight(_)) = event.event {
+                        let result = http_response_session_result::Result::PreflightResult(
+                            HttpPreflightResult {
+                                decision: Some(
+                                    http_preflight_result::Decision::ContinueWithoutBody(
+                                        HttpContinue {},
+                                    ),
+                                ),
+                                ..Default::default()
+                            },
+                        );
+                        let _ = sender
+                            .send(Ok(HttpResponseSessionResult {
+                                result: Some(result),
+                            }))
+                            .await;
+                    }
+                }
+            });
+            Ok(Box::pin(tokio_stream::wrappers::ReceiverStream::new(
+                receiver,
+            )))
+        }
+    }
+
+    #[tokio::test]
+    async fn request_asks_for_identity_coding_when_a_response_stage_can_inspect_bodies() {
+        let data = r#"
+network_middlewares:
+  coding:
+    middleware: test/session-echo
+    on_error: fail_closed
+    endpoints:
+      include: ["api.example.test"]
+network_policies:
+  rest_api:
+    name: rest_api
+    endpoints:
+      - host: api.example.test
+        port: 8080
+        protocol: rest
+        enforcement: enforce
+        rules:
+          - allow:
+              method: POST
+              path: "/v1/**"
+    binaries:
+      - { path: /usr/bin/curl }
+"#;
+        let sandbox_codings = ["gzip, br", "deflate"];
+        for (name, stream_request, response_payload_bytes, forwarded_codings) in [
+            ("buffered, inspecting", false, 4096, &["identity"][..]),
+            ("streamed, inspecting", true, 4096, &["identity"][..]),
+            // A stage with no body mode inspects nothing, so the sandbox's
+            // preference stands.
+            ("buffered, headers only", false, 0, &sandbox_codings[..]),
+            ("streamed, headers only", true, 0, &sandbox_codings[..]),
+        ] {
+            let engine = OpaEngine::from_strings(TEST_POLICY, data).expect("test policy");
+            engine.set_middleware_runner_for_tests(
+                openshell_supervisor_middleware::ChainRunner::new(Arc::new(ResponseCodingStage {
+                    stream_request,
+                    response_payload_bytes,
+                })),
+            );
+            let input = NetworkInput {
+                host: "api.example.test".into(),
+                port: 8080,
+                binary_path: PathBuf::from("/usr/bin/curl"),
+                binary_sha256: "unused".into(),
+                ancestors: vec![],
+                cmdline_paths: vec![],
+            };
+            let (endpoint_config, generation) = engine
+                .query_endpoint_config_with_generation(&input)
+                .expect("endpoint config");
+            let config = crate::l7::parse_l7_config(&endpoint_config.expect("configured endpoint"))
+                .expect("REST config");
+            let tunnel_engine = engine
+                .clone_engine_for_tunnel(generation)
+                .expect("tunnel engine");
+            let ctx = L7EvalContext {
+                host: "api.example.test".into(),
+                port: 8080,
+                request_default_port: Some(8080),
+                policy_name: "rest_api".into(),
+                binary_path: "/usr/bin/curl".into(),
+                ..Default::default()
+            };
+            let (mut app, mut relay_client) = tokio::io::duplex(8192);
+            let (mut relay_upstream, mut upstream) = tokio::io::duplex(8192);
+            let relay = tokio::spawn(async move {
+                relay_rest(
+                    &config,
+                    &tunnel_engine,
+                    &mut relay_client,
+                    &mut relay_upstream,
+                    &ctx,
+                )
+                .await
+            });
+            app.write_all(
+                b"POST /v1/items HTTP/1.1\r\nHost: api.example.test\r\nAccept-Encoding: gzip, br\r\nAccept-Encoding: deflate\r\nContent-Length: 5\r\n\r\nhello",
+            )
+            .await
+            .expect("send request");
+
+            let mut forwarded = Vec::new();
+            let mut response = Vec::new();
+            tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                let mut buffer = [0u8; 512];
+                while forwarded
+                    .windows(4)
+                    .position(|window| window == b"\r\n\r\n")
+                    .is_none_or(|end| forwarded.len() < end + 4 + 5)
+                {
+                    let count = upstream.read(&mut buffer).await.unwrap();
+                    assert!(count > 0, "{name}: upstream closed early");
+                    forwarded.extend_from_slice(&buffer[..count]);
+                }
+                upstream
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+                    )
+                    .await
+                    .unwrap();
+                app.read_to_end(&mut response).await.unwrap();
+            })
+            .await
+            .unwrap_or_else(|_| panic!("{name}: relay stalled"));
+            drop(app);
+            relay
+                .await
+                .expect("join REST relay")
+                .expect("REST relay result");
+
+            let forwarded = String::from_utf8(forwarded).unwrap();
+            let (head, body) = forwarded
+                .split_once("\r\n\r\n")
+                .unwrap_or_else(|| panic!("{name}: no forwarded head: {forwarded}"));
+            assert_eq!(body, "hello", "{name}");
+            let codings = head
+                .lines()
+                .filter_map(|line| {
+                    let (field, value) = line.split_once(':')?;
+                    field
+                        .eq_ignore_ascii_case("accept-encoding")
+                        .then(|| value.trim())
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(codings, forwarded_codings, "{name}: {head}");
+            let response = String::from_utf8(response).unwrap();
+            assert!(response.starts_with("HTTP/1.1 200"), "{name}: {response}");
+            assert!(response.ends_with("\r\n\r\nok"), "{name}: {response}");
         }
     }
 
