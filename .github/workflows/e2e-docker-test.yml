@@ -100,6 +100,9 @@ jobs:
       - name: Log in to GHCR
         run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${GITHUB_ACTOR}" --password-stdin
 
+      - name: Install pinned uv
+        run: mise install --locked uv
+
       - name: Install Python dependencies and generate protobuf stubs
         if: matrix.python_proto
         run: uv sync --frozen && mise run --no-deps python:proto
