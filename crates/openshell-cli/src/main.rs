@@ -504,6 +504,8 @@ struct Cli {
 }
 
 #[derive(Subcommand, Debug)]
+// Parsed once at startup; keep the Clap command tree inline.
+#[allow(clippy::large_enum_variant)]
 enum Commands {
     // ===================================================================
     // SANDBOX COMMANDS

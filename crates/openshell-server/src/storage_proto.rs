@@ -157,11 +157,11 @@ mod tests {
     // closures and TokenGrantStatus to public reports. Older rows have no grant
     // record; absent report extensions retain compatibility without a rewrite.
     const PUBLIC_RPC_SCHEMA_SHA256: &str =
-        "e79949fc56607199a9c58b5cd07be41f7c8f54f79e872f2da08e4a2e685a8d04";
+        "ac5872f225f4ca2fe8b8215f7055770abc6734279bb0bbbbbccb653a89260601";
     const DURABLE_SCHEMA_SHA256: &str =
-        "6a546dd04f8bcf580a187b82418da8b1fb35314db496e26855ba6543084ff273";
+        "858d46aad42e85626a87b707d2955190e51e5df3cef891e801ca3412819cb7c2";
     const PUBLIC_DURABLE_OVERLAP_SHA256: &str =
-        "4710c85fc70c7049abd35952bedbc271d614166af27984d27e22af567ae6cf02";
+        "8ed75a4afe7204dd7489ed102a962086f9107e40d328ff87dd985852032c4591";
     // Encoded with the schema that omitted stable_placeholder. Keep these
     // bytes fixed so the current encoder cannot hide a compatibility change.
     const LEGACY_STATIC_PROFILE: &str = "0a240a116c65676163792d70726f66696c652d6964120d6c65676163792d737461746963280712510a0d6c65676163792d73746174696312184c6567616379207374617469632063726564656e7469616c2a260a076170695f6b65791a1153594e5448455449435f4150495f4b455920012a06626561726572";
