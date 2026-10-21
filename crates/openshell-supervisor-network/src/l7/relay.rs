@@ -667,6 +667,10 @@ where
         observation_context,
         mut live_body,
     } = forwarding;
+    // Response middleware sees the head request middleware forwarded, recorded
+    // before credentials are injected.
+    let request_head =
+        crate::l7::middleware::ForwardedRequestHead::of(&request, live_body.as_deref());
     let (request, grant_ctx, injected) = match prepare_inspected_request(
         request,
         ctx,
@@ -748,6 +752,7 @@ where
         live_body,
         Some(http_response_middleware_relay(
             &request,
+            request_head,
             ctx,
             "https",
             request_id,
@@ -964,8 +969,12 @@ fn request_body_delivery(config: &L7EndpointConfig) -> RequestBodyDelivery {
     }
 }
 
+/// The response relay for `request`, which may already carry credentials.
+/// Response stages receive `request_head`, recorded before injection.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn http_response_middleware_relay<'a>(
     request: &crate::l7::provider::L7Request,
+    request_head: crate::l7::middleware::ForwardedRequestHead,
     ctx: &'a L7EvalContext,
     scheme: &str,
     request_id: &str,
@@ -989,6 +998,7 @@ pub(crate) fn http_response_middleware_relay<'a>(
         generation_guard,
         whole_body_timeout: super::rest::DEFAULT_HTTP_RESPONSE_WHOLE_BODY_TIMEOUT,
         client_accepts_chunked: crate::l7::middleware::request_line_is_http11(&request.raw_header),
+        request_head: Some(request_head),
     }
 }
 
@@ -7725,6 +7735,7 @@ network_policies:
         let chain = Vec::new();
         let response = http_response_middleware_relay(
             &req,
+            crate::l7::middleware::ForwardedRequestHead::new(&req),
             &ctx,
             "https",
             "exchange-123",

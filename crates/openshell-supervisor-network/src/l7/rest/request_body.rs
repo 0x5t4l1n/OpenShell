@@ -789,6 +789,7 @@ where
     U: AsyncWrite + Unpin,
 {
     let injected = body.take_injected_headers();
+    let forwarded_head = body.forwarded_head().clone();
     // Chunked input may end with trailers, which only chunked output carries.
     let input_chunked = body.input_is_chunked();
     let (sender, mut receiver) = tokio::sync::mpsc::channel(4);
@@ -815,6 +816,9 @@ where
                     let output_body_bytes = output_body_bytes.filter(|_| !input_chunked);
                     let head = commit_live_head(head, &header_mutations, output_body_bytes)
                         .and_then(|head| injected.apply(&head))
+                        .map_err(LiveWriteError::Failed)?;
+                    forwarded_head
+                        .commit(&header_mutations)
                         .map_err(LiveWriteError::Failed)?;
                     let mut head = strip_connection_nominated_headers(&head, false)
                         .map_err(LiveWriteError::Failed)?;

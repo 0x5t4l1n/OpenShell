@@ -107,6 +107,20 @@ where
     let status_line = response_status_line(&buffered[..header_end])?;
     let chunked = middleware.client_accepts_chunked && !status_line.starts_with("HTTP/1.0 ");
     let original_headers = parsed.headers.clone();
+    // Stages see the request head that request middleware forwarded, never
+    // the forwarded request with its credentials. Without it they fail closed.
+    let request_headers = match middleware
+        .request_head
+        .as_ref()
+        .map(crate::l7::middleware::ForwardedRequestHead::visible_headers)
+    {
+        Some(Ok(headers)) => Some(headers),
+        Some(Err(error)) => {
+            debug!(error = %error, "Forwarded request head cannot be shown to response middleware");
+            None
+        }
+        None => None,
+    };
     let input = openshell_supervisor_middleware::HttpResponsePreflightInput {
         context: middleware.request_context.clone(),
         target: middleware.target.clone(),
@@ -117,12 +131,13 @@ where
         },
         headers: parsed.headers.clone(),
         connection_nominated_headers: parsed.connection_nominated.clone(),
+        request_headers: request_headers.clone().unwrap_or_default(),
     };
     let delivery = HttpResponseDelivery {
         buffered_body_timeout: middleware.whole_body_timeout,
         ..HttpResponseDelivery::new(chunked)
     };
-    let preflight = if parsed.representable {
+    let preflight = if parsed.representable && request_headers.is_some() {
         middleware
             .runner
             .preflight_http_response_pipeline(described, input, delivery)

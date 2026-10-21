@@ -170,6 +170,8 @@ struct ScriptedStage {
     begun: Arc<Mutex<Vec<Vec<HttpHeader>>>>,
     /// Preflights this stage received.
     preflights: Arc<Mutex<Vec<HttpRequestSessionPreflight>>>,
+    /// Request headers each response preflight carried.
+    response_request_headers: Arc<Mutex<Vec<Vec<HttpHeader>>>>,
 }
 
 impl ScriptedStage {
@@ -186,6 +188,7 @@ impl ScriptedStage {
             ended: Arc::default(),
             begun: Arc::default(),
             preflights: Arc::default(),
+            response_request_headers: Arc::default(),
         }
     }
 
@@ -428,12 +431,17 @@ impl InProcessMiddleware for ScriptedStage {
             HttpResponseSessionResult, http_response_session_event::Event as E,
             http_response_session_result::Result as R,
         };
+        let response_request_headers = Arc::clone(&self.response_request_headers);
         let (sender, receiver) = mpsc::channel(4);
         tokio::spawn(async move {
             while let Some(event) = events.recv().await {
                 let event = event.event.map(|event| match event {
                     E::Preflight(p) => {
                         let response = p.response.unwrap();
+                        response_request_headers
+                            .lock()
+                            .unwrap()
+                            .push(response.request_headers.clone());
                         http_request_session_event::Event::Preflight(HttpRequestSessionPreflight {
                             request: Some(openshell_core::proto::HttpRequestPreflightHead {
                                 target: response.target,
@@ -1303,6 +1311,7 @@ async fn run_response(
                 headers: request.headers,
                 declared_body_length: request.declared_body_length,
                 connection_nominated_headers: Vec::new(),
+                request_headers: Vec::new(),
             },
             crate::HttpResponseDelivery::new(true),
         )
@@ -1672,4 +1681,51 @@ async fn cancellation_closes_only_opened_stages_and_releases_capacity() {
             MAX_CONCURRENT_HTTP_MIDDLEWARE_STREAMS
         )
     );
+}
+
+#[tokio::test]
+async fn response_preflight_carries_request_headers_within_head_limits() {
+    let header = |name: &str, value: String| HttpHeader {
+        name: name.into(),
+        value,
+    };
+    let within = vec![header("content-type", "application/json".into())];
+    let over: Vec<_> = (0..=crate::MAX_MIDDLEWARE_HEADERS)
+        .map(|index| header("x-extra", index.to_string()))
+        .collect();
+    for (case, request_headers, allowed) in [("within", within, true), ("over", over, false)] {
+        let stage = scripted("example/a", Preflight::Continue, Body::Unchanged);
+        let (runner, described) = scripted_chain(vec![Arc::clone(&stage)]).await;
+        let request = request_input(b"");
+        let preflight = runner
+            .preflight_http_response_pipeline(
+                described,
+                crate::HttpResponsePreflightInput {
+                    context: request.context,
+                    target: request.target,
+                    status_code: 200,
+                    headers: Vec::new(),
+                    declared_body_length: Some(0),
+                    connection_nominated_headers: Vec::new(),
+                    request_headers: request_headers.clone(),
+                },
+                crate::HttpResponseDelivery::new(true),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(preflight.allowed, allowed, "{case}: {}", preflight.reason);
+        let seen = stage.response_request_headers.lock().unwrap().clone();
+        if allowed {
+            assert_eq!(seen, [request_headers], "{case}");
+        } else {
+            // Over the head limits, the chain fails closed before any stage.
+            assert!(seen.is_empty(), "{case}");
+            assert_eq!(
+                preflight.failure.map(|failure| failure.code),
+                Some(HttpFailureCode::CannotInspect),
+                "{case}"
+            );
+        }
+    }
 }

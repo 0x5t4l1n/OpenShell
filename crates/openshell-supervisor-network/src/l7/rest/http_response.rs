@@ -23,6 +23,10 @@ pub struct HttpResponseMiddlewareRelay<'a> {
     /// The client request used HTTP/1.1, so an HTTP session hook response may
     /// be re-framed chunked. An HTTP/1.0 client cannot decode chunked framing.
     pub(crate) client_accepts_chunked: bool,
+    /// The request head as request middleware forwarded it, before
+    /// credentials. HTTP session hook response stages receive its headers, and
+    /// fail closed without it.
+    pub(crate) request_head: Option<crate::l7::middleware::ForwardedRequestHead>,
 }
 
 impl HttpResponseMiddlewareRelay<'_> {
@@ -426,6 +430,8 @@ where
         },
         headers: parsed.headers,
         connection_nominated_headers: parsed.connection_nominated,
+        // v1 response hooks do not receive request headers.
+        request_headers: Vec::new(),
     };
     let preflight_result = if parsed.representable {
         middleware

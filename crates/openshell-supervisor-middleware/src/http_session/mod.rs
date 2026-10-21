@@ -100,7 +100,15 @@ fn validate_head_input(
 ) -> Result<(), &'static str> {
     if context.encoded_len() > MAX_MIDDLEWARE_CONTEXT_BYTES
         || target.encoded_len() > MAX_MIDDLEWARE_TARGET_BYTES
-        || headers.len() > MAX_MIDDLEWARE_HEADERS
+    {
+        return Err("head_input_over_capacity");
+    }
+    validate_header_input(headers)
+}
+
+/// Platform limits on one header list shown to every stage.
+fn validate_header_input(headers: &[HttpHeader]) -> Result<(), &'static str> {
+    if headers.len() > MAX_MIDDLEWARE_HEADERS
         || headers
             .iter()
             .map(prost::Message::encoded_len)

@@ -75,6 +75,10 @@ pub struct HttpResponsePreflightInput {
     /// Lowercased names nominated by the original response's `Connection`
     /// fields. Their values are not exposed to middleware.
     pub connection_nominated_headers: Vec<String>,
+    /// Sanitized headers of the request this response answers, as request
+    /// middleware forwarded them before credentials. Only HTTP session hook
+    /// stages receive them.
+    pub request_headers: Vec<HttpHeader>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1801,6 +1805,7 @@ mod tests {
                 value: "text/plain".into(),
             }],
             connection_nominated_headers: Vec::new(),
+            request_headers: Vec::new(),
         }
     }
 

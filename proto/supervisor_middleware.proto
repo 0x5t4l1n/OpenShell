@@ -352,8 +352,9 @@ message HttpResponseSessionPreflight {
   HttpResponsePreflightHead response = 1;
   // Phase of the HTTP_RESPONSE binding this stream serves: PRE_RETURN.
   SupervisorMiddlewarePhase phase = 2;
-  // Sandbox, request, and originating process identity. Limited to 4 KiB
-  // encoded.
+  // Sandbox, request, and originating process identity. request_id matches
+  // the request preflights of the request this response answers. Limited to
+  // 4 KiB encoded.
   RequestContext context = 3;
   // Built-in middleware name or operator-owned registration name.
   string middleware_name = 4;
@@ -394,6 +395,14 @@ message HttpResponsePreflightHead {
   // Credential, routing, and hop-by-hop headers are omitted. Limited to 128
   // lines and 64 KiB encoded.
   repeated HttpHeader headers = 3;
+  // Headers of the request this response answers, as the request middleware
+  // chain forwarded them: after every request stage's mutations and before
+  // OpenShell adds credentials or makes its own forwarding changes, such as
+  // sending Accept-Encoding: identity. In wire order, with the omissions and
+  // limits of HttpRequestPreflightHead.headers.
+  // A value that contains an OpenShell credential placeholder reads
+  // [REDACTED].
+  repeated HttpHeader request_headers = 4;
 }
 
 // Limits for one stage exchange. max_buffered_body_bytes is 0 unless BUFFERED

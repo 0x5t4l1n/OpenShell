@@ -37,7 +37,7 @@ use super::pipeline::{
     MiddlewareFailureDetail, Pipeline, PipelineSpec, PipelineTimeouts, PreflightFields, StageHead,
     StagePreflight,
 };
-use super::{has_content_coding, validate_head_input};
+use super::{has_content_coding, validate_head_input, validate_header_input};
 use crate::headers::HeaderAuthority;
 use crate::{
     ChainRunner, DescribedChainEntry, HttpResponsePreflightInput, MAX_MIDDLEWARE_CHAIN_TIMEOUT,
@@ -254,6 +254,7 @@ impl StageHead for ResponseHead {
             target: Some(self.input.target.clone()),
             status_code: u32::from(self.input.status_code),
             headers: headers.to_vec(),
+            request_headers: self.input.request_headers.clone(),
         })
     }
 
@@ -329,7 +330,9 @@ impl ChainRunner {
         if described.is_empty() {
             return Ok(outcome(input.headers, HttpStageDiagnostics::default()));
         }
-        if let Err(reason) = validate_head_input(&input.context, &input.target, &input.headers) {
+        if let Err(reason) = validate_head_input(&input.context, &input.target, &input.headers)
+            .and_then(|()| validate_header_input(&input.request_headers))
+        {
             return Ok(chain_failure(&described, input.headers, reason));
         }
         let chain_deadline = Instant::now() + MAX_MIDDLEWARE_CHAIN_TIMEOUT;
@@ -507,6 +510,7 @@ mod tests {
                 })
                 .collect(),
             connection_nominated_headers: Vec::new(),
+            request_headers: Vec::new(),
         }
     }
 

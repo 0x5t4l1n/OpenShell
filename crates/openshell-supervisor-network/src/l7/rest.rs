@@ -2428,7 +2428,10 @@ fn append_header(headers: &[u8], name: &str, value: &str) -> Vec<u8> {
     out
 }
 
-fn apply_header_mutations(headers: &[u8], mutations: &[HeaderMutation]) -> Result<Vec<u8>> {
+pub(crate) fn apply_header_mutations(
+    headers: &[u8],
+    mutations: &[HeaderMutation],
+) -> Result<Vec<u8>> {
     let mut out = headers.to_vec();
     for mutation in mutations {
         match mutation.operation.as_ref() {
@@ -7008,7 +7011,21 @@ mod tests {
             generation_guard: None,
             whole_body_timeout: DEFAULT_HTTP_RESPONSE_WHOLE_BODY_TIMEOUT,
             client_accepts_chunked: true,
+            request_head: Some(forwarded_request_head(&format!(
+                "{method} /data HTTP/1.1\r\nHost: example.test\r\n\r\n"
+            ))),
         }
+    }
+
+    /// The forwarded head of a request whose raw head is `raw`.
+    fn forwarded_request_head(raw: &str) -> crate::l7::middleware::ForwardedRequestHead {
+        crate::l7::middleware::ForwardedRequestHead::new(&L7Request {
+            action: "GET".into(),
+            target: "/data".into(),
+            query_params: HashMap::new(),
+            raw_header: raw.as_bytes().to_vec(),
+            body_length: BodyLength::None,
+        })
     }
 
     async fn run_response_middleware_relay(
@@ -7315,13 +7332,15 @@ mod tests {
     /// declares `declared` output bytes. A stage that declares an empty output
     /// emits nothing. With `gate`, it waits after the first byte of each input
     /// chunk. It rejects at `input_end` when `reject` is set. `output_start`
-    /// carries `late_mutations`.
+    /// carries `late_mutations`. With `captured_request_headers`, it records
+    /// the request headers its preflight carries.
     #[derive(Default)]
     struct SessionEchoStage {
         declared: Option<u64>,
         reject: bool,
         gate: Option<ResponseBodyGate>,
         late_mutations: Vec<HeaderMutation>,
+        captured_request_headers: Option<Arc<std::sync::Mutex<Option<Vec<HttpHeader>>>>>,
     }
 
     async fn emit_session_result(
@@ -7389,11 +7408,16 @@ mod tests {
             };
             let (declared, reject, gate) = (self.declared, self.reject, self.gate.clone());
             let late_mutations = self.late_mutations.clone();
+            let captured_request_headers = self.captured_request_headers.clone();
             let (sender, receiver) = mpsc::channel(4);
             tokio::spawn(async move {
                 while let Some(event) = events.recv().await {
                     let sent = match event.event {
-                        Some(http_response_session_event::Event::Preflight(_)) => {
+                        Some(http_response_session_event::Event::Preflight(preflight)) => {
+                            if let Some(captured) = &captured_request_headers {
+                                *captured.lock().expect("preflight capture lock") =
+                                    preflight.response.map(|response| response.request_headers);
+                            }
                             emit_session_result(
                                 &sender,
                                 http_response_session_result::Result::PreflightResult(
@@ -7537,6 +7561,97 @@ mod tests {
             );
             assert!(delivered.ends_with(expected_end), "{name}: {delivered}");
         }
+    }
+
+    #[tokio::test]
+    async fn session_response_preflight_carries_forwarded_request_headers() {
+        let captured = Arc::new(std::sync::Mutex::new(None));
+        let (runner, chain) = session_echo_fixture(SessionEchoStage {
+            declared: Some(5),
+            captured_request_headers: Some(Arc::clone(&captured)),
+            ..Default::default()
+        });
+        let mut context = response_middleware_context(&runner, &chain, "POST");
+        // The head as request middleware forwarded it, before credentials,
+        // with its inline body.
+        context.request_head = Some(forwarded_request_head(
+            "POST /data HTTP/1.1\r\n\
+             Host: example.test\r\n\
+             Content-Type: application/json\r\n\
+             Authorization: Bearer sandbox-token\r\n\
+             Cookie: session=secret\r\n\
+             X-Api-Key: openshell:resolve:env:API_KEY\r\n\
+             X-Trace: one\r\n\
+             X-Trace: two\r\n\
+             Content-Length: 2\r\n\r\n{}",
+        ));
+        let response = b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello";
+        let mut upstream = response.as_slice();
+        let mut delivered = Vec::new();
+
+        relay_response(
+            "POST",
+            &mut upstream,
+            &mut delivered,
+            RelayResponseOptions::default(),
+            Some(context),
+        )
+        .await
+        .expect("response relay");
+
+        let observed = captured
+            .lock()
+            .expect("preflight capture lock")
+            .clone()
+            .expect("stage received a response preflight");
+        assert_eq!(
+            observed
+                .iter()
+                .map(|header| (header.name.as_str(), header.value.as_str()))
+                .collect::<Vec<_>>(),
+            [
+                ("content-type", "application/json"),
+                ("x-api-key", "[REDACTED]"),
+                ("x-trace", "one"),
+                ("x-trace", "two"),
+            ]
+        );
+        assert!(delivered.ends_with(b"\r\n\r\nhello"));
+    }
+
+    #[tokio::test]
+    async fn session_response_without_forwarded_request_head_fails_closed() {
+        let captured = Arc::new(std::sync::Mutex::new(None));
+        let (runner, chain) = session_echo_fixture(SessionEchoStage {
+            captured_request_headers: Some(Arc::clone(&captured)),
+            ..Default::default()
+        });
+        let mut context = response_middleware_context(&runner, &chain, "GET");
+        context.request_head = None;
+        let response = b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello";
+        let mut upstream = response.as_slice();
+        let mut delivered = Vec::new();
+
+        let outcome = relay_response(
+            "GET",
+            &mut upstream,
+            &mut delivered,
+            RelayResponseOptions::default(),
+            Some(context),
+        )
+        .await;
+
+        assert!(matches!(outcome.unwrap(), RelayOutcome::Consumed));
+        assert!(captured.lock().expect("preflight capture lock").is_none());
+        let delivered = String::from_utf8(delivered).unwrap();
+        assert!(
+            delivered.starts_with("HTTP/1.1 502 Bad Gateway\r\n"),
+            "{delivered}"
+        );
+        assert!(
+            delivered.contains("middleware_cannot_inspect"),
+            "{delivered}"
+        );
     }
 
     #[tokio::test]

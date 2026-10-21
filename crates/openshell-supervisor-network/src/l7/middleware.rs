@@ -7,6 +7,7 @@ use crate::l7::relay::L7EvalContext;
 use crate::opa::PolicyGenerationGuard;
 use miette::{IntoDiagnostic, Result, miette};
 use openshell_core::proto::MiddlewareSessionEndReason;
+use openshell_core::secrets;
 use openshell_ocsf::{
     ActionId, ActivityId, DetectionFindingBuilder, DispositionId, Endpoint, FindingInfo,
     HttpActivityBuilder, HttpRequest, NetworkActivityBuilder, SeverityId, StatusId, Url as OcsfUrl,
@@ -19,6 +20,7 @@ use openshell_supervisor_middleware::{
 };
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::mpsc;
@@ -122,6 +124,74 @@ impl RequestBodyDelivery {
     }
 }
 
+/// Request head as the request middleware chain forwarded it, before
+/// credentials are injected. HTTP session hook response stages receive its
+/// visible headers.
+///
+/// Record it from a request that does not carry credentials yet. A live body
+/// applies its late mutations when its head commits, which happens before the
+/// upstream can answer.
+#[derive(Clone, Debug)]
+pub struct ForwardedRequestHead(Arc<ForwardedHead>);
+
+#[derive(Debug)]
+struct ForwardedHead {
+    /// Head after every request stage's mutations, except a live body's late
+    /// mutations.
+    head: Vec<u8>,
+    /// A live head after its late mutations, once it commits.
+    committed: OnceLock<Vec<u8>>,
+}
+
+impl ForwardedRequestHead {
+    /// Record the head of `request`, ignoring any inline body.
+    pub fn new(request: &crate::l7::provider::L7Request) -> Self {
+        let head = &request.raw_header[..request_header_end(&request.raw_header)];
+        Self(Arc::new(ForwardedHead {
+            head: head.to_vec(),
+            committed: OnceLock::new(),
+        }))
+    }
+
+    /// The forwarded head of a request that request middleware returned. A
+    /// live body keeps its own record, which its late mutations complete.
+    pub(crate) fn of(
+        request: &crate::l7::provider::L7Request,
+        live_body: Option<&RequestBodyStream>,
+    ) -> Self {
+        live_body.map_or_else(|| Self::new(request), |body| body.forwarded_head.clone())
+    }
+
+    /// Apply a live body's late mutations when its head commits.
+    pub(crate) fn commit(
+        &self,
+        late_mutations: &[openshell_core::proto::HeaderMutation],
+    ) -> Result<()> {
+        let committed = crate::l7::rest::apply_header_mutations(&self.0.head, late_mutations)?;
+        let _ = self.0.committed.set(committed);
+        Ok(())
+    }
+
+    /// Headers shown to response middleware, with the omissions of the request
+    /// preflight. A value that carries a credential placeholder reads
+    /// `[REDACTED]`, as in the response target's query.
+    pub(crate) fn visible_headers(&self) -> Result<Vec<openshell_core::proto::HttpHeader>> {
+        let head = self.0.committed.get().unwrap_or(&self.0.head);
+        Ok(safe_middleware_headers(head)?
+            .visible
+            .into_iter()
+            .map(|(name, value)| openshell_core::proto::HttpHeader {
+                name,
+                value: if secrets::contains_reserved_credential_marker(&value) {
+                    "[REDACTED]".to_string()
+                } else {
+                    value
+                },
+            })
+            .collect())
+    }
+}
+
 /// One destination-selected middleware chain shared by an HTTP request and
 /// its matching response. The request and response phases filter bindings
 /// independently, so the full chain must remain available until relay ends.
@@ -131,6 +201,9 @@ pub struct HttpMiddlewareExchange {
     chain: Vec<openshell_supervisor_middleware::ChainEntry>,
     runner: openshell_supervisor_middleware::ChainRunner,
     generation_guard: PolicyGenerationGuard,
+    /// Recorded when request middleware allows the request, before the caller
+    /// injects credentials.
+    forwarded_head: Arc<OnceLock<ForwardedRequestHead>>,
 }
 
 impl HttpMiddlewareExchange {
@@ -145,6 +218,7 @@ impl HttpMiddlewareExchange {
             chain,
             runner,
             generation_guard,
+            forwarded_head: Arc::default(),
         }
     }
 
@@ -182,7 +256,7 @@ impl HttpMiddlewareExchange {
     where
         C: AsyncRead + AsyncWrite + Unpin + Send,
     {
-        Box::pin(
+        let result = Box::pin(
             apply_middleware_chain_for_scheme_with_request_id_and_delivery(
                 request,
                 client,
@@ -196,9 +270,23 @@ impl HttpMiddlewareExchange {
                 delivery,
             ),
         )
-        .await
+        .await?;
+        let forwarded = match &result {
+            MiddlewareApplyResult::Allowed(request) => Some(ForwardedRequestHead::new(request)),
+            MiddlewareApplyResult::Streamed { request, body } => {
+                Some(ForwardedRequestHead::of(request, Some(body)))
+            }
+            _ => None,
+        };
+        if let Some(forwarded) = forwarded {
+            let _ = self.forwarded_head.set(forwarded);
+        }
+        Ok(result)
     }
 
+    /// The response relay for this exchange. `request` may already carry
+    /// credentials, so response stages receive the request head recorded
+    /// when request middleware allowed the request, never `request`'s.
     pub fn response_relay<'a>(
         &'a self,
         request: &crate::l7::provider::L7Request,
@@ -221,6 +309,7 @@ impl HttpMiddlewareExchange {
             generation_guard: Some(&self.generation_guard),
             whole_body_timeout: super::rest::DEFAULT_HTTP_RESPONSE_WHOLE_BODY_TIMEOUT,
             client_accepts_chunked: request_line_is_http11(&request.raw_header),
+            request_head: self.forwarded_head.get().cloned(),
         }
     }
 }
@@ -1085,6 +1174,7 @@ async fn apply_pipeline_middleware_chain<C: AsyncRead + AsyncWrite + Unpin + Sen
             &prepared_headers,
             &preflight.header_mutations,
         )?;
+        let forwarded_head = ForwardedRequestHead::new(&request);
         return Ok(MiddlewareApplyResult::Streamed {
             request,
             body: Box::new(RequestBodyStream {
@@ -1093,6 +1183,7 @@ async fn apply_pipeline_middleware_chain<C: AsyncRead + AsyncWrite + Unpin + Sen
                 events,
                 generation_guard: generation_guard.clone(),
                 injected_headers: crate::l7::token_grant_injection::InjectedHeaders::default(),
+                forwarded_head,
             }),
         });
     }
@@ -1428,9 +1519,16 @@ pub struct RequestBodyStream {
     events: RequestEvents,
     generation_guard: PolicyGenerationGuard,
     injected_headers: crate::l7::token_grant_injection::InjectedHeaders,
+    /// The head before credentials, completed by late mutations at commit.
+    forwarded_head: ForwardedRequestHead,
 }
 
 impl RequestBodyStream {
+    /// The head response middleware sees, which the commit completes.
+    pub(crate) fn forwarded_head(&self) -> &ForwardedRequestHead {
+        &self.forwarded_head
+    }
+
     /// Keep the platform's token grant headers over late header mutations
     /// when the head commits.
     pub(crate) fn reapply_injected_headers(
@@ -2049,6 +2147,110 @@ mod tests {
     use crate::l7::relay::L7EvalContext;
     use openshell_supervisor_middleware::{HttpFailureCode, MiddlewareFailureDetail};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    fn forwarded_request(raw: &str) -> crate::l7::provider::L7Request {
+        crate::l7::provider::L7Request {
+            action: "POST".into(),
+            target: "/v1/items".into(),
+            query_params: std::collections::HashMap::new(),
+            raw_header: raw.as_bytes().to_vec(),
+            body_length: crate::l7::provider::BodyLength::None,
+        }
+    }
+
+    fn header_pairs(headers: &[openshell_core::proto::HttpHeader]) -> Vec<(&str, &str)> {
+        headers
+            .iter()
+            .map(|header| (header.name.as_str(), header.value.as_str()))
+            .collect()
+    }
+
+    #[test]
+    fn forwarded_request_head_applies_late_mutations_when_it_commits() {
+        use openshell_core::proto::{
+            ExistingHeaderAction, HeaderMutation, WriteHeader, header_mutation,
+        };
+        let head = super::ForwardedRequestHead::new(&forwarded_request(
+            "POST /v1/items HTTP/1.1\r\nHost: api.example.test\r\nX-Stage: preflight\r\n\r\n",
+        ));
+        assert_eq!(
+            header_pairs(&head.visible_headers().unwrap()),
+            [("x-stage", "preflight")]
+        );
+
+        head.commit(&[HeaderMutation {
+            operation: Some(header_mutation::Operation::Write(WriteHeader {
+                name: "x-stage".into(),
+                value: "late".into(),
+                on_existing: ExistingHeaderAction::Overwrite as i32,
+            })),
+        }])
+        .unwrap();
+
+        assert_eq!(
+            header_pairs(&head.visible_headers().unwrap()),
+            [("x-stage", "late")]
+        );
+    }
+
+    #[tokio::test]
+    async fn exchange_shows_response_middleware_the_head_before_credentials() {
+        let engine = crate::opa::OpaEngine::from_strings(
+            include_str!("../../data/sandbox-policy.rego"),
+            "network_policies: {}\n",
+        )
+        .unwrap();
+        let exchange = super::HttpMiddlewareExchange::new(
+            "request-1".into(),
+            Vec::new(),
+            openshell_supervisor_middleware::ChainRunner::default(),
+            engine
+                .generation_guard(engine.current_generation())
+                .unwrap(),
+        );
+        let ctx = L7EvalContext {
+            host: "api.example.test".into(),
+            port: 443,
+            ..Default::default()
+        };
+        let head = "POST /v1/items HTTP/1.1\r\nHost: api.example.test\r\nContent-Type: application/json\r\n\r\n";
+        // Nothing is recorded before request middleware allows the request.
+        assert!(
+            exchange
+                .response_relay(&forwarded_request(head), &ctx, "https")
+                .request_head
+                .is_none()
+        );
+        let (_app, mut client) = tokio::io::duplex(1024);
+        let allowed = exchange
+            .apply_request(
+                forwarded_request(head),
+                &mut client,
+                &ctx,
+                "https",
+                openshell_supervisor_middleware::TransformedBodyPolicy::NotPolicyRelevant,
+            )
+            .await
+            .unwrap();
+        assert!(matches!(allowed, super::MiddlewareApplyResult::Allowed(_)));
+
+        // The caller injects a token grant under a custom header name before
+        // it builds the response relay.
+        let with_credentials = forwarded_request(
+            "POST /v1/items HTTP/1.1\r\nHost: api.example.test\r\nContent-Type: application/json\r\nX-Api-Key: live-access-token\r\n\r\n",
+        );
+        let relay = exchange.response_relay(&with_credentials, &ctx, "https");
+
+        let headers = relay
+            .request_head
+            .expect("head recorded by apply_request")
+            .visible_headers()
+            .unwrap();
+        assert_eq!(
+            header_pairs(&headers),
+            [("content-type", "application/json")]
+        );
+    }
 
     #[test]
     fn admission_exhaustion_event_contains_only_platform_context() {
