@@ -83,6 +83,9 @@
         content: |
           [profile.default]
           slow-timeout = { period = "30s", terminate-after = 4 }
+
+          [profile.default.junit]
+          path = "junit.xml"
       become: true
       become_user: tmachine
 
@@ -111,6 +114,24 @@
       changed_when: false
       failed_when: false
       when: gateway_status is succeeded
+
+    # Keep the JUnit report with the run. The integration runner uploads
+    # artifacts/tmachine-diagnostics whether or not the lane passes.
+    - name: Find the JUnit report
+      ansible.builtin.find:
+        paths: "{{ suite_root }}"
+        patterns: junit.xml
+        recurse: true
+      register: suite_junit
+      failed_when: false
+
+    - name: Fetch the JUnit report
+      ansible.builtin.fetch:
+        src: "{{ item.path }}"
+        dest: "{{ playbook_dir }}/../../../../artifacts/tmachine-diagnostics/junit/sandbox-lifecycle-{{ inventory_hostname }}.xml"
+        flat: true
+      loop: "{{ suite_junit.files | default([]) }}"
+      failed_when: false
 
     - name: Show suite diagnostics
       ansible.builtin.debug:
