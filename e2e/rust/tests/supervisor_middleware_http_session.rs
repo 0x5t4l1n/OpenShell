@@ -18,8 +18,7 @@
 //! - STREAM carries a request body larger than any BUFFERED limit;
 //! - STREAM delivers server-sent events one by one;
 //! - a preflight rejection never contacts the upstream;
-//! - a `tls: skip` tunnel is denied by default and allowed when the guard is
-//!   configured to allow uninspectable traffic;
+//! - the guard refuses `tls: skip` tunnels in every body mode;
 //! - a policy that mixes HTTP hook versions on one destination is rejected at
 //!   `policy set`.
 
@@ -415,7 +414,6 @@ impl Drop for EchoServer {
 struct PolicyCase<'a> {
     mode: &'a str,
     body_mode: &'a str,
-    uninspectable: &'a str,
     /// Port of a `tls: skip` endpoint the attachment also selects.
     tls_skip_port: Option<u16>,
     /// Also attach `openshell/regex` (v1 HTTP hooks) to the same host.
@@ -476,7 +474,6 @@ network_middlewares:
     config:
       mode: {mode}
       body_mode: {body_mode}
-      uninspectable: {uninspectable}
       terms:
         - prototype-secret
         - internal-only
@@ -514,7 +511,6 @@ network_policies:
 "#,
         mode = case.mode,
         body_mode = case.body_mode,
-        uninspectable = case.uninspectable,
     );
     let mut file = NamedTempFile::new().expect("create policy file");
     file.write_all(policy.as_bytes()).expect("write policy");
@@ -692,7 +688,6 @@ async fn http_session_hook_content_guard_runs_against_the_gateway_and_supervisor
         &PolicyCase {
             mode: "redact",
             body_mode: "buffered",
-            uninspectable: "deny",
             tls_skip_port: Some(echo.port),
             mixed: false,
         },
@@ -724,7 +719,7 @@ async fn http_session_hook_content_guard_runs_against_the_gateway_and_supervisor
     assert_ne!(
         redact["tls_skip"],
         hex::encode(tls_skip_payload()),
-        "the guard denies uninspectable traffic by default: {redact}"
+        "the guard denies uninspectable traffic: {redact}"
     );
     assert!(echo.observed.lock().unwrap().is_empty());
 
@@ -735,7 +730,6 @@ async fn http_session_hook_content_guard_runs_against_the_gateway_and_supervisor
         &PolicyCase {
             mode: "deny",
             body_mode: "buffered",
-            uninspectable: "deny",
             tls_skip_port: None,
             mixed: false,
         },
@@ -760,7 +754,6 @@ async fn http_session_hook_content_guard_runs_against_the_gateway_and_supervisor
         &PolicyCase {
             mode: "redact",
             body_mode: "stream",
-            uninspectable: "allow",
             tls_skip_port: Some(echo.port),
             mixed: false,
         },
@@ -789,11 +782,12 @@ async fn http_session_hook_content_guard_runs_against_the_gateway_and_supervisor
         stream["events"]["rest"], "data: two\n\n",
         "the first event reached the sandbox before the second was sent: {stream}"
     );
-    assert_eq!(
+    assert_ne!(
         stream["tls_skip"],
         hex::encode(tls_skip_payload()),
-        "the guard allows uninspectable traffic when configured to: {stream}"
+        "the guard denies uninspectable traffic in STREAM mode: {stream}"
     );
+    assert!(echo.observed.lock().unwrap().is_empty());
 
     // A policy that runs both HTTP hook versions for one destination is rejected.
     let base = write_policy(
@@ -801,7 +795,6 @@ async fn http_session_hook_content_guard_runs_against_the_gateway_and_supervisor
         &PolicyCase {
             mode: "redact",
             body_mode: "buffered",
-            uninspectable: "deny",
             tls_skip_port: None,
             mixed: false,
         },
@@ -811,7 +804,6 @@ async fn http_session_hook_content_guard_runs_against_the_gateway_and_supervisor
         &PolicyCase {
             mode: "redact",
             body_mode: "buffered",
-            uninspectable: "deny",
             tls_skip_port: None,
             mixed: true,
         },

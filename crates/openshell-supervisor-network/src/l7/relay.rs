@@ -7428,33 +7428,6 @@ network_policies:
         assert_eq!(&upstream_bytes[..n], b"\x00\x00\x00\x08\x04\xd2\x16\x2f");
     }
 
-    #[test]
-    fn uninspectable_gate_reflects_chain_on_error() {
-        use crate::l7::middleware::uninspectable_traffic_gate;
-        use openshell_supervisor_middleware::{ChainEntry, OnError};
-
-        let entry = |on_error| ChainEntry {
-            name: "m".into(),
-            implementation: "example/guard".into(),
-            order: 0,
-            config: prost_types::Struct::default(),
-            on_error,
-        };
-
-        assert_eq!(
-            uninspectable_traffic_gate(&[]),
-            UninspectableTrafficGate::Unrestricted
-        );
-        assert_eq!(
-            uninspectable_traffic_gate(&[entry(OnError::FailOpen), entry(OnError::FailOpen)]),
-            UninspectableTrafficGate::BypassWithFinding
-        );
-        assert_eq!(
-            uninspectable_traffic_gate(&[entry(OnError::FailOpen), entry(OnError::FailClosed)]),
-            UninspectableTrafficGate::Deny
-        );
-    }
-
     /// One named middleware with one HTTP/pre-credentials binding. Two
     /// instances exercise mixed-limit chain buffering at the relay level.
     struct LimitService {

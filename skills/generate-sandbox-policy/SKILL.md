@@ -231,7 +231,7 @@ Add `network_middlewares` only when the user asks to inspect, transform, redact,
 - Entries whose endpoint selectors may overlap must use the same HTTP hook version for the operations both handle. The built-in `openshell/regex` uses v1 HTTP hooks, so do not let its selector overlap an HTTP session hook service that inspects requests.
 - Assign unique `order` values across the complete policy. Lower values run first, and at most 10 configs may be selected.
 - Match the narrowest destination hosts possible with `endpoints.include`; use `exclude` when a broad selector has trusted exceptions.
-- Do not select fail-closed v1 HTTP hook middleware for `tls: skip` endpoints because the supervisor cannot inspect that traffic. HTTP session hook middleware may select them; the service then allows or refuses each connection without seeing its content.
+- Do not select `tls: skip` endpoints with fail-closed middleware unless its service binds `UNINSPECTABLE_NETWORK/PRE_FORWARD`, because the supervisor cannot inspect that traffic. Such a service allows or refuses each connection without seeing its content. A `fail_open` entry without the binding lets the traffic through with a finding; that exception is deprecated and removed in 0.2.0.
 
 ### Mapping Paths to Glob Patterns (when building explicit rules)
 
@@ -403,7 +403,7 @@ Before presenting the policy to the user, verify correctness **and** flag breadt
 - [ ] `rules` list is not empty when present
 - [ ] Every middleware config has a non-empty `middleware` name and non-empty `endpoints.include`
 - [ ] Middleware `order` values are unique and no selected chain exceeds 10 stages
-- [ ] No fail-closed v1 HTTP hook middleware selector can cover a `tls: skip` endpoint
+- [ ] No fail-closed middleware selector can cover a `tls: skip` endpoint unless its service binds `UNINSPECTABLE_NETWORK/PRE_FORWARD`
 - [ ] No HTTP session hook middleware entry uses `on_error: fail_open`
 - [ ] Middleware entries with overlapping selectors use the same HTTP hook version for each HTTP operation they share
 - [ ] Any required WebSocket control advertises `WEBSOCKET_MESSAGE/PRE_CREDENTIALS`, and the user understands that V1 does not inspect binary messages

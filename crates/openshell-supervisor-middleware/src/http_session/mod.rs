@@ -13,7 +13,6 @@ mod request;
 mod response;
 #[cfg(test)]
 mod tests;
-mod uninspectable;
 
 use openshell_core::proto::{HttpHeader, HttpRequestTarget, RequestContext};
 use prost::Message as _;
@@ -31,7 +30,6 @@ pub use request::{
 pub use response::{
     HttpResponseDelivery, HttpResponsePipelinePreflight, HttpResponsePipelineSession,
 };
-pub use uninspectable::{UninspectableInvocation, UninspectableOutcome, UninspectableTrafficInput};
 
 use crate::{
     DescribedChainEntry, HttpHookVersion, MAX_MIDDLEWARE_CONTEXT_BYTES,

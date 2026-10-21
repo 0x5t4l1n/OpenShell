@@ -34,9 +34,6 @@ pub(crate) struct GuardConfig {
     pub(crate) terms: Vec<String>,
     pub(crate) replacement: String,
     pub(crate) body_mode: BodyMode,
-    /// Let connections OpenShell cannot inspect, such as `tls: skip`
-    /// tunnels, continue. The default denies them.
-    pub(crate) allow_uninspectable: bool,
 }
 
 impl GuardConfig {
@@ -45,7 +42,7 @@ impl GuardConfig {
         if let Some(field) = config.fields.keys().find(|field| {
             !matches!(
                 field.as_str(),
-                "mode" | "terms" | "replacement" | "body_mode" | "uninspectable"
+                "mode" | "terms" | "replacement" | "body_mode"
             )
         }) {
             return Err(format!("unsupported config field '{field}'"));
@@ -90,19 +87,12 @@ impl GuardConfig {
             "stream" => BodyMode::Stream,
             _ => return Err("config.body_mode must be 'buffered' or 'stream'".into()),
         };
-        let allow_uninspectable =
-            match optional_string_field(config, "uninspectable")?.unwrap_or("deny") {
-                "deny" => false,
-                "allow" => true,
-                _ => return Err("config.uninspectable must be 'deny' or 'allow'".into()),
-            };
 
         Ok(Self {
             mode,
             terms: unique_terms.into_iter().collect(),
             replacement,
             body_mode,
-            allow_uninspectable,
         })
     }
 }
@@ -492,7 +482,7 @@ mod tests {
         for (mode, extra) in [
             ("deny", &[("replacement", "ignored")][..]),
             ("redact", &[("body_mode", "whole")][..]),
-            ("redact", &[("uninspectable", "maybe")][..]),
+            ("redact", &[("uninspectable", "allow")][..]),
             ("redact", &[("unknown", "x")][..]),
         ] {
             assert!(
@@ -521,6 +511,5 @@ mod tests {
         assert_eq!(parsed.mode, Mode::Redact);
         assert_eq!(parsed.replacement, DEFAULT_REPLACEMENT);
         assert_eq!(parsed.body_mode, BodyMode::Buffered);
-        assert!(!parsed.allow_uninspectable);
     }
 }

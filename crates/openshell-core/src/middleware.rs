@@ -11,11 +11,12 @@ use tokio::sync::mpsc;
 use tonic::{Request, Response, Status};
 
 use crate::proto::{
-    HttpHeader, HttpRequestEvaluation, HttpRequestResult, HttpRequestSessionEvent,
-    HttpRequestSessionResult, HttpRequestTarget, HttpResponseEvent, HttpResponseEventResult,
-    HttpResponseSessionEvent, HttpResponseSessionResult, MiddlewareDescribeRequest,
-    MiddlewareManifest, RequestContext, SupervisorMiddlewarePhase, ValidateConfigRequest,
-    ValidateConfigResponse, WebSocketSessionEvent, WebSocketSessionEventResult,
+    EvaluateUninspectableNetworkRequest, EvaluateUninspectableNetworkResponse, HttpHeader,
+    HttpRequestEvaluation, HttpRequestResult, HttpRequestSessionEvent, HttpRequestSessionResult,
+    HttpRequestTarget, HttpResponseEvent, HttpResponseEventResult, HttpResponseSessionEvent,
+    HttpResponseSessionResult, MiddlewareDescribeRequest, MiddlewareManifest, RequestContext,
+    SupervisorMiddlewarePhase, ValidateConfigRequest, ValidateConfigResponse,
+    WebSocketSessionEvent, WebSocketSessionEventResult,
 };
 
 /// Transport-neutral result stream for one `HttpSessionMiddleware.EvaluateRequest`
@@ -100,6 +101,17 @@ pub trait SupervisorMiddlewareEndpoint: Send + Sync {
     ) -> Result<HttpResponseSessionResultStream, Status> {
         Err(Status::unimplemented(
             "middleware does not implement HTTP session hook responses",
+        ))
+    }
+
+    /// Decide about one connection `OpenShell` forwards without inspecting it
+    /// (`UninspectableNetworkMiddleware.Evaluate`).
+    async fn evaluate_uninspectable_network(
+        &self,
+        _request: Request<EvaluateUninspectableNetworkRequest>,
+    ) -> Result<Response<EvaluateUninspectableNetworkResponse>, Status> {
+        Err(Status::unimplemented(
+            "middleware does not implement uninspectable network evaluation",
         ))
     }
 }
@@ -317,7 +329,7 @@ pub trait InProcessMiddleware: Send + Sync {
     }
 
     /// Open one HTTP session hook request exchange (`HttpSessionMiddleware.EvaluateRequest`),
-    /// for a request or for traffic `OpenShell` cannot inspect.
+    /// for one HTTP request.
     ///
     /// Implementations that do not require the HTTP session hooks capability
     /// may keep the default unsupported response.
@@ -340,6 +352,20 @@ pub trait InProcessMiddleware: Send + Sync {
     ) -> std::result::Result<HttpResponseSessionResultStream, Status> {
         Err(Status::unimplemented(
             "middleware does not implement HTTP session hook responses",
+        ))
+    }
+
+    /// Decide about one connection `OpenShell` forwards without inspecting it
+    /// (`UninspectableNetworkMiddleware.Evaluate`).
+    ///
+    /// Implementations that do not bind `UNINSPECTABLE_NETWORK/PRE_FORWARD`
+    /// may keep the default unsupported response.
+    async fn evaluate_uninspectable_network(
+        &self,
+        _request: EvaluateUninspectableNetworkRequest,
+    ) -> std::result::Result<EvaluateUninspectableNetworkResponse, Status> {
+        Err(Status::unimplemented(
+            "middleware does not implement uninspectable network evaluation",
         ))
     }
 }

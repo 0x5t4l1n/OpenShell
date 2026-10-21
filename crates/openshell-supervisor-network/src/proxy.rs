@@ -2969,6 +2969,62 @@ async fn handle_mediated_connection(
         return Ok(());
     }
 
+    // Build request-processing context shared by CONNECT and forward HTTP.
+    let workspace = policy_local_ctx
+        .as_ref()
+        .map(|ctx| ctx.workspace())
+        .unwrap_or_default();
+    let mut ctx = relay::http_context(
+        &decision,
+        provider_credentials,
+        secret_resolver.clone(),
+        agent_proposals,
+        workspace,
+        relay::RelaySignals {
+            activity: activity_tx.clone(),
+            endpoint_observation: endpoint_observation_tx,
+        },
+    );
+
+    // Decide about a `tls: skip` tunnel before `200 Connection Established`,
+    // so a denial is a plain 403. Policy validation rejects fail-closed
+    // middleware without the uninspectable binding overlapping `tls: skip`
+    // endpoints, so for those this gate is defense in depth. Middleware that
+    // binds UNINSPECTABLE_NETWORK decides here.
+    if effective_tls_skip {
+        match middleware_uninspectable_gate(
+            &opa_engine,
+            &ctx,
+            openshell_core::proto::UninspectableTrafficReason::TlsSkip,
+        )
+        .await?
+        {
+            crate::l7::middleware::UninspectableTrafficGate::Deny => {
+                crate::l7::middleware::emit_middleware_uninspectable(&ctx, "tls-skip tunnel", true);
+                respond(
+                    &mut client,
+                    &build_json_error_response(
+                        403,
+                        "Forbidden",
+                        "middleware_required",
+                        "tls: skip tunnel cannot be inspected by required middleware",
+                    ),
+                )
+                .await?;
+                return Ok(());
+            }
+            crate::l7::middleware::UninspectableTrafficGate::BypassWithFinding => {
+                crate::l7::middleware::emit_middleware_uninspectable(
+                    &ctx,
+                    "tls-skip tunnel",
+                    false,
+                );
+            }
+            crate::l7::middleware::UninspectableTrafficGate::Unrestricted
+            | crate::l7::middleware::UninspectableTrafficGate::Allowed => {}
+        }
+    }
+
     let dial_span = egress::dial_span(&connect_span);
     let upstream_result = tokio::select! {
         result = dial_upstream(&upstream_proxy, &host_lc, &raw_host_lc, port, connector.addrs())
@@ -3032,58 +3088,7 @@ async fn handle_mediated_connection(
     // `effective_tls_skip` was resolved before the `200` above (the fail-closed
     // gate needs it) and drives the raw-tunnel branch below.
 
-    // Build request-processing context shared by CONNECT and forward HTTP.
-    let workspace = policy_local_ctx
-        .as_ref()
-        .map(|ctx| ctx.workspace())
-        .unwrap_or_default();
-    let mut ctx = relay::http_context(
-        &decision,
-        provider_credentials,
-        secret_resolver.clone(),
-        agent_proposals,
-        workspace,
-        relay::RelaySignals {
-            activity: activity_tx.clone(),
-            endpoint_observation: endpoint_observation_tx,
-        },
-    );
-
     if effective_tls_skip {
-        // Policy validation rejects fail-closed v1 HTTP hook middleware
-        // overlapping `tls: skip` endpoints; this runtime gate is defense in
-        // depth. HTTP session hook middleware decides here at runtime.
-        match middleware_uninspectable_gate(
-            &opa_engine,
-            &ctx,
-            openshell_core::proto::UninspectableTrafficReason::TlsSkip,
-        )
-        .await?
-        {
-            crate::l7::middleware::UninspectableTrafficGate::Deny => {
-                crate::l7::middleware::emit_middleware_uninspectable(&ctx, "tls-skip tunnel", true);
-                respond(
-                    &mut client,
-                    &build_json_error_response(
-                        403,
-                        "Forbidden",
-                        "middleware_required",
-                        "tls: skip tunnel cannot be inspected by required middleware",
-                    ),
-                )
-                .await?;
-                return Ok(());
-            }
-            crate::l7::middleware::UninspectableTrafficGate::BypassWithFinding => {
-                crate::l7::middleware::emit_middleware_uninspectable(
-                    &ctx,
-                    "tls-skip tunnel",
-                    false,
-                );
-            }
-            crate::l7::middleware::UninspectableTrafficGate::Unrestricted
-            | crate::l7::middleware::UninspectableTrafficGate::Allowed => {}
-        }
         // tls: skip — raw tunnel, no termination, no credential injection.
         debug!(
             host = %host_lc,
@@ -9556,7 +9561,7 @@ network_policies:
     }
 
     #[tokio::test]
-    async fn plaintext_websocket_middleware_inspects_compressed_ws_messages() {
+    async fn plaintext_websocket_inspects_messages_without_invoking_connection_hook() {
         if !cfg!(target_os = "linux") {
             eprintln!("skipping: handler identity binding requires /proc (Linux)");
             return;
@@ -9579,6 +9584,12 @@ network_middlewares:
     on_error: fail_closed
     endpoints:
       include: ["{upstream_ip}"]
+  connection:
+    middleware: test/connection-guard
+    order: 1
+    on_error: fail_closed
+    endpoints:
+      include: ["{upstream_ip}"]
 network_policies:
   allow-upstream:
     name: allow-upstream
@@ -9594,8 +9605,10 @@ network_policies:
             OpaEngine::from_strings(include_str!("../data/sandbox-policy.rego"), &data)
                 .expect("load policy"),
         );
+        let mut services = openshell_supervisor_middleware_builtins::services();
+        services.push(uninspectable_tests::denying_service());
         let registry = openshell_supervisor_middleware::MiddlewareRegistry::connect_services(
-            openshell_supervisor_middleware_builtins::services(),
+            services,
             Vec::new(),
         )
         .await
@@ -10378,6 +10391,14 @@ network_policies:
         assert_eq!(
             inspection_requirement(true, UninspectableTrafficGate::Deny),
             InspectionRequirement::L7Route
+        );
+        assert_eq!(
+            inspection_requirement(true, UninspectableTrafficGate::Allowed),
+            InspectionRequirement::L7Route
+        );
+        assert_eq!(
+            inspection_requirement(false, UninspectableTrafficGate::Allowed),
+            InspectionRequirement::None
         );
         assert_eq!(
             inspection_requirement(false, UninspectableTrafficGate::Deny),
@@ -14611,6 +14632,16 @@ network_policies:
         connect_target: &str,
         budget: std::time::Duration,
     ) -> (bool, Vec<u8>, Vec<String>) {
+        drive_connect_through_handler_with_middleware(endpoint_yaml, connect_target, budget, None)
+            .await
+    }
+
+    async fn drive_connect_through_handler_with_middleware(
+        endpoint_yaml: &str,
+        connect_target: &str,
+        budget: std::time::Duration,
+        middleware: Option<openshell_supervisor_middleware::ChainRunner>,
+    ) -> (bool, Vec<u8>, Vec<String>) {
         const POLICY_REGO: &str = include_str!("../data/sandbox-policy.rego");
 
         // Allow the current test binary — the in-process client's
@@ -14626,7 +14657,17 @@ network_policies:
 "#,
             exe = exe.display(),
         );
+        let data = if middleware.is_some() {
+            format!(
+                "{data}\nnetwork_middlewares:\n  guard:\n    middleware: test/connection-guard\n    on_error: fail_open\n    endpoints:\n      include: [\"203.0.113.10\"]\n"
+            )
+        } else {
+            data
+        };
         let engine = Arc::new(OpaEngine::from_strings(POLICY_REGO, &data).expect("load policy"));
+        if let Some(runner) = middleware {
+            engine.set_middleware_runner_for_tests(runner);
+        }
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let proxy_port = listener.local_addr().unwrap().port();
@@ -14847,6 +14888,24 @@ network_policies:
             "an explicit loopback endpoint must fail declared-endpoint validation; got: {response:?}"
         );
         assert_eq!(denial_stages, ["ssrf"]);
+    }
+
+    #[tokio::test]
+    async fn tls_skip_callback_denial_precedes_connect_success_and_payload() {
+        if !cfg!(target_os = "linux") {
+            return;
+        }
+        let (completed, response, _) = drive_connect_through_handler_with_middleware(
+            "      - { host: \"203.0.113.10\", port: 443, tls: skip }\n",
+            "203.0.113.10:443",
+            std::time::Duration::from_secs(2),
+            Some(uninspectable_tests::denying_runner()),
+        )
+        .await;
+        assert!(completed);
+        let response = String::from_utf8(response).unwrap();
+        assert!(response.starts_with("HTTP/1.1 403 Forbidden"), "{response}");
+        assert!(!response.contains("200 Connection Established"));
     }
 
     /// A real `tls: skip` policy path through the handler is exempt from the
@@ -15538,3 +15597,6 @@ network_policies:
     #[path = "token_grants.rs"]
     mod token_grants;
 }
+
+#[cfg(test)]
+mod uninspectable_tests;

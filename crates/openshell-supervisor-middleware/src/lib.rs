@@ -3,11 +3,17 @@
 
 //! Supervisor middleware registration and chain execution.
 
+mod diagnostics;
 pub mod headers;
 mod http_session;
 mod remote;
 mod response;
+mod uninspectable;
 mod websocket;
+pub use uninspectable::{
+    UninspectableInvocation, UninspectableInvocationOutcome, UninspectableOutcome,
+    UninspectableTrafficInput,
+};
 
 pub use http_session::{
     ChainHttpHookVersion, HTTP_BUFFERED_BODY_TIMEOUT, HTTP_STREAM_IDLE_TIMEOUT, HttpBodyInput,
@@ -16,8 +22,7 @@ pub use http_session::{
     HttpResponseDelivery, HttpResponsePipelinePreflight, HttpResponsePipelineSession,
     HttpStageDiagnostics, HttpStageInvocation, HttpStageOutcome, MAX_HTTP_REQUEST_WITHHELD_BYTES,
     MAX_HTTP_STREAM_UNIT_BYTES, MIDDLEWARE_CANNOT_INSPECT, MIDDLEWARE_HOOK_VERSIONS_MIXED,
-    MiddlewareFailureDetail, UninspectableInvocation, UninspectableOutcome,
-    UninspectableTrafficInput, chain_http_hook_version,
+    MiddlewareFailureDetail, chain_http_hook_version,
 };
 
 pub use response::{
@@ -48,11 +53,12 @@ use openshell_core::extension_protocol::{
 };
 use openshell_core::proto::middleware::v1::supervisor_middleware_server::SupervisorMiddleware;
 use openshell_core::proto::{
-    Decision, Finding, HeaderMutation, HttpHeader, HttpRequestEvaluation, HttpRequestSessionEvent,
-    HttpRequestTarget, HttpResponseSessionEvent, MiddlewareBinding, MiddlewareDescribeRequest,
-    MiddlewareManifest, NetworkMiddlewareConfig, RequestContext, SandboxPolicy,
-    SupervisorMiddlewareOperation, SupervisorMiddlewarePhase, SupervisorMiddlewareService,
-    ValidateConfigRequest, ValidateConfigResponse,
+    Decision, EvaluateUninspectableNetworkRequest, EvaluateUninspectableNetworkResponse, Finding,
+    HeaderMutation, HttpHeader, HttpRequestEvaluation, HttpRequestSessionEvent, HttpRequestTarget,
+    HttpResponseSessionEvent, MiddlewareBinding, MiddlewareDescribeRequest, MiddlewareManifest,
+    NetworkMiddlewareConfig, RequestContext, SandboxPolicy, SupervisorMiddlewareOperation,
+    SupervisorMiddlewarePhase, SupervisorMiddlewareService, ValidateConfigRequest,
+    ValidateConfigResponse,
 };
 use tokio::sync::{OnceCell, OwnedSemaphorePermit, Semaphore};
 use tonic::{Request, Response as TonicResponse, Status as TonicStatus};
@@ -231,6 +237,16 @@ impl InProcessMiddleware for EndpointInProcessAdapter {
         requests: tokio::sync::mpsc::Receiver<HttpResponseSessionEvent>,
     ) -> std::result::Result<HttpResponseSessionResultStream, tonic::Status> {
         self.endpoint.open_http_response_session(requests).await
+    }
+
+    async fn evaluate_uninspectable_network(
+        &self,
+        request: EvaluateUninspectableNetworkRequest,
+    ) -> std::result::Result<EvaluateUninspectableNetworkResponse, tonic::Status> {
+        self.endpoint
+            .evaluate_uninspectable_network(Request::new(request))
+            .await
+            .map(TonicResponse::into_inner)
     }
 }
 
@@ -465,19 +481,6 @@ fn manifest_http_hook_version(manifest: &MiddlewareManifest) -> Option<HttpHookV
         .find_map(|binding| binding_http_hook_version(manifest, binding))
 }
 
-/// The `HTTP_REQUEST` binding of an HTTP session hooks service, whose
-/// `HttpSessionMiddleware.EvaluateRequest` exchange also carries preflights for traffic
-/// `OpenShell` cannot inspect.
-fn uninspectable_traffic_binding(manifest: &MiddlewareManifest) -> Option<&MiddlewareBinding> {
-    if !requires_http_session(manifest) {
-        return None;
-    }
-    manifest.bindings.iter().find(|binding| {
-        binding.operation == SupervisorMiddlewareOperation::HttpRequest as i32
-            && binding.phase == SupervisorMiddlewarePhase::PreCredentials as i32
-    })
-}
-
 /// A service that supports the HTTP session hooks capability must also
 /// require it. Only a required capability makes peers that predate HTTP
 /// session hooks reject the service; otherwise they would call its HTTP
@@ -507,8 +510,9 @@ fn binding_requires_payload_limit(
     manifest: &MiddlewareManifest,
     binding: &MiddlewareBinding,
 ) -> bool {
-    binding_http_hook_version(manifest, binding) != Some(HttpHookVersion::Session)
-        || binding.max_payload_bytes > 0
+    binding.operation != SupervisorMiddlewareOperation::UninspectableNetwork as i32
+        && (binding_http_hook_version(manifest, binding) != Some(HttpHookVersion::Session)
+            || binding.max_payload_bytes > 0)
 }
 
 #[derive(Debug, Clone)]
@@ -849,6 +853,16 @@ impl MiddlewareDispatch {
             Self::Grpc(service) => service.open_http_response_session(receiver).await,
         }
     }
+
+    async fn evaluate_uninspectable_network(
+        &self,
+        request: EvaluateUninspectableNetworkRequest,
+    ) -> std::result::Result<EvaluateUninspectableNetworkResponse, tonic::Status> {
+        match self {
+            Self::InProcess(service) => service.evaluate_uninspectable_network(request).await,
+            Self::Grpc(service) => service.evaluate_uninspectable_network(request).await,
+        }
+    }
 }
 
 struct MiddlewareServiceState {
@@ -1085,6 +1099,7 @@ enum SupportedBinding {
     HttpPreCredentials,
     HttpResponsePreReturn,
     WebSocketPreCredentials,
+    UninspectablePreForward,
 }
 
 fn supported_binding(source: &str, binding: &MiddlewareBinding) -> Result<SupportedBinding> {
@@ -1092,6 +1107,10 @@ fn supported_binding(source: &str, binding: &MiddlewareBinding) -> Result<Suppor
         SupervisorMiddlewareOperation::try_from(binding.operation).ok(),
         SupervisorMiddlewarePhase::try_from(binding.phase).ok(),
     ) {
+        (
+            Some(SupervisorMiddlewareOperation::UninspectableNetwork),
+            Some(SupervisorMiddlewarePhase::PreForward),
+        ) => Ok(SupportedBinding::UninspectablePreForward),
         (
             Some(SupervisorMiddlewareOperation::HttpRequest),
             Some(SupervisorMiddlewarePhase::PreCredentials),
@@ -1128,7 +1147,13 @@ fn validate_manifest_bindings(
     validate_manifest_http_session_capability(source, manifest)?;
     let mut described_pairs = HashSet::with_capacity(manifest.bindings.len());
     for binding in &manifest.bindings {
-        supported_binding(source, binding)?;
+        let supported = supported_binding(source, binding)?;
+        if supported == SupportedBinding::UninspectablePreForward && binding.max_payload_bytes != 0
+        {
+            return Err(miette!(
+                "{source} must advertise a zero payload limit for UNINSPECTABLE_NETWORK/PRE_FORWARD"
+            ));
+        }
         if !described_pairs.insert((binding.operation, binding.phase)) {
             return Err(miette!(
                 "{source} describes a duplicate middleware operation/phase pair"
@@ -1520,16 +1545,20 @@ impl MiddlewareRegistry {
         })
     }
 
-    /// True when `implementation` binds `HTTP_REQUEST` with HTTP session
-    /// hooks, whose exchange also decides about traffic `OpenShell` cannot
-    /// inspect. The gateway uses it to exempt such middleware from the
-    /// `tls: skip` conflict rule.
+    /// True when `implementation` binds `UNINSPECTABLE_NETWORK/PRE_FORWARD`
+    /// and so decides about connections `OpenShell` cannot inspect. The gateway
+    /// uses it to exempt such middleware from the `tls: skip` conflict rule.
     #[must_use]
     pub fn decides_uninspectable_traffic(&self, implementation: &str) -> bool {
         self.services.iter().any(|state| {
             state.manifest.get().is_some_and(|manifest| {
                 ChainRunner::attachment_name(state, manifest) == implementation
-                    && uninspectable_traffic_binding(manifest).is_some()
+                    && ChainRunner::binding(
+                        manifest,
+                        SupervisorMiddlewareOperation::UninspectableNetwork,
+                        SupervisorMiddlewarePhase::PreForward,
+                    )
+                    .is_some()
             })
         })
     }
@@ -1986,12 +2015,6 @@ impl ChainRunner {
     #[must_use]
     pub fn http_hook_version_of(&self, implementation: &str) -> Option<HttpHookVersion> {
         self.registry.http_hook_version_of(implementation)
-    }
-
-    /// See [`MiddlewareRegistry::decides_uninspectable_traffic`].
-    #[must_use]
-    pub fn decides_uninspectable_traffic(&self, implementation: &str) -> bool {
-        self.registry.decides_uninspectable_traffic(implementation)
     }
 
     /// Warn once per policy config that its `fail_open` does not apply to an
@@ -4411,6 +4434,55 @@ mod tests {
         let error = validate_manifest_bindings("test WebSocket service", &manifest, None)
             .expect_err("return-path WebSocket binding is not yet supported");
         assert!(error.to_string().contains("not yet supported"));
+    }
+
+    #[test]
+    fn uninspectable_binding_is_metadata_only_and_requires_pre_forward() {
+        let registration = external_registration(0);
+        let mut manifest = MiddlewareManifest {
+            name: "example/connection-only".into(),
+            bindings: vec![MiddlewareBinding {
+                operation: SupervisorMiddlewareOperation::UninspectableNetwork as i32,
+                phase: SupervisorMiddlewarePhase::PreForward as i32,
+                ..Default::default()
+            }],
+            extension: Some(openshell_core::extension_protocol::extension_metadata(
+                ExtensionFamily::SupervisorMiddleware,
+                "example/connection-only",
+                "test",
+                [],
+            )),
+            ..Default::default()
+        };
+        validate_external_manifest(&registration, &manifest, 0, false).unwrap();
+        manifest.bindings[0].max_payload_bytes = 1;
+        assert!(
+            validate_external_manifest(&registration, &manifest, 0, false)
+                .unwrap_err()
+                .to_string()
+                .contains("zero payload limit")
+        );
+        manifest.bindings[0].max_payload_bytes = 0;
+        for phase in [
+            SupervisorMiddlewarePhase::PreCredentials,
+            SupervisorMiddlewarePhase::PreReturn,
+        ] {
+            manifest.bindings[0].phase = phase as i32;
+            assert!(
+                validate_external_manifest(&registration, &manifest, 0, false)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("unsupported middleware operation/phase pair")
+            );
+        }
+        manifest.bindings[0].phase = SupervisorMiddlewarePhase::PreForward as i32;
+        manifest.bindings[0].operation = SupervisorMiddlewareOperation::HttpRequest as i32;
+        assert!(
+            validate_external_manifest(&registration, &manifest, 0, false)
+                .unwrap_err()
+                .to_string()
+                .contains("unsupported middleware operation/phase pair")
+        );
     }
 
     #[test]

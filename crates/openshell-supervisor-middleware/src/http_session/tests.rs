@@ -17,7 +17,7 @@ use openshell_core::proto::{
     MiddlewareBinding, MiddlewareDiagnostics, MiddlewareManifest, RequestContext,
     SupervisorMiddlewareOperation, SupervisorMiddlewarePhase, WriteHeader, header_mutation,
     http_buffered_result, http_inspect, http_preflight_result, http_request_session_event,
-    http_request_session_preflight, http_request_session_result,
+    http_request_session_result,
 };
 use tokio::sync::mpsc;
 
@@ -27,8 +27,7 @@ use crate::{
     HttpRequestPreflightInput, HttpRequestSessionResultStream, HttpRequestView, HttpStageOutcome,
     InProcessMiddleware, MAX_CONCURRENT_HTTP_MIDDLEWARE_SESSIONS,
     MAX_CONCURRENT_HTTP_MIDDLEWARE_STREAMS, MAX_MIDDLEWARE_CHAIN_TIMEOUT, MiddlewareFailureDetail,
-    MiddlewareRegistry, OnError, TransformedBodyPolicy, UninspectableTrafficInput,
-    validate_manifest_bindings,
+    MiddlewareRegistry, OnError, TransformedBodyPolicy, validate_manifest_bindings,
 };
 
 fn binding(operation: SupervisorMiddlewareOperation) -> MiddlewareBinding {
@@ -250,13 +249,7 @@ impl InProcessMiddleware for ScriptedStage {
                 let reply = match event.event {
                     Some(http_request_session_event::Event::Preflight(preflight_event)) => {
                         preflights.lock().unwrap().push(preflight_event.clone());
-                        assert!(matches!(
-                            preflight_event.subject,
-                            Some(
-                                http_request_session_preflight::Subject::Request(_)
-                                    | http_request_session_preflight::Subject::Uninspectable(_)
-                            )
-                        ));
+                        assert!(preflight_event.request.is_some());
                         let buffered_limit = preflight_event
                             .limits
                             .map_or(0, |limits| limits.max_buffered_body_bytes);
@@ -674,7 +667,14 @@ impl InProcessMiddleware for ResponseOnlyStage {
     async fn describe(&self) -> MiddlewareManifest {
         MiddlewareManifest {
             name: "example/response-only".into(),
-            ..session_manifest(vec![binding(SupervisorMiddlewareOperation::HttpResponse)])
+            ..session_manifest(vec![
+                binding(SupervisorMiddlewareOperation::HttpResponse),
+                MiddlewareBinding {
+                    operation: SupervisorMiddlewareOperation::UninspectableNetwork as i32,
+                    phase: SupervisorMiddlewarePhase::PreForward as i32,
+                    ..Default::default()
+                },
+            ])
         }
     }
 
@@ -697,46 +697,23 @@ impl InProcessMiddleware for ResponseOnlyStage {
 }
 
 #[tokio::test]
-async fn only_request_bindings_decide_about_uninspectable_traffic() {
-    let request_stage = Arc::new(ScriptedStage::new(
-        "example/request",
-        Preflight::Continue,
-        Body::Unchanged,
-    ));
-    let services: Vec<Arc<dyn InProcessMiddleware>> =
-        vec![request_stage, Arc::new(ResponseOnlyStage)];
-    let registry = MiddlewareRegistry::connect_services(services, Vec::new())
-        .await
-        .expect("registry");
-    assert!(registry.decides_uninspectable_traffic("example/request"));
-    assert!(!registry.decides_uninspectable_traffic("example/response-only"));
-
-    let runner = ChainRunner::from_registry(registry);
-    let input = || UninspectableTrafficInput {
-        context: RequestContext::default(),
-        host: "api.example.com".into(),
-        port: 443,
-        endpoint: "api".into(),
-        reason: openshell_core::proto::UninspectableTrafficReason::TlsSkip,
-    };
-    let allowed = runner
-        .evaluate_uninspectable(&[chain_entry("example/request", 0)], input())
-        .await;
-    assert!(allowed.allowed, "{}", allowed.reason);
-
-    // A response-only service is never asked, so its fail-closed entry
-    // denies the connection.
-    let denied = runner
+async fn handwritten_default_callback_refuses_even_when_fail_open() {
+    let runner = ChainRunner::new(Arc::new(ResponseOnlyStage));
+    let mut entry = chain_entry("example/response-only", 0);
+    entry.on_error = OnError::FailOpen;
+    let outcome = runner
         .evaluate_uninspectable(
-            &[
-                chain_entry("example/request", 0),
-                chain_entry("example/response-only", 1),
-            ],
-            input(),
+            &[entry],
+            crate::UninspectableTrafficInput {
+                context: RequestContext::default(),
+                host: "example.test".into(),
+                port: 443,
+                reason: openshell_core::proto::UninspectableTrafficReason::TlsSkip,
+            },
         )
         .await;
-    assert!(!denied.allowed);
-    assert_eq!(denied.reason, "middleware_failed: traffic_uninspectable");
+    assert!(!outcome.allowed);
+    assert_eq!(outcome.reason, "middleware_failed: evaluation_failed");
 }
 
 fn scripted(name: &'static str, preflight: Preflight, body: Body) -> Arc<ScriptedStage> {

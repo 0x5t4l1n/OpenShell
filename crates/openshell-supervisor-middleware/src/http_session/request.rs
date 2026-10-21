@@ -9,7 +9,7 @@
 
 use openshell_core::proto::{
     HeaderMutation, HttpBodyMode, HttpBodyUnavailableReason, HttpHeader, HttpRequestPreflightHead,
-    HttpRequestTarget, MiddlewareSessionEndReason, RequestContext, http_request_session_preflight,
+    HttpRequestTarget, MiddlewareSessionEndReason, RequestContext,
 };
 use tokio::sync::mpsc;
 use tokio::time::Instant;
@@ -128,12 +128,10 @@ impl StageHead for RequestHead<'_> {
     }
 
     fn preflight(&self, headers: &[HttpHeader], fields: PreflightFields) -> StagePreflight {
-        fields.request(http_request_session_preflight::Subject::Request(
-            HttpRequestPreflightHead {
-                target: Some(self.input.target.clone()),
-                headers: headers.to_vec(),
-            },
-        ))
+        fields.request(HttpRequestPreflightHead {
+            target: Some(self.input.target.clone()),
+            headers: headers.to_vec(),
+        })
     }
 
     fn body_modes(

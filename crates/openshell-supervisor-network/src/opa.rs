@@ -12423,7 +12423,7 @@ network_middlewares:
 
     #[test]
     fn middleware_tls_skip_conflict_is_left_to_the_gateway() {
-        // The rule depends on the middleware's HTTP hook version, which only the
+        // The rule depends on the middleware's bindings, which only the
         // gateway's registry knows. At runtime a fail-closed entry that
         // cannot inspect a tls: skip tunnel denies it.
         let data = r#"

@@ -8,7 +8,8 @@
 //! and `HttpSessionMiddleware.EvaluateResponse`), and in WebSocket text messages. Its
 //! manifest requires the `openshell.supervisor-middleware.http-session`
 //! capability, which gateways and supervisors that predate HTTP session hooks
-//! do not support, so they refuse it at Describe.
+//! do not support, so they refuse it at Describe. It also decides about
+//! connections OpenShell cannot inspect (`UninspectableNetworkMiddleware.Evaluate`).
 
 mod guard;
 mod http;
@@ -29,11 +30,15 @@ use openshell_core::proto::middleware::v1::http_session_middleware_server::{
 use openshell_core::proto::middleware::v1::supervisor_middleware_server::{
     SupervisorMiddleware, SupervisorMiddlewareServer,
 };
+use openshell_core::proto::middleware::v1::uninspectable_network_middleware_server::{
+    UninspectableNetworkMiddleware, UninspectableNetworkMiddlewareServer,
+};
 use openshell_core::proto::{
+    EvaluateUninspectableNetworkRequest, EvaluateUninspectableNetworkResponse,
     HttpRequestEvaluation, HttpRequestResult, HttpRequestSessionEvent, HttpResponseSessionEvent,
-    MiddlewareBinding, MiddlewareDescribeRequest, MiddlewareManifest,
-    SupervisorMiddlewareOperation, SupervisorMiddlewarePhase, ValidateConfigRequest,
-    ValidateConfigResponse, WebSocketSessionEvent,
+    MiddlewareBinding, MiddlewareDescribeRequest, MiddlewareDiagnostics, MiddlewareManifest,
+    SupervisorMiddlewareOperation, SupervisorMiddlewarePhase, UninspectableNetworkDecision,
+    ValidateConfigRequest, ValidateConfigResponse, WebSocketSessionEvent,
 };
 use tonic::transport::Server;
 use tonic::{Request, Response, Status};
@@ -81,6 +86,11 @@ impl SupervisorMiddleware for ContentGuard {
             name: MANIFEST_NAME.into(),
             service_version: env!("CARGO_PKG_VERSION").into(),
             bindings: vec![
+                MiddlewareBinding {
+                    operation: SupervisorMiddlewareOperation::UninspectableNetwork as i32,
+                    phase: SupervisorMiddlewarePhase::PreForward as i32,
+                    ..Default::default()
+                },
                 http_binding(
                     SupervisorMiddlewareOperation::HttpRequest,
                     SupervisorMiddlewarePhase::PreCredentials,
@@ -171,6 +181,27 @@ impl HttpSessionMiddleware for ContentGuard {
     }
 }
 
+/// The guard cannot see the content of connections OpenShell does not
+/// inspect, such as `tls: skip` tunnels, so it denies them.
+#[tonic::async_trait]
+impl UninspectableNetworkMiddleware for ContentGuard {
+    async fn evaluate(
+        &self,
+        request: Request<EvaluateUninspectableNetworkRequest>,
+    ) -> Result<Response<EvaluateUninspectableNetworkResponse>, Status> {
+        GuardConfig::parse(request.into_inner().config.as_ref())
+            .map_err(Status::invalid_argument)?;
+        Ok(Response::new(EvaluateUninspectableNetworkResponse {
+            decision: UninspectableNetworkDecision::Deny as i32,
+            diagnostics: Some(MiddlewareDiagnostics {
+                reason: "content guard cannot inspect this connection".into(),
+                reason_code: "uninspectable_traffic".into(),
+                ..Default::default()
+            }),
+        }))
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
@@ -186,6 +217,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .max_decoding_message_size(MAX_GRPC_MESSAGE_BYTES)
                 .max_encoding_message_size(MAX_GRPC_MESSAGE_BYTES),
         )
+        .add_service(UninspectableNetworkMiddlewareServer::new(ContentGuard))
         .serve(cli.bind)
         .await?;
     Ok(())
@@ -200,7 +232,41 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn manifest_advertises_http_session_hook_and_websocket_bindings() {
+    async fn uninspectable_connections_are_denied() {
+        let config = prost_types::Struct {
+            fields: [(
+                "terms".into(),
+                prost_types::Value {
+                    kind: Some(prost_types::value::Kind::ListValue(
+                        prost_types::ListValue {
+                            values: vec![prost_types::Value {
+                                kind: Some(prost_types::value::Kind::StringValue("secret".into())),
+                            }],
+                        },
+                    )),
+                },
+            )]
+            .into(),
+        };
+        let response = UninspectableNetworkMiddleware::evaluate(
+            &ContentGuard,
+            Request::new(EvaluateUninspectableNetworkRequest {
+                config: Some(config),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        assert_eq!(response.decision, UninspectableNetworkDecision::Deny as i32);
+        assert_eq!(
+            response.diagnostics.unwrap().reason_code,
+            "uninspectable_traffic"
+        );
+    }
+
+    #[tokio::test]
+    async fn manifest_advertises_http_websocket_and_connection_bindings() {
         let manifest = SupervisorMiddleware::describe(
             &ContentGuard,
             Request::new(MiddlewareDescribeRequest {
@@ -219,6 +285,7 @@ mod tests {
         assert_eq!(
             operations,
             [
+                SupervisorMiddlewareOperation::UninspectableNetwork as i32,
                 SupervisorMiddlewareOperation::HttpRequest as i32,
                 SupervisorMiddlewareOperation::HttpResponse as i32,
                 SupervisorMiddlewareOperation::WebsocketMessage as i32,

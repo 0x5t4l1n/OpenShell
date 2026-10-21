@@ -17,6 +17,7 @@ A middleware service handles one or more operations, such as HTTP requests or We
 | `HTTP_REQUEST` | `PRE_CREDENTIALS` | After network policy allows a request, before OpenShell injects provider credentials. | `HttpSessionMiddleware.EvaluateRequest`, or v1 `EvaluateHttpRequest` |
 | `HTTP_RESPONSE` | `PRE_RETURN` | After the external service responds, before the sandbox receives the response. | `HttpSessionMiddleware.EvaluateResponse`, or v1 `HttpResponsePreReturn.Evaluate` |
 | `WEBSOCKET_MESSAGE` | `PRE_CREDENTIALS` | When the sandbox opens a WebSocket connection, and for each text message it sends. | `EvaluateWebSocketSession` |
+| `UNINSPECTABLE_NETWORK` | `PRE_FORWARD` | Before OpenShell forwards a connection it cannot inspect, such as a `tls: skip` tunnel. | `UninspectableNetworkMiddleware.Evaluate` |
 
 Your service declares each operation it supports as a binding, an operation and its phase, in its `Describe` manifest. OpenShell calls your service only for the operations it declares.
 
@@ -114,14 +115,6 @@ OpenShell does not update integrity headers, such as `ETag`, `Content-MD5`, `Dig
 OpenShell applies all preflight changes in chain order, then late changes from `buffered_result` or `output_start` in chain order. `begin` carries the head after all preflight changes and earlier stages' late changes. Trailer changes can modify or remove existing trailers but cannot add new names.
 
 OpenShell applies each stage's changes as a unit. If one change is invalid, it discards all of them and fails the stage.
-
-### Uninspectable Traffic
-
-For connections it cannot inspect as HTTP, OpenShell sends request middleware an `uninspectable` preflight. It includes the destination, policy name, and reason: `TLS_SKIP`, `H2C`, `UNSUPPORTED_TUNNEL`, `RAW_TCP`, or `SQL_PASSTHROUGH`.
-
-Return `continue_without_body` to allow the connection or `reject` to refuse it. No body mode or header mutation is allowed. Failures and timeouts refuse the connection too.
-
-This lets request middleware decide whether to allow `tls: skip` endpoints without seeing their content. Recreate sandboxes with older supervisors before attaching such a policy. Entries without a session request binding follow their `on_error` setting.
 
 ### Failures
 
@@ -230,6 +223,18 @@ A denied message closes the connection with code `1008`. When middleware fails, 
 
 </Accordion>
 </AccordionGroup>
+
+## Uninspectable Traffic
+
+OpenShell cannot inspect connections to `tls: skip` endpoints, h2c, unsupported tunnels, raw TCP, or SQL passthrough. To decide whether such a connection may proceed, bind `UNINSPECTABLE_NETWORK` at `PRE_FORWARD` with `max_payload_bytes: 0`, and serve `UninspectableNetworkMiddleware.Evaluate` on the same endpoint as `SupervisorMiddleware`. This binding can be the only one in your manifest.
+
+Before it forwards such a connection, OpenShell calls `Evaluate` once for each selected entry, in chain order. The request carries the entry's configuration, the destination host and port, the reason, and `context`, whose `request_id` identifies the connection. Return `ALLOW_WITHOUT_INSPECTION` to let the connection through or `DENY` to refuse it. Every selected entry must allow the connection. For `tls: skip`, OpenShell decides before it accepts the `CONNECT` request, so a refusal returns `403`.
+
+This hook always fails closed. An unimplemented RPC, an error, a timeout, or an invalid result refuses the connection, regardless of `on_error`.
+
+A selected entry whose service does not bind `UNINSPECTABLE_NETWORK` refuses such connections, and the gateway rejects a policy in which it can select a `tls: skip` endpoint. If that entry sets `on_error: fail_open`, OpenShell instead lets the connection through and records a finding. This exception is deprecated and will be removed in 0.2.0. Add the binding to keep allowing these connections.
+
+Gateways and supervisors that predate this hook reject a manifest that binds it. Upgrade them before you add the binding.
 
 ## Limits
 

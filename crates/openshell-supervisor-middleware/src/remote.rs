@@ -9,7 +9,9 @@ use openshell_core::middleware::{
 use openshell_core::proto::middleware::v1::http_response_pre_return_client::HttpResponsePreReturnClient;
 use openshell_core::proto::middleware::v1::http_session_middleware_client::HttpSessionMiddlewareClient;
 use openshell_core::proto::middleware::v1::supervisor_middleware_client::SupervisorMiddlewareClient;
+use openshell_core::proto::middleware::v1::uninspectable_network_middleware_client::UninspectableNetworkMiddlewareClient;
 use openshell_core::proto::{
+    EvaluateUninspectableNetworkRequest, EvaluateUninspectableNetworkResponse,
     HttpRequestEvaluation, HttpRequestResult, HttpRequestSessionEvent, HttpResponseEvent,
     HttpResponseSessionEvent, MiddlewareDescribeRequest, MiddlewareManifest, ValidateConfigRequest,
     ValidateConfigResponse, WebSocketSessionEvent,
@@ -137,6 +139,17 @@ impl GrpcMiddlewareService {
     ) -> std::result::Result<HttpResponseSessionResultStream, Status> {
         self.service.open_http_response_session(receiver).await
     }
+
+    /// Decide about one uninspectable connection through the gRPC adapter.
+    pub async fn evaluate_uninspectable_network(
+        &self,
+        request: EvaluateUninspectableNetworkRequest,
+    ) -> std::result::Result<EvaluateUninspectableNetworkResponse, Status> {
+        self.service
+            .evaluate_uninspectable_network(Request::new(request))
+            .await
+            .map(Response::into_inner)
+    }
 }
 
 #[derive(Clone)]
@@ -144,6 +157,7 @@ pub struct RemoteMiddlewareService {
     client: SupervisorMiddlewareClient<ExtensionChannel>,
     response_client: HttpResponsePreReturnClient<ExtensionChannel>,
     http_session_client: HttpSessionMiddlewareClient<ExtensionChannel>,
+    uninspectable_client: UninspectableNetworkMiddlewareClient<ExtensionChannel>,
 }
 
 impl RemoteMiddlewareService {
@@ -177,9 +191,10 @@ impl RemoteMiddlewareService {
             response_client: HttpResponsePreReturnClient::new(channel.clone())
                 .max_decoding_message_size(MIDDLEWARE_GRPC_MESSAGE_BYTES)
                 .max_encoding_message_size(MIDDLEWARE_GRPC_MESSAGE_BYTES),
-            http_session_client: HttpSessionMiddlewareClient::new(channel)
+            http_session_client: HttpSessionMiddlewareClient::new(channel.clone())
                 .max_decoding_message_size(MIDDLEWARE_GRPC_MESSAGE_BYTES)
                 .max_encoding_message_size(MIDDLEWARE_GRPC_MESSAGE_BYTES),
+            uninspectable_client: UninspectableNetworkMiddlewareClient::new(channel),
         })
     }
 }
@@ -268,6 +283,14 @@ impl SupervisorMiddlewareEndpoint for RemoteMiddlewareService {
             .await?
             .into_inner();
         Ok(Box::pin(responses))
+    }
+
+    async fn evaluate_uninspectable_network(
+        &self,
+        request: Request<EvaluateUninspectableNetworkRequest>,
+    ) -> std::result::Result<Response<EvaluateUninspectableNetworkResponse>, Status> {
+        let mut client = self.uninspectable_client.clone();
+        client.evaluate(request).await
     }
 }
 

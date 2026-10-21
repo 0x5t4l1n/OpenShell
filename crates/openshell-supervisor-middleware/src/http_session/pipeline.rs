@@ -28,7 +28,6 @@ use std::time::Duration;
 
 use futures::StreamExt as _;
 use futures::stream::FuturesUnordered;
-use prost::Message as _;
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::time::Instant;
 
@@ -36,21 +35,18 @@ use openshell_core::proto::{
     Decision, HeaderMutation, HttpBegin, HttpBodyLimits, HttpBodyMode, HttpBodyModeUnavailable,
     HttpBodyUnavailableReason, HttpBufferedBody, HttpBufferedResult, HttpFinish, HttpHeader,
     HttpInputChunk, HttpInputEnd, HttpOutputChunk, HttpOutputStart, HttpPreflightResult,
-    HttpReject, HttpRequestSessionEvent, HttpRequestSessionPreflight, HttpResponsePreflightHead,
-    HttpResponseSessionEvent, HttpResponseSessionPreflight, MiddlewareDiagnostics,
-    MiddlewareSessionEnd, MiddlewareSessionEndReason, RequestContext, SupervisorMiddlewarePhase,
-    http_buffered_result, http_inspect, http_preflight_result, http_request_session_event,
-    http_request_session_preflight, http_response_session_event,
+    HttpReject, HttpRequestPreflightHead, HttpRequestSessionEvent, HttpRequestSessionPreflight,
+    HttpResponsePreflightHead, HttpResponseSessionEvent, HttpResponseSessionPreflight,
+    MiddlewareDiagnostics, MiddlewareSessionEnd, MiddlewareSessionEndReason, RequestContext,
+    SupervisorMiddlewarePhase, http_buffered_result, http_inspect, http_preflight_result,
+    http_request_session_event, http_response_session_event,
 };
 
 use crate::headers::{self, HeaderAuthority};
 use crate::{
-    ChainRunner, DescribedChainEntry, EXTERNAL_FINDING_LABEL, HttpHookVersion,
-    MAX_MIDDLEWARE_FINDING_BYTES, MAX_MIDDLEWARE_FINDINGS_PER_STAGE, MAX_MIDDLEWARE_METADATA_BYTES,
-    MAX_MIDDLEWARE_METADATA_ENTRIES, MAX_MIDDLEWARE_PAYLOAD_BYTES, MAX_MIDDLEWARE_REASON_BYTES,
-    MAX_MIDDLEWARE_REASON_CODE_BYTES, MiddlewareDenial, MiddlewareDiagnosticPolicy,
-    MiddlewareInvocation, MiddlewareSessionPermit, NamespacedFinding, OnError,
-    TransformedBodyPolicy, is_stable_reason_code, middleware_denial_reason, safe_reason,
+    ChainRunner, DescribedChainEntry, HttpHookVersion, MAX_MIDDLEWARE_PAYLOAD_BYTES,
+    MiddlewareDenial, MiddlewareDiagnosticPolicy, MiddlewareInvocation, MiddlewareSessionPermit,
+    NamespacedFinding, OnError, TransformedBodyPolicy, middleware_denial_reason, safe_reason,
 };
 
 /// Largest normalized body chunk a stage sends or receives.
@@ -406,9 +402,9 @@ pub struct PreflightFields {
 
 impl PreflightFields {
     /// An `HttpSessionMiddleware.EvaluateRequest` preflight at `PRE_CREDENTIALS`.
-    pub fn request(self, subject: http_request_session_preflight::Subject) -> StagePreflight {
+    pub fn request(self, request: HttpRequestPreflightHead) -> StagePreflight {
         StagePreflight::Request(HttpRequestSessionPreflight {
-            subject: Some(subject),
+            request: Some(request),
             phase: SupervisorMiddlewarePhase::PreCredentials as i32,
             context: Some(self.context),
             middleware_name: self.middleware_name,
@@ -2199,63 +2195,27 @@ fn duration_to_proto(duration: Duration) -> prost_types::Duration {
     }
 }
 
-pub(super) fn validate_diagnostics(
+fn validate_diagnostics(
     entry: &DescribedChainEntry,
     diagnostics: Option<&MiddlewareDiagnostics>,
 ) -> Result<MiddlewareDiagnostics, HttpMiddlewareFailure> {
-    let diagnostics = diagnostics.cloned().unwrap_or_default();
-    if diagnostics.reason.len() > MAX_MIDDLEWARE_REASON_BYTES {
-        return Err(entry_failure(entry, "diagnostics_reason_over_capacity"));
-    }
-    if !diagnostics.reason_code.is_empty()
-        && (diagnostics.reason_code.len() > MAX_MIDDLEWARE_REASON_CODE_BYTES
-            || !is_stable_reason_code(&diagnostics.reason_code))
-    {
-        return Err(entry_failure(entry, "diagnostics_reason_code_invalid"));
-    }
-    if diagnostics.findings.len() > MAX_MIDDLEWARE_FINDINGS_PER_STAGE
-        || diagnostics
-            .findings
-            .iter()
-            .any(|finding| finding.encoded_len() > MAX_MIDDLEWARE_FINDING_BYTES)
-    {
-        return Err(entry_failure(entry, "diagnostics_findings_over_capacity"));
-    }
-    if diagnostics.metadata.len() > MAX_MIDDLEWARE_METADATA_ENTRIES
-        || diagnostics
-            .metadata
-            .iter()
-            .map(|(key, value)| key.len().saturating_add(value.len()))
-            .fold(0usize, usize::saturating_add)
-            > MAX_MIDDLEWARE_METADATA_BYTES
-    {
-        return Err(entry_failure(entry, "diagnostics_metadata_over_capacity"));
-    }
-    Ok(diagnostics)
+    crate::diagnostics::validate_diagnostics(diagnostics)
+        .map_err(|reason| entry_failure(entry, reason))
 }
 
 /// Namespace one stage's findings and metadata. External services get the
 /// same normalization as v1 HTTP hook results: no metadata and no service-chosen
 /// finding text.
-pub(super) fn collect_diagnostics(
+fn collect_diagnostics(
     entry: &DescribedChainEntry,
     mut diagnostics: MiddlewareDiagnostics,
     collected: &mut HttpStageDiagnostics,
 ) {
-    if diagnostic_policy(entry) == MiddlewareDiagnosticPolicy::Normalize {
-        diagnostics.metadata.clear();
-        for finding in &mut diagnostics.findings {
-            finding.r#type = format!("{}.finding", entry.entry.implementation);
-            finding.label = EXTERNAL_FINDING_LABEL.to_string();
-            finding.confidence.clear();
-            finding.severity = match finding.severity.as_str() {
-                "low" => "low",
-                "high" => "high",
-                _ => "medium",
-            }
-            .to_string();
-        }
-    }
+    crate::diagnostics::normalize_diagnostics(
+        &entry.entry.implementation,
+        diagnostic_policy(entry),
+        &mut diagnostics,
+    );
     collected.findings.extend(
         diagnostics
             .findings

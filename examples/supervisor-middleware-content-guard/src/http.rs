@@ -2,14 +2,12 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! HTTP session hooks (`HttpSessionMiddleware.EvaluateRequest` and
-//! `HttpSessionMiddleware.EvaluateResponse`) for requests, responses, and uninspectable
-//! connections.
+//! `HttpSessionMiddleware.EvaluateResponse`) for requests and responses.
 //!
 //! The guard selects its configured body mode, BUFFERED by default, and falls
 //! back to the other mode when OpenShell offers only that one. A message
 //! without a body continues. A message the guard cannot inspect, such as an
-//! encoded body, is rejected with reason code `cannot_inspect`. Uninspectable
-//! connections are rejected unless the config sets `uninspectable: allow`.
+//! encoded body, is rejected with reason code `cannot_inspect`.
 //!
 //! OpenShell leaves integrity headers such as `ETag` and `Content-Digest`
 //! alone. When the guard may change a body, it removes them itself.
@@ -24,9 +22,8 @@ use openshell_core::proto::{
     HttpPreflightResult, HttpReject, HttpRequestPreflightHead, HttpRequestSessionEvent,
     HttpRequestSessionResult, HttpResponseSessionEvent, HttpResponseSessionResult, HttpStreamMode,
     HttpUnchanged, MiddlewareDiagnostics, RemoveHeader, header_mutation, http_buffered_result,
-    http_inspect, http_preflight_result, http_request_session_event,
-    http_request_session_preflight, http_request_session_result, http_response_session_event,
-    http_response_session_result,
+    http_inspect, http_preflight_result, http_request_session_event, http_request_session_result,
+    http_response_session_event, http_response_session_result,
 };
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
@@ -125,22 +122,13 @@ enum Subject {
     Missing,
     Request(HttpRequestPreflightHead),
     Response,
-    Uninspectable,
 }
 
 fn request_event(event: HttpRequestSessionEvent) -> Option<Event> {
     use http_request_session_event::Event as Wire;
     Some(match event.event? {
         Wire::Preflight(preflight) => Event::Preflight(Box::new(Preflight {
-            subject: match preflight.subject {
-                Some(http_request_session_preflight::Subject::Request(head)) => {
-                    Subject::Request(head)
-                }
-                Some(http_request_session_preflight::Subject::Uninspectable(_)) => {
-                    Subject::Uninspectable
-                }
-                None => Subject::Missing,
-            },
+            subject: preflight.request.map_or(Subject::Missing, Subject::Request),
             config: preflight.config,
             permitted_body_modes: preflight.permitted_body_modes,
             unavailable_body_modes: preflight.unavailable_body_modes,
@@ -327,17 +315,6 @@ enum Decision {
 fn preflight_decision(preflight: Preflight) -> Result<Decision, Status> {
     let config = GuardConfig::parse(preflight.config.as_ref()).map_err(Status::invalid_argument)?;
     match &preflight.subject {
-        Subject::Uninspectable => {
-            return Ok(if config.allow_uninspectable {
-                Decision::Continue
-            } else {
-                Decision::Reject(MiddlewareDiagnostics {
-                    reason: "content guard cannot inspect this connection".into(),
-                    reason_code: "uninspectable_traffic".into(),
-                    ..Default::default()
-                })
-            });
-        }
         // The request target cannot be redacted, so a configured term in the
         // path or query rejects the request before its body is read or the
         // upstream is contacted.
@@ -757,39 +734,6 @@ mod tests {
     }
 
     #[test]
-    fn uninspectable_traffic_is_denied_unless_allowed() {
-        let subject = || Subject::Uninspectable;
-        let denied = only(
-            Stage::Preflight
-                .handle(preflight(subject(), "redact", &[], &[]))
-                .unwrap(),
-        );
-        let Reply::Reject(reject) = denied else {
-            panic!("expected a rejection")
-        };
-        assert_eq!(
-            reject.diagnostics.unwrap().reason_code,
-            "uninspectable_traffic"
-        );
-        assert!(matches!(
-            only(
-                Stage::Preflight
-                    .handle(preflight(
-                        subject(),
-                        "redact",
-                        &[("uninspectable", "allow")],
-                        &[]
-                    ))
-                    .unwrap()
-            ),
-            Reply::Preflight(HttpPreflightResult {
-                decision: Some(http_preflight_result::Decision::ContinueWithoutBody(_)),
-                ..
-            })
-        ));
-    }
-
-    #[test]
     fn stage_enforces_its_lifecycle() {
         assert_eq!(
             Stage::Preflight
@@ -840,9 +784,7 @@ mod tests {
         let request = request_stream(tokio_stream::iter(
             [
                 http_request_session_event::Event::Preflight(HttpRequestSessionPreflight {
-                    subject: Some(http_request_session_preflight::Subject::Request(
-                        HttpRequestPreflightHead::default(),
-                    )),
+                    request: Some(HttpRequestPreflightHead::default()),
                     config: config.clone(),
                     permitted_body_modes: permitted.clone(),
                     limits,

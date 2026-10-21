@@ -200,66 +200,42 @@ impl HttpMiddlewareExchange {
     }
 }
 
-/// How traffic a middleware chain can never inspect (h2c, non-HTTP TCP,
-/// protocols without an L7 relay) must be handled for a matching chain.
-///
-/// v1 HTTP hook entries derive this from their `on_error`. HTTP session hook
-/// request middleware decides itself at an uninspectable preflight; see
-/// [`uninspectable_traffic_decision`].
+/// How traffic a middleware chain can never inspect (`tls: skip`, h2c,
+/// non-HTTP TCP, protocols without an L7 relay) must be handled for a
+/// matching chain. See [`uninspectable_traffic_decision`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UninspectableTrafficGate {
     /// No middleware matches this destination; raw relay is unaffected.
     Unrestricted,
-    /// Every matching entry is `fail_open`: relay raw bytes but emit a bypass
-    /// detection finding.
+    /// Every entry allowed the connection, and at least one is an entry
+    /// without the uninspectable binding that sets `on_error: fail_open`:
+    /// relay raw bytes but emit a bypass detection finding. Deprecated;
+    /// removed in 0.2.0.
     BypassWithFinding,
-    /// At least one matching entry is `fail_closed`, or an HTTP session hook
-    /// stage rejected or failed: deny.
+    /// An entry denied the connection or failed.
     Deny,
-    /// Every HTTP session hook stage let the connection continue, and no other
-    /// entry requires inspection.
+    /// Every entry allowed the connection.
     Allowed,
-}
-
-pub fn uninspectable_traffic_gate(
-    chain: &[openshell_supervisor_middleware::ChainEntry],
-) -> UninspectableTrafficGate {
-    if chain.is_empty() {
-        return UninspectableTrafficGate::Unrestricted;
-    }
-    if chain
-        .iter()
-        .all(|entry| entry.on_error == openshell_supervisor_middleware::OnError::FailOpen)
-    {
-        UninspectableTrafficGate::BypassWithFinding
-    } else {
-        UninspectableTrafficGate::Deny
-    }
 }
 
 /// Decide about traffic a matching middleware chain cannot inspect.
 ///
-/// A chain without an HTTP session hook entry that binds `HTTP_REQUEST` keeps the
-/// v1 HTTP hook rule of [`uninspectable_traffic_gate`]. Otherwise each such
-/// entry decides at an uninspectable preflight, in chain order, and other
-/// entries follow their `on_error`. Any failure of a deciding stage denies.
+/// Entries whose service binds `UNINSPECTABLE_NETWORK/PRE_FORWARD` decide
+/// through `UninspectableNetworkMiddleware.Evaluate`, and any failure denies.
+/// Other entries follow their `on_error`.
 pub async fn uninspectable_traffic_decision(
     runner: &openshell_supervisor_middleware::ChainRunner,
     chain: &[openshell_supervisor_middleware::ChainEntry],
     ctx: &L7EvalContext,
     reason: openshell_core::proto::UninspectableTrafficReason,
 ) -> UninspectableTrafficGate {
-    let decides = chain
-        .iter()
-        .any(|entry| runner.decides_uninspectable_traffic(&entry.implementation));
-    if !decides {
-        return uninspectable_traffic_gate(chain);
+    if chain.is_empty() {
+        return UninspectableTrafficGate::Unrestricted;
     }
     let input = openshell_supervisor_middleware::UninspectableTrafficInput {
         context: middleware_request_context(ctx, &uuid::Uuid::new_v4().to_string()),
         host: ctx.host.clone(),
         port: ctx.port,
-        endpoint: ctx.policy_name.clone(),
         reason,
     };
     let outcome = runner.evaluate_uninspectable(chain, input).await;
@@ -269,7 +245,8 @@ pub async fn uninspectable_traffic_decision(
     if !outcome.allowed {
         UninspectableTrafficGate::Deny
     } else if outcome.invocations.iter().any(|invocation| {
-        invocation.outcome == openshell_supervisor_middleware::HttpStageOutcome::FailOpen
+        invocation.outcome
+            == openshell_supervisor_middleware::UninspectableInvocationOutcome::LegacyBypass
     }) {
         UninspectableTrafficGate::BypassWithFinding
     } else {
@@ -307,7 +284,7 @@ pub(super) fn uninspectable_decision_events(
     reason: openshell_core::proto::UninspectableTrafficReason,
     outcome: &openshell_supervisor_middleware::UninspectableOutcome,
 ) -> Vec<openshell_ocsf::OcsfEvent> {
-    use openshell_supervisor_middleware::HttpStageOutcome;
+    use openshell_supervisor_middleware::UninspectableInvocationOutcome;
     let traffic = reason
         .as_str_name()
         .trim_start_matches("UNINSPECTABLE_TRAFFIC_REASON_")
@@ -317,33 +294,33 @@ pub(super) fn uninspectable_decision_events(
         .iter()
         .map(|invocation| {
             let (action, disposition, severity, status, name) = match invocation.outcome {
-                HttpStageOutcome::Continue => (
+                UninspectableInvocationOutcome::AllowWithoutInspection => (
                     ActionId::Allowed,
                     DispositionId::Allowed,
                     SeverityId::Informational,
                     StatusId::Success,
-                    "continue",
+                    "allow_without_inspection",
                 ),
-                HttpStageOutcome::Reject => (
+                UninspectableInvocationOutcome::LegacyBypass => (
+                    ActionId::Allowed,
+                    DispositionId::Allowed,
+                    SeverityId::Medium,
+                    StatusId::Success,
+                    "legacy_bypass",
+                ),
+                UninspectableInvocationOutcome::Deny => (
                     ActionId::Denied,
                     DispositionId::Blocked,
                     SeverityId::Medium,
                     StatusId::Failure,
-                    "reject",
+                    "deny",
                 ),
-                HttpStageOutcome::FailOpen => (
-                    ActionId::Allowed,
-                    DispositionId::Allowed,
-                    SeverityId::Medium,
-                    StatusId::Failure,
-                    "fail_open",
-                ),
-                _ => (
+                UninspectableInvocationOutcome::Failed => (
                     ActionId::Denied,
                     DispositionId::Blocked,
                     SeverityId::High,
                     StatusId::Failure,
-                    "fail_closed",
+                    "evaluation_failed",
                 ),
             };
             let reason_code = invocation.reason_code.as_deref().unwrap_or("-");
@@ -2531,6 +2508,52 @@ mod tests {
                 safe_middleware_headers(headers).is_err(),
                 "middleware must reject malformed header fields"
             );
+        }
+    }
+    #[test]
+    fn connection_audit_distinguishes_approval_denial_and_evaluation_failure() {
+        use super::uninspectable_decision_events;
+        use openshell_ocsf::SeverityId;
+        use openshell_supervisor_middleware::{
+            UninspectableInvocation, UninspectableInvocationOutcome as Outcome,
+            UninspectableOutcome,
+        };
+        let ctx = L7EvalContext {
+            host: "example.test".into(),
+            port: 443,
+            policy_name: "policy".into(),
+            ..Default::default()
+        };
+        for (outcome, expected, severity) in [
+            (
+                Outcome::AllowWithoutInspection,
+                "allow_without_inspection",
+                SeverityId::Informational,
+            ),
+            (Outcome::LegacyBypass, "legacy_bypass", SeverityId::Medium),
+            (Outcome::Deny, "deny", SeverityId::Medium),
+            (Outcome::Failed, "evaluation_failed", SeverityId::High),
+        ] {
+            let events = uninspectable_decision_events(
+                &ctx,
+                openshell_core::proto::UninspectableTrafficReason::TlsSkip,
+                &UninspectableOutcome {
+                    invocations: vec![UninspectableInvocation {
+                        config_name: "guard".into(),
+                        implementation: "registration".into(),
+                        outcome,
+                        reason_code: None,
+                        failure_reason: None,
+                    }],
+                    ..Default::default()
+                },
+            );
+            assert_eq!(events.len(), 1);
+            assert_eq!(events[0].class_uid(), 4001);
+            assert_eq!(events[0].base().severity, severity);
+            let json = serde_json::to_string(&events).unwrap();
+            assert!(json.contains(&format!("MIDDLEWARE_UNINSPECTABLE {expected} ")));
+            assert!(!json.contains("fail_open"));
         }
     }
 }
