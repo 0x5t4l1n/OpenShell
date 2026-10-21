@@ -314,8 +314,9 @@ Run the Docker-backed Rust CLI e2e suite:
 mise run e2e:docker
 ```
 
-Run the portable CLI conformance suite against the gateway selected in your
-OpenShell CLI configuration:
+Run the sandbox suites against the gateway selected in your OpenShell CLI
+configuration. The `oci-image` suite needs `OPENSHELL_TEST_CONTAINER_ENGINE`, so
+this excludes it; run it with `mise run e2e:oci-image`:
 
 ```shell
 cargo build --package openshell-cli
@@ -324,6 +325,7 @@ OPENSHELL_BIN="$PWD/target/debug/openshell" \
     --locked \
     --manifest-path tests/suites/sandbox/Cargo.toml \
     --workspace \
+    --exclude openshell-test-sandbox-oci-image \
     --no-fail-fast \
     -- \
     --test-threads=1 \
@@ -358,7 +360,7 @@ openshell sandbox list --output json
 openshell sandbox delete <sandbox-name>
 ```
 
-Gateway-backed Rust E2E tasks run the CLI conformance Cargo tests against the
+Gateway-backed Rust E2E tasks run the testkit sandbox suites against the
 configured gateway, then run any lane-specific Rust tests that still apply.
 Run the Podman-backed Rust CLI e2e suite:
 
@@ -379,11 +381,11 @@ for the host's architecture (`aarch64` or `x86_64`), such as Docker Desktop on
 macOS. The package version defaults to the development version that branch CI
 computes; set `OPENSHELL_RPM_VERSION` and `OPENSHELL_RPM_RELEASE` to override
 it. After `nix run .#build-artifacts-binaries`, `nix run .#build-artifacts-rpm`
-rebuilds only the RPMs. Run conformance against the installed RPMs:
+rebuilds only the RPMs. Run the sandbox suites against the installed RPMs:
 
 ```shell
 nix run .#build-artifacts
-nix run .#tmachine -- test fedora-podman-rootful rpm conformance
+nix run .#tmachine -- test fedora-podman-rootful rpm sandbox
 ```
 
 Run the portable subset in a disposable rootless Podman guest:

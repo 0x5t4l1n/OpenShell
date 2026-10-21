@@ -109,6 +109,9 @@
           [profile.default]
           slow-timeout = { period = "30s", terminate-after = 4 }
 
+          [profile.default.junit]
+          path = "junit.xml"
+
     - name: Run the suite archive
       ansible.builtin.command:
         argv:
@@ -135,6 +138,24 @@
       changed_when: false
       failed_when: false
       when: gateway_status is succeeded and not (controller_readiness_failed | default(false))
+
+    # Keep the JUnit report with the run. The integration runner uploads
+    # artifacts/tmachine-diagnostics whether or not the lane passes.
+    - name: Find the JUnit report
+      ansible.builtin.find:
+        paths: "/var/lib/openshell-suite/{{ suite_name }}"
+        patterns: junit.xml
+        recurse: true
+      register: suite_junit
+      failed_when: false
+
+    - name: Fetch the JUnit report
+      ansible.builtin.fetch:
+        src: "{{ item.path }}"
+        dest: "{{ playbook_dir }}/../../../../../artifacts/tmachine-diagnostics/junit/{{ suite_name }}-{{ inventory_hostname }}.xml"
+        flat: true
+      loop: "{{ suite_junit.files | default([]) }}"
+      failed_when: false
 
     # Preserve both streams for failures without adding passing-test output to
     # every tmachine run.
