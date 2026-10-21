@@ -485,6 +485,8 @@ message HttpBufferedResult {
   // Head mutations applied after this stage's preflight mutations, before
   // the next stage receives its preflight.
   repeated HeaderMutation header_mutations = 3;
+  // Ordered trailer mutations. A write must name a trailer the input already
+  // carries; removing an absent name does nothing.
   repeated HeaderMutation trailer_mutations = 4;
   MiddlewareDiagnostics diagnostics = 5;
 }
@@ -493,8 +495,6 @@ message HttpUnchanged {}
 
 message HttpInputChunk {
   // Nonempty bytes without transfer framing. Boundaries carry no meaning.
-  // Ordered trailer mutations. A write must name a trailer the input already
-  // carries; removing an absent name does nothing.
   bytes data = 1;
 }
 
@@ -528,6 +528,8 @@ message HttpOutputChunk {
 // STREAM terminal success. Valid only after output_start and after input_end
 // was consumed.
 message HttpFinish {
+  // Ordered trailer mutations, under the rules of
+  // HttpBufferedResult.trailer_mutations.
   repeated HeaderMutation trailer_mutations = 1;
   MiddlewareDiagnostics diagnostics = 2;
 }
@@ -536,8 +538,6 @@ message HttpFinish {
 // head reaches the sandbox, OpenShell answers the sandbox with the canonical
 // 403 middleware denial with the validated reason_code. A message already
 // partly delivered stays incomplete: OpenShell withholds its terminating chunk
-  // Ordered trailer mutations, under the rules of
-  // HttpBufferedResult.trailer_mutations.
 // or final byte, trailers, and any error body, and closes that connection.
 // A stage that cannot inspect an HTTP message, such as a body in a format it
 // does not understand, denies it with a reason_code that says so.
