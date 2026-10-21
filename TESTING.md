@@ -156,7 +156,7 @@ CI runs them in two Branch E2E jobs (label `test:e2e`). `testkit-e2e` runs
 runs them through a tmachine lane that installs the Debian package. The suite's playbook
 fails the lane if fewer tests run than it expects, so raise
 `suite_expected_tests` in
-`tests/ansible/playbooks/suites/sandbox-lifecycle.yaml` when you add a
+`tests/tmachine/ansible/playbooks/suites/sandbox-lifecycle.yaml` when you add a
 test.
 
 Workspaces that build root crates through path dependencies must lock shared

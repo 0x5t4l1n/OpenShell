@@ -77,7 +77,7 @@ jobs:
           # actions/cache doesn't save after an exact key hit, so a fixed key
           # would rebuild the changed layers on every run. Key on the playbooks
           # and fall back to the newest entry for the same runner.
-          key: tmachine-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('tests/ansible/**') }}
+          key: tmachine-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('tests/tmachine/ansible/**') }}
           restore-keys: |
             tmachine-${{ runner.os }}-${{ runner.arch }}-
 

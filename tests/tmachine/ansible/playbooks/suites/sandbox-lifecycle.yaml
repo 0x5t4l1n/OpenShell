@@ -128,7 +128,7 @@
     - name: Fetch the JUnit report
       ansible.builtin.fetch:
         src: "{{ item.path }}"
-        dest: "{{ playbook_dir }}/../../../../artifacts/tmachine-diagnostics/junit/sandbox-lifecycle-{{ inventory_hostname }}.xml"
+        dest: "{{ playbook_dir }}/../../../../../artifacts/tmachine-diagnostics/junit/sandbox-lifecycle-{{ inventory_hostname }}.xml"
         flat: true
       loop: "{{ suite_junit.files | default([]) }}"
       failed_when: false
