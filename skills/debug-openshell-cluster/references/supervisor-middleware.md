@@ -26,6 +26,12 @@ A service selects HTTP session hooks for all of its HTTP bindings by listing `op
 
 When gateway JWT signing is disabled, supervisors preserve the legacy unauthenticated connector and do not request extension credentials. When signing is enabled, credential acquisition and verification failures are fail closed: check HTTPS trust and hostname validation, audience and issuer agreement, the token `kid`, gateway `RefreshSandboxToken` errors, and middleware logs. Changing a registration requires a gateway restart. A policy update can also fail before persistence if the selected implementation rejects its `network_middlewares` config.
 
+## HTTP session stage ordering
+
+Each HTTP session stage receives preflight only after the preceding stage establishes its output headers. If a later service has no RPC yet, check whether the earlier service has returned `buffered_result` or `output_start`. A stage that continues without inspection passes its header changes immediately. Later stages see earlier body-time header changes before choosing inspection.
+
+Preflight and BUFFERED processing share the per-message buffering slot. A chain with deferred decisions also reserves a stream slot. If a deferred preflight cannot acquire capacity within its setup budget, the exchange fails closed with `middleware_unavailable`; services not yet opened receive no session-end event.
+
 ## HTTP response failures
 
 For response failures, distinguish a deliberate `middleware_denied` decision from `response_delivery_failed`. Before response commitment, they produce canonical 403 and 502 responses respectively. After commitment, OpenShell aborts without adding an error body, final chunk, or trailer. A whole-body accumulation timeout is one fixed, non-resetting 120-second wall-clock deadline shared across response reads and whole-body barriers; inspect the active stage's `on_error` and `whole_body_accumulation_timeout` diagnostics. Header-only stages preserve upstream body framing. Body-processing stages normalize framing and send a trailer exchange, including an empty trailer set, after the final body result.

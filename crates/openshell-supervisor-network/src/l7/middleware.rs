@@ -1046,7 +1046,7 @@ async fn apply_pipeline_middleware_chain<C: AsyncRead + AsyncWrite + Unpin + Sen
     let (prepared_headers, mut reader) =
         crate::l7::rest::prepare_request_body_stream(&req, client).await?;
     if delivery == RequestBodyDelivery::Incremental
-        && !session.withholds_output()
+        && !session.buffers_final_output()
         && !matches!(req.body_length, crate::l7::provider::BodyLength::None)
         && request_line_is_http11(head)
         && !crate::l7::rest::request_has_upgrade_header(head)
@@ -1068,7 +1068,9 @@ async fn apply_pipeline_middleware_chain<C: AsyncRead + AsyncWrite + Unpin + Sen
         });
     }
 
-    let progress = session.streams().then_some(REQUEST_CLIENT_PROGRESS_TIMEOUT);
+    let progress = session
+        .may_stream()
+        .then_some(REQUEST_CLIENT_PROGRESS_TIMEOUT);
     let (output, mut outputs) = mpsc::channel(4);
     let collect = async move {
         let mut late = Vec::new();
@@ -1434,7 +1436,9 @@ impl RequestBodyStream {
             .session
             .take()
             .ok_or_else(|| miette!("request middleware body already ran"))?;
-        let progress = session.streams().then_some(REQUEST_CLIENT_PROGRESS_TIMEOUT);
+        let progress = session
+            .may_stream()
+            .then_some(REQUEST_CLIENT_PROGRESS_TIMEOUT);
         let error = match run_request_body(
             session,
             &mut self.reader,

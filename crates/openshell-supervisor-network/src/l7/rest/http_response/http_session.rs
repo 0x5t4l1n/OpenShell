@@ -551,7 +551,7 @@ async fn read_trailer_fields<R: AsyncRead + Unpin>(
 struct ResponseWriter<'c, 'a, C> {
     client: &'c mut C,
     status_line: &'a str,
-    /// Head after every preflight mutation.
+    /// Head after the initial preflight prefix.
     headers: &'a [HttpHeader],
     parsed: &'a ParsedResponseHead,
     /// The client can decode chunked framing.

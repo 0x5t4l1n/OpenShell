@@ -103,7 +103,7 @@ The echoed JSON body contains `[FILTERED]` instead of the configured term.
 
 At preflight, the guard selects its configured `body_mode`, BUFFERED by default, and falls back to the other mode when OpenShell offers only that one. BUFFERED inspects one complete body of at most 256 KiB. STREAM has no size limit: it releases every complete line at once and withholds only the bytes that may begin a term split across chunks, so line-oriented streams such as server-sent events keep flowing. Redaction can make the output longer than the input, so the guard splits it into chunks within the limit OpenShell offers.
 
-- A request whose path or query contains a configured term is rejected at preflight with reason code `content_match`, before its body is read or the upstream is contacted.
+- The guard denies a request whose path or query contains a configured term at preflight with reason code `content_match`. This happens before the guard receives body bytes or OpenShell contacts the upstream. Earlier middleware may already have processed the body.
 - A message with an empty or absent body continues without inspection.
 - When OpenShell offers no body mode, such as for an encoded request or response, or a partial or `no-transform` response, the guard rejects the message with reason code `cannot_inspect`.
 - The guard binds `UNINSPECTABLE_NETWORK/PRE_FORWARD`, so OpenShell asks it through `UninspectableNetworkMiddleware.Evaluate` before forwarding a connection it cannot inspect, such as a `tls: skip` tunnel. The guard cannot see their content, so it denies them with reason code `uninspectable_traffic`.

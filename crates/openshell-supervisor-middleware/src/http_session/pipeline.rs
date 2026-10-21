@@ -3,14 +3,10 @@
 
 //! HTTP session hook stage pipeline, shared by request and response evaluation.
 //!
-//! Preflight runs every selected stage in chain order. Stages that inspect
-//! the body then run concurrently, linked by bounded channels. Each stage
-//! waits for its upstream `Start`, sends `Begin` with the head after every
-//! preflight mutation and the late mutations of earlier stages, and forwards
-//! its own `Start` only after that. The outgoing head therefore
-//! commits only on the final `Start`, once every late header mutation is
-//! known: the original head, then every preflight mutation, then every late
-//! mutation, each in chain order.
+//! Each stage opens when the preceding stage establishes its output headers.
+//! Header-only stages continue immediately; inspecting stages emit `Start`
+//! after their preflight and body-time header changes. Bounded channels link
+//! the stages, and the relay commits headers only on the final `Start`.
 //!
 //! BUFFERED stages hold one bounded body under a whole-body deadline. STREAM
 //! stages run independent input and output pumps with no total deadline and
@@ -24,11 +20,12 @@
 use std::collections::BTreeMap;
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::{Arc, Weak};
 use std::time::Duration;
 
 use futures::StreamExt as _;
 use futures::stream::FuturesUnordered;
-use tokio::sync::{mpsc, oneshot, watch};
+use tokio::sync::{Mutex, mpsc, oneshot, watch};
 use tokio::time::Instant;
 
 use openshell_core::proto::{
@@ -44,9 +41,10 @@ use openshell_core::proto::{
 
 use crate::headers::{self, HeaderAuthority};
 use crate::{
-    ChainRunner, DescribedChainEntry, HttpHookVersion, MAX_MIDDLEWARE_PAYLOAD_BYTES,
-    MiddlewareDenial, MiddlewareDiagnosticPolicy, MiddlewareInvocation, MiddlewareSessionPermit,
-    NamespacedFinding, OnError, TransformedBodyPolicy, middleware_denial_reason, safe_reason,
+    ChainRunner, DescribedChainEntry, HttpHookVersion, MAX_MIDDLEWARE_CHAIN_TIMEOUT,
+    MAX_MIDDLEWARE_PAYLOAD_BYTES, MiddlewareDenial, MiddlewareDiagnosticPolicy,
+    MiddlewareInvocation, MiddlewareSessionPermit, NamespacedFinding, OnError,
+    TransformedBodyPolicy, middleware_denial_reason, safe_reason,
 };
 
 /// Largest normalized body chunk a stage sends or receives.
@@ -157,8 +155,9 @@ pub enum HttpBodyInput {
 /// Body output of a pipeline: one `Start`, chunks, then one `End`.
 #[derive(Debug, PartialEq, Eq)]
 pub enum HttpBodyOutput {
-    /// Commit the outgoing head. Apply `header_mutations`, every stage's late
-    /// mutations in chain order, after the preflight mutations. When
+    /// Commit the outgoing head. Apply `header_mutations` after the initial
+    /// preflight prefix. These include deferred preflight and body-time
+    /// mutations, in stage order. When
     /// `output_body_bytes` is present, the body has exactly that length.
     Start {
         header_mutations: Vec<HeaderMutation>,
@@ -371,13 +370,22 @@ impl BodyModeOffer {
 }
 
 /// What a pipeline evaluates: the preflight and body eligibility.
-pub trait StageHead: Sync {
+pub trait StageHead: Send + Sync {
     /// Sandbox and request identity shown to every stage.
     fn context(&self) -> &RequestContext;
 
     /// Preflight shown to a stage, given the head after earlier stages'
-    /// preflight mutations and the fields every preflight carries.
+    /// complete output mutations and the fields every preflight carries.
     fn preflight(&self, headers: &[HttpHeader], fields: PreflightFields) -> StagePreflight;
+
+    /// Refresh platform-owned framing metadata for this representation.
+    fn current_headers(
+        &self,
+        headers: &[HttpHeader],
+        _declared_body_bytes: Option<u64>,
+    ) -> Vec<HttpHeader> {
+        headers.to_vec()
+    }
 
     /// Body modes `entry` may select: those the message is eligible for
     /// within the entry's payload limit. `declared_body_bytes` is the
@@ -385,6 +393,7 @@ pub trait StageHead: Sync {
     fn body_modes(
         &self,
         entry: &DescribedChainEntry,
+        headers: &[HttpHeader],
         declared_body_bytes: Option<u64>,
     ) -> BodyModeOffer;
 }
@@ -644,7 +653,7 @@ pub struct Preflight {
     pub reason: String,
     pub denial: Option<MiddlewareDenial>,
     pub failure: Option<MiddlewareFailureDetail>,
-    /// Head after every preflight mutation.
+    /// Head after the initial preflight prefix.
     pub headers: Vec<HttpHeader>,
     /// Preflight mutations in chain order.
     pub header_mutations: Vec<HeaderMutation>,
@@ -734,7 +743,7 @@ pub(super) fn preflight_deadline(
 /// Build the preflight for `entry`.
 pub(super) fn preflight_event(
     entry: &DescribedChainEntry,
-    head: &impl StageHead,
+    head: &dyn StageHead,
     headers: &[HttpHeader],
     offer: BodyModeOffer,
     timeouts: PipelineTimeouts,
@@ -755,163 +764,173 @@ pub(super) fn preflight_event(
     )
 }
 
-/// Run preflight for `entries` in chain order, each stage within its binding
-/// timeout and `chain_deadline`.
+struct PreparedStage {
+    headers: Vec<HttpHeader>,
+    header_mutations: Vec<HeaderMutation>,
+    diagnostics: HttpStageDiagnostics,
+    stage: Option<Stage>,
+}
+
+async fn prepare_stage(
+    entry: &DescribedChainEntry,
+    spec: &PipelineSpec,
+    input_headers: &[HttpHeader],
+    declared_body_bytes: Option<u64>,
+    head: &dyn StageHead,
+    chain_deadline: Instant,
+) -> Result<PreparedStage, HttpMiddlewareFailure> {
+    if !entry.is_resolved() {
+        if entry.on_error() == OnError::FailOpen {
+            let mut diagnostics = HttpStageDiagnostics::default();
+            diagnostics
+                .invocations
+                .push(fail_open_invocation(entry, "binding_not_described"));
+            return Ok(PreparedStage {
+                headers: input_headers.to_vec(),
+                header_mutations: Vec::new(),
+                diagnostics,
+                stage: None,
+            });
+        }
+        return Err(entry_failure(entry, "binding_not_described"));
+    }
+    if entry.http_hook_version() != Some(HttpHookVersion::Session) {
+        return Err(entry_failure(entry, MIDDLEWARE_HOOK_VERSIONS_MIXED));
+    }
+    let offer = head.body_modes(entry, input_headers, declared_body_bytes);
+    let permitted = offer.permitted.clone();
+    let event = preflight_event(
+        entry,
+        head,
+        input_headers,
+        offer,
+        spec.timeouts,
+        declared_body_bytes,
+    );
+    let (deadline, timeout_reason) = preflight_deadline(entry, chain_deadline);
+    let (mut stream, first) = open_stage(entry, event, deadline, timeout_reason).await?;
+    let decision = (|| {
+        let result = match classify_result(entry, first)? {
+            StageResult::PreflightResult(result) => result,
+            StageResult::Deny(deny) => return Err(denial(entry, deny.diagnostics.as_ref())),
+            _ => return Err(entry_failure(entry, "preflight_result_expected")),
+        };
+        let diagnostics = validate_diagnostics(entry, result.diagnostics.as_ref())?;
+        let headers = headers::apply(
+            spec.head_authority,
+            input_headers,
+            &spec.connection_nominated,
+            &result.header_mutations,
+        )
+        .map_err(|error| mutation_failure(entry, &error))?;
+        let mode = match result.decision {
+            Some(http_preflight_result::Decision::ContinueWithoutBody(_)) => None,
+            Some(http_preflight_result::Decision::Inspect(inspect)) => {
+                let mode = inspect
+                    .mode
+                    .as_ref()
+                    .ok_or_else(|| entry_failure(entry, "preflight_result_unknown"))?;
+                Some(
+                    validate_inspect(mode, &permitted, entry.max_payload_bytes())
+                        .map_err(|reason| entry_failure(entry, reason))?,
+                )
+            }
+            None => return Err(entry_failure(entry, "preflight_result_unknown")),
+        };
+        let mut retained = HttpStageDiagnostics::default();
+        let reason_code = nonempty(&diagnostics.reason_code);
+        collect_diagnostics(entry, diagnostics, &mut retained);
+        retained.invocations.push(HttpStageInvocation {
+            transformed: headers != input_headers,
+            ..invocation(
+                entry,
+                match mode {
+                    None => HttpStageOutcome::Continue,
+                    Some(StageMode::Buffered { .. }) => HttpStageOutcome::Buffered,
+                    Some(StageMode::Stream) => HttpStageOutcome::Stream,
+                },
+                reason_code,
+            )
+        });
+        Ok((headers, result.header_mutations, retained, mode))
+    })();
+    match decision {
+        Ok((headers, header_mutations, diagnostics, mode)) => {
+            let stage = if let Some(mode) = mode {
+                Some(Stage {
+                    entry: entry.clone(),
+                    stream,
+                    mode,
+                })
+            } else {
+                stream.end(MiddlewareSessionEndReason::StageSkipped).await;
+                None
+            };
+            Ok(PreparedStage {
+                headers,
+                header_mutations,
+                diagnostics,
+                stage,
+            })
+        }
+        Err(failure) => {
+            stream.end(failure.end_reason).await;
+            Err(failure)
+        }
+    }
+}
+
+/// Prepare the header-only prefix and the first inspecting stage. Later
+/// stages open only when their predecessor establishes their input headers.
 pub async fn preflight(
     entries: &[DescribedChainEntry],
     spec: PipelineSpec,
     headers: Vec<HttpHeader>,
     declared_input_bytes: Option<u64>,
-    head: &impl StageHead,
+    head: Arc<dyn StageHead>,
     chain_deadline: Instant,
 ) -> Preflight {
     let mut state = PreflightState {
         headers,
         header_mutations: Vec::new(),
-        stages: Vec::new(),
         diagnostics: HttpStageDiagnostics::default(),
     };
-    for entry in entries {
-        if !entry.is_resolved() {
-            // An unresolved entry follows its on_error, as with v1 HTTP
-            // hooks. The gateway rejects fail_open for HTTP session hook services.
-            if entry.on_error() == OnError::FailOpen {
-                state
-                    .diagnostics
-                    .invocations
-                    .push(fail_open_invocation(entry, "binding_not_described"));
-                continue;
-            }
-            return state
-                .fail(entry_failure(entry, "binding_not_described"))
-                .await;
-        }
-        if entry.http_hook_version() != Some(HttpHookVersion::Session) {
-            return state
-                .fail(entry_failure(entry, MIDDLEWARE_HOOK_VERSIONS_MIXED))
-                .await;
-        }
-        // A stage that inspects the body may replace it, so later stages
-        // learn no declared length.
-        let declared = state
-            .stages
-            .is_empty()
-            .then_some(declared_input_bytes)
-            .flatten();
-        let offer = head.body_modes(entry, declared);
-        let permitted = offer.permitted.clone();
-        let buffered_limit = entry.max_payload_bytes();
-        let event = preflight_event(entry, head, &state.headers, offer, spec.timeouts, declared);
-        let (deadline, timeout_reason) = preflight_deadline(entry, chain_deadline);
-        let (mut stream, first) = match open_stage(entry, event, deadline, timeout_reason).await {
-            Ok(opened) => opened,
-            Err(failure) => return state.fail(failure).await,
+    let mut pending = Vec::new();
+    let mut first = None;
+    for (index, entry) in entries.iter().enumerate() {
+        let prepared = match prepare_stage(
+            entry,
+            &spec,
+            &state.headers,
+            declared_input_bytes,
+            head.as_ref(),
+            chain_deadline,
+        )
+        .await
+        {
+            Ok(prepared) => prepared,
+            Err(failure) => return state.fail(failure),
         };
-        let result = match classify_result(entry, first) {
-            Ok(result) => result,
-            Err(failure) => {
-                stream.end(failure.end_reason).await;
-                return state.fail(failure).await;
-            }
-        };
-        match result {
-            StageResult::PreflightResult(result) => {
-                let diagnostics = match validate_diagnostics(entry, result.diagnostics.as_ref()) {
-                    Ok(diagnostics) => diagnostics,
-                    Err(failure) => {
-                        stream.end(failure.end_reason).await;
-                        return state.fail(failure).await;
-                    }
-                };
-                let headers = match headers::apply(
-                    spec.head_authority,
-                    &state.headers,
-                    &spec.connection_nominated,
-                    &result.header_mutations,
-                ) {
-                    Ok(headers) => headers,
-                    Err(error) => {
-                        let failure = mutation_failure(entry, &error);
-                        stream.end(failure.end_reason).await;
-                        return state.fail(failure).await;
-                    }
-                };
-                let mode = match result.decision {
-                    Some(http_preflight_result::Decision::ContinueWithoutBody(_)) => None,
-                    Some(http_preflight_result::Decision::Inspect(inspect)) => {
-                        let mode = inspect
-                            .mode
-                            .as_ref()
-                            .map_or(Err("preflight_result_unknown"), |mode| {
-                                validate_inspect(mode, &permitted, buffered_limit)
-                            });
-                        match mode {
-                            Ok(mode) => Some(mode),
-                            Err(reason) => {
-                                let failure = entry_failure(entry, reason);
-                                stream.end(failure.end_reason).await;
-                                return state.fail(failure).await;
-                            }
-                        }
-                    }
-                    None => {
-                        let failure = entry_failure(entry, "preflight_result_unknown");
-                        stream.end(failure.end_reason).await;
-                        return state.fail(failure).await;
-                    }
-                };
-                let reason_code = nonempty(&diagnostics.reason_code);
-                collect_diagnostics(entry, diagnostics, &mut state.diagnostics);
-                let head_changed = headers != state.headers;
-                state.headers = headers;
-                state.header_mutations.extend(result.header_mutations);
-                let Some(mode) = mode else {
-                    state.diagnostics.invocations.push(HttpStageInvocation {
-                        transformed: head_changed,
-                        ..invocation(entry, HttpStageOutcome::Continue, reason_code)
-                    });
-                    stream.end(MiddlewareSessionEndReason::StageSkipped).await;
-                    continue;
-                };
-                state.diagnostics.invocations.push(HttpStageInvocation {
-                    transformed: head_changed,
-                    ..invocation(
-                        entry,
-                        match mode {
-                            StageMode::Buffered { .. } => HttpStageOutcome::Buffered,
-                            StageMode::Stream => HttpStageOutcome::Stream,
-                        },
-                        reason_code,
-                    )
-                });
-                state.stages.push(Stage {
-                    entry: entry.clone(),
-                    stream,
-                    mode,
-                });
-            }
-            StageResult::Deny(deny) => {
-                let failure = denial(entry, deny.diagnostics.as_ref());
-                stream.end(failure.end_reason).await;
-                return state.fail(failure).await;
-            }
-            _ => {
-                let failure = entry_failure(entry, "preflight_result_expected");
-                stream.end(failure.end_reason).await;
-                return state.fail(failure).await;
-            }
+        state.headers = prepared.headers;
+        state.header_mutations.extend(prepared.header_mutations);
+        state.diagnostics.extend(prepared.diagnostics);
+        if let Some(stage) = prepared.stage {
+            first = Some(stage);
+            pending.extend_from_slice(&entries[index + 1..]);
+            break;
         }
     }
     let PreflightState {
         headers,
         header_mutations,
-        stages,
         diagnostics,
     } = state;
-    let pipeline = (!stages.is_empty()).then(|| Pipeline {
+    let pipeline = first.map(|stage| Pipeline {
         spec,
         head: headers.clone(),
-        stages,
+        head_source: head,
+        stage,
+        pending,
         declared_input_bytes,
         admission: BodyAdmission::default(),
     });
@@ -930,15 +949,11 @@ pub async fn preflight(
 struct PreflightState {
     headers: Vec<HttpHeader>,
     header_mutations: Vec<HeaderMutation>,
-    stages: Vec<Stage>,
     diagnostics: HttpStageDiagnostics,
 }
 
 impl PreflightState {
-    async fn fail(mut self, failure: HttpMiddlewareFailure) -> Preflight {
-        for stage in &mut self.stages {
-            stage.stream.end(failure.end_reason).await;
-        }
+    fn fail(mut self, failure: HttpMiddlewareFailure) -> Preflight {
         let HttpMiddlewareFailure {
             reason,
             denial,
@@ -960,12 +975,14 @@ impl PreflightState {
     }
 }
 
-/// Stages that selected a body mode, ready to run.
+/// The first inspecting stage and the stages whose input is not ready yet.
 pub struct Pipeline {
     spec: PipelineSpec,
-    /// Head after every preflight mutation.
+    /// Head after the initial preflight prefix.
     head: Vec<HttpHeader>,
-    stages: Vec<Stage>,
+    stage: Stage,
+    pending: Vec<DescribedChainEntry>,
+    head_source: Arc<dyn StageHead>,
     declared_input_bytes: Option<u64>,
     admission: BodyAdmission,
 }
@@ -973,18 +990,18 @@ pub struct Pipeline {
 /// Session budget slots one message holds while its body stages run.
 #[derive(Default)]
 struct BodyAdmission {
-    /// The preflight slot, kept until every BUFFERED stage ends.
-    buffered: Option<MiddlewareSessionPermit>,
+    /// The first stage retains its preflight slot while it buffers.
+    buffered: Option<Arc<MiddlewareSessionPermit>>,
+    runner: Option<ChainRunner>,
     /// A STREAM slot, kept until the pipeline ends.
     stream: Option<MiddlewareSessionPermit>,
 }
 
 impl ChainRunner {
-    /// Move a message whose stages selected body modes from its preflight
-    /// `slot` onto the budgets its body runs under. A STREAM stage needs a
-    /// stream slot, waited for until `deadline`. The preflight slot stays
-    /// only while a BUFFERED stage runs. When no slot frees up in time, every
-    /// stage is cancelled and `None` is returned.
+    /// Reserve a stream slot for a STREAM stage or a chain with deferred
+    /// stages. Keep the initial preflight slot only if the first stage
+    /// buffers. Later stages share or acquire a preflight/buffering slot
+    /// when their input headers arrive.
     ///
     /// A message never waits for a stream slot while holding a preflight
     /// slot: messages queued behind open streams would otherwise starve every
@@ -998,9 +1015,10 @@ impl ChainRunner {
         slot: MiddlewareSessionPermit,
         deadline: Instant,
     ) -> Option<Pipeline> {
-        if !pipeline.streams() {
+        pipeline.admission.runner = Some(self.clone());
+        if !pipeline.may_stream() {
             if pipeline.buffers() {
-                pipeline.admission.buffered = Some(slot);
+                pipeline.admission.buffered = Some(Arc::new(slot));
             }
             return Some(pipeline);
         }
@@ -1025,7 +1043,7 @@ impl ChainRunner {
                 pipeline.end(MiddlewareSessionEndReason::Cancellation).await;
                 return None;
             };
-            pipeline.admission.buffered = Some(slot);
+            pipeline.admission.buffered = Some(Arc::new(slot));
         }
         Some(pipeline)
     }
@@ -1034,27 +1052,22 @@ impl ChainRunner {
 impl Pipeline {
     /// Largest input chunk the first stage accepts.
     pub fn input_unit_limit(&self) -> usize {
-        self.stages
-            .first()
-            .map_or(MAX_HTTP_STREAM_UNIT_BYTES, input_unit_limit)
+        input_unit_limit(&self.stage)
     }
 
-    /// True when a BUFFERED stage withholds the head until its body result.
-    pub fn withholds_output(&self) -> bool {
-        self.buffers()
+    /// True when the final output is already known to be buffered. Deferred
+    /// stages may stream, so their output must use the incremental relay.
+    pub fn buffers_final_output(&self) -> bool {
+        self.pending.is_empty() && self.buffers()
     }
 
     fn buffers(&self) -> bool {
-        self.stages
-            .iter()
-            .any(|stage| matches!(stage.mode, StageMode::Buffered { .. }))
+        matches!(self.stage.mode, StageMode::Buffered { .. })
     }
 
-    /// True when a STREAM stage runs without a total deadline.
-    pub fn streams(&self) -> bool {
-        self.stages
-            .iter()
-            .any(|stage| stage.mode == StageMode::Stream)
+    /// True when this pipeline runs or may later select STREAM.
+    pub fn may_stream(&self) -> bool {
+        self.stage.mode == StageMode::Stream || !self.pending.is_empty()
     }
 
     #[cfg(test)]
@@ -1064,9 +1077,7 @@ impl Pipeline {
 
     /// End every stage without running the body.
     pub async fn end(mut self, reason: MiddlewareSessionEndReason) {
-        for stage in &mut self.stages {
-            stage.stream.end(reason).await;
-        }
+        self.stage.stream.end(reason).await;
     }
 
     /// Run every body stage, re-checking every replaced body with
@@ -1114,19 +1125,19 @@ impl Pipeline {
         let Self {
             spec,
             head,
-            stages,
+            stage,
+            pending,
+            head_source,
             declared_input_bytes,
             mut admission,
         } = self;
-        let count = stages.len();
-        let buffered: Vec<bool> = stages
-            .iter()
-            .map(|stage| matches!(stage.mode, StageMode::Buffered { .. }))
+        let stages: Vec<_> = std::iter::once(PipelineStage::Ready(stage))
+            .chain(pending.into_iter().map(PipelineStage::Pending))
             .collect();
-        let mut buffering = buffered.iter().filter(|buffered| **buffered).count();
+        let count = stages.len();
         let limits: Vec<usize> = stages
             .iter()
-            .map(input_unit_limit)
+            .map(PipelineStage::input_unit_limit)
             .chain(std::iter::once(MAX_HTTP_STREAM_UNIT_BYTES))
             .collect();
         let mut senders = Vec::with_capacity(count + 1);
@@ -1137,7 +1148,20 @@ impl Pipeline {
             receivers.push(Some(receiver));
         }
         let (abort, aborted) = watch::channel(None::<MiddlewareSessionEndReason>);
-        let shared = Shared { spec, head };
+        let shared = Shared {
+            spec,
+            head,
+            head_source,
+            admission: BufferAdmission {
+                runner: admission.runner.take().expect("admitted pipeline"),
+                active: Mutex::new(
+                    admission
+                        .buffered
+                        .as_ref()
+                        .map_or_else(Weak::new, Arc::downgrade),
+                ),
+            },
+        };
 
         let checks = matches!(body_policy, TransformedBodyPolicy::Reevaluate(_));
         let (source_body, mut checked_body) = if checks {
@@ -1164,7 +1188,7 @@ impl Pipeline {
                 checked_body = Some(next);
                 tasks.push(Box::pin(run_checkpoint(
                     Checkpoint {
-                        entry: stage.entry.clone(),
+                        entry: stage.entry().clone(),
                         previous,
                         checked,
                         output_limit: limits[index + 1],
@@ -1178,6 +1202,11 @@ impl Pipeline {
             tasks.push(Box::pin(run_stage(
                 index,
                 stage,
+                if index == 0 {
+                    admission.buffered.take()
+                } else {
+                    None
+                },
                 StageLinks {
                     input: receivers[index].take().expect("stage input link"),
                     output: stage_output,
@@ -1220,14 +1249,6 @@ impl Pipeline {
             match result {
                 Ok(TaskDone::Stage(index, stage)) => {
                     done[index] = Some(stage);
-                    if buffered[index] {
-                        buffering -= 1;
-                        // The last BUFFERED stage delivered its body, so the
-                        // message no longer holds buffered input.
-                        if buffering == 0 {
-                            admission.buffered = None;
-                        }
-                    }
                 }
                 Ok(TaskDone::Sink(value)) => trailers = Some(value),
                 Err(TaskError::Failed(error)) if failure.is_none() => {
@@ -1285,7 +1306,7 @@ fn stage_chunk_limit(entry: &DescribedChainEntry) -> usize {
 /// Message on a link between pipeline tasks.
 #[derive(Debug)]
 enum Frame {
-    /// `header_mutations` holds every earlier stage's late mutations.
+    /// Mutations since the initial preflight prefix, in stage order.
     Start {
         header_mutations: Vec<HeaderMutation>,
         output_body_bytes: Option<u64>,
@@ -1296,9 +1317,52 @@ enum Frame {
 
 struct Shared {
     spec: PipelineSpec,
-    /// Head after every preflight mutation. Each stage begins on it plus the
+    /// Head after the initial preflight prefix. Each stage begins on it plus the
     /// late mutations of earlier stages.
     head: Vec<HttpHeader>,
+    head_source: Arc<dyn StageHead>,
+    admission: BufferAdmission,
+}
+
+/// Buffered stages of one message share a slot, including while passing
+/// output to the next stage. A stream releases the slot until it is needed.
+struct BufferAdmission {
+    runner: ChainRunner,
+    active: Mutex<Weak<MiddlewareSessionPermit>>,
+}
+
+impl BufferAdmission {
+    async fn acquire(&self, deadline: Instant) -> Option<Arc<MiddlewareSessionPermit>> {
+        let mut active = self.active.lock().await;
+        if let Some(permit) = active.upgrade() {
+            return Some(permit);
+        }
+        let permit = Arc::new(self.runner.reserve_http_session(deadline).await?);
+        *active = Arc::downgrade(&permit);
+        Some(permit)
+    }
+}
+
+enum PipelineStage {
+    Ready(Stage),
+    Pending(DescribedChainEntry),
+}
+
+impl PipelineStage {
+    fn input_unit_limit(&self) -> usize {
+        match self {
+            Self::Ready(stage) => input_unit_limit(stage),
+            Self::Pending(entry) if entry.max_payload_bytes() == 0 => MAX_HTTP_STREAM_UNIT_BYTES,
+            Self::Pending(entry) => stage_chunk_limit(entry),
+        }
+    }
+
+    fn entry(&self) -> &DescribedChainEntry {
+        match self {
+            Self::Ready(stage) => &stage.entry,
+            Self::Pending(entry) => entry,
+        }
+    }
 }
 
 #[derive(Default)]
@@ -1561,33 +1625,52 @@ struct StageLinks {
 
 async fn run_stage(
     index: usize,
-    mut stage: Stage,
+    stage: PipelineStage,
+    mut permit: Option<Arc<MiddlewareSessionPermit>>,
     mut links: StageLinks,
     shared: &Shared,
     mut aborted: watch::Receiver<Option<MiddlewareSessionEndReason>>,
 ) -> TaskResult {
+    let entry = stage.entry().clone();
+    let mut active = match stage {
+        PipelineStage::Ready(stage) => Some(stage),
+        PipelineStage::Pending(_) => None,
+    };
+    let mut diagnostics = HttpStageDiagnostics::default();
     let exit = tokio::select! {
         biased;
         reason = abort_reason(&mut aborted) => StageExit::Aborted(reason),
-        result = drive_stage(&mut stage, &mut links, shared) => StageExit::Done(result),
+        result = drive_stage(&entry, &mut active, &mut permit, &mut diagnostics, &mut links, shared) => StageExit::Done(result),
     };
     match exit {
-        StageExit::Done(Ok(done)) => {
-            stage.stream.end(MiddlewareSessionEndReason::Normal).await;
+        StageExit::Done(Ok(mut done)) => {
+            if let Some(stage) = active.as_mut() {
+                stage.stream.end(MiddlewareSessionEndReason::Normal).await;
+            }
+            diagnostics.extend(done.diagnostics);
+            done.diagnostics = diagnostics;
             Ok(TaskDone::Stage(index, done))
         }
-        StageExit::Done(Err(StageError::Failed(failure))) => {
-            stage.stream.end(failure.end_reason).await;
+        StageExit::Done(Err(StageError::Failed(mut failure))) => {
+            if let Some(stage) = active.as_mut() {
+                stage.stream.end(failure.end_reason).await;
+            }
+            diagnostics.extend(*failure.diagnostics);
+            failure.diagnostics = Box::new(diagnostics);
             Err(TaskError::Failed(failure))
         }
         StageExit::Done(Err(StageError::LinkClosed)) => {
             let reason = abort_reason(&mut aborted).await;
-            stage.stream.end(reason).await;
-            Err(TaskError::Aborted)
+            if let Some(stage) = active.as_mut() {
+                stage.stream.end(reason).await;
+            }
+            Ok(TaskDone::Stage(index, StageDone { diagnostics }))
         }
         StageExit::Aborted(reason) => {
-            stage.stream.end(reason).await;
-            Err(TaskError::Aborted)
+            if let Some(stage) = active.as_mut() {
+                stage.stream.end(reason).await;
+            }
+            Ok(TaskDone::Stage(index, StageDone { diagnostics }))
         }
     }
 }
@@ -1595,10 +1678,14 @@ async fn run_stage(
 /// `Start` received from the previous link.
 struct UpstreamStart {
     header_mutations: Vec<HeaderMutation>,
+    output_body_bytes: Option<u64>,
 }
 
 async fn drive_stage(
-    stage: &mut Stage,
+    entry: &DescribedChainEntry,
+    active: &mut Option<Stage>,
+    permit: &mut Option<Arc<MiddlewareSessionPermit>>,
+    diagnostics: &mut HttpStageDiagnostics,
     links: &mut StageLinks,
     shared: &Shared,
 ) -> Result<StageDone, StageError> {
@@ -1608,20 +1695,74 @@ async fn drive_stage(
         output_limit,
     } = links;
     let output_limit = *output_limit;
-    let upstream = match input.recv().await {
+    let mut upstream = match input.recv().await {
         Some(Frame::Start {
-            header_mutations, ..
-        }) => UpstreamStart { header_mutations },
-        Some(_) => return Err(entry_failure(&stage.entry, "stage_input_order_invalid").into()),
+            header_mutations,
+            output_body_bytes,
+        }) => UpstreamStart {
+            header_mutations,
+            output_body_bytes,
+        },
+        Some(_) => return Err(entry_failure(entry, "stage_input_order_invalid").into()),
         None => return Err(StageError::LinkClosed),
     };
-    let begin_head = headers::apply_accumulated(
+    let mut begin_head = headers::apply_accumulated(
         shared.spec.head_authority,
         &shared.head,
         &shared.spec.connection_nominated,
         &upstream.header_mutations,
     )
-    .map_err(|error| mutation_failure(&stage.entry, &error))?;
+    .map_err(|error| mutation_failure(entry, &error))?;
+    if active.is_none() {
+        begin_head = shared
+            .head_source
+            .current_headers(&begin_head, upstream.output_body_bytes);
+        let deadline = Instant::now() + MAX_MIDDLEWARE_CHAIN_TIMEOUT;
+        *permit = Some(
+            shared
+                .admission
+                .acquire(deadline)
+                .await
+                .ok_or_else(|| entry_failure(entry, "session_capacity_exhausted"))?,
+        );
+        let prepared = prepare_stage(
+            entry,
+            &shared.spec,
+            &begin_head,
+            upstream.output_body_bytes,
+            shared.head_source.as_ref(),
+            deadline,
+        )
+        .await?;
+        begin_head = prepared.headers;
+        upstream.header_mutations.extend(prepared.header_mutations);
+        diagnostics.extend(prepared.diagnostics);
+        *active = prepared.stage;
+    }
+    let Some(stage) = active else {
+        *permit = None;
+        send_frame(
+            output,
+            Frame::Start {
+                header_mutations: upstream.header_mutations,
+                output_body_bytes: upstream.output_body_bytes,
+            },
+        )
+        .await?;
+        loop {
+            match input.recv().await {
+                Some(Frame::Chunk(data)) => send_body(output, &data, output_limit).await?,
+                Some(Frame::End(trailers)) => {
+                    send_frame(output, Frame::End(trailers)).await?;
+                    return Ok(StageDone::default());
+                }
+                Some(Frame::Start { .. }) => {
+                    return Err(entry_failure(entry, "stage_input_order_invalid").into());
+                }
+                None => return Err(StageError::LinkClosed),
+            }
+        }
+    };
     match stage.mode {
         StageMode::Buffered { max_body_bytes } => {
             drive_buffered(
@@ -1637,6 +1778,7 @@ async fn drive_stage(
             .await
         }
         StageMode::Stream => {
+            *permit = None;
             drive_stream(
                 stage,
                 input,

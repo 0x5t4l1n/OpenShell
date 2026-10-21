@@ -162,6 +162,10 @@ struct ScriptedStage {
     preflight_mutation: bool,
     /// Late head mutation, as `x-order: <name>-late`.
     late_mutation: bool,
+    inspect_content_type: Option<&'static str>,
+    output_content_type: Option<&'static str>,
+    output_after_input: bool,
+    ended: Arc<Mutex<Vec<i32>>>,
     /// Heads this stage received in `Begin`.
     begun: Arc<Mutex<Vec<Vec<HttpHeader>>>>,
     /// Preflights this stage received.
@@ -176,6 +180,10 @@ impl ScriptedStage {
             body,
             preflight_mutation: false,
             late_mutation: false,
+            inspect_content_type: None,
+            output_content_type: None,
+            output_after_input: false,
+            ended: Arc::default(),
             begun: Arc::default(),
             preflights: Arc::default(),
         }
@@ -206,7 +214,10 @@ impl InProcessMiddleware for ScriptedStage {
     async fn describe(&self) -> MiddlewareManifest {
         MiddlewareManifest {
             name: self.name.into(),
-            ..session_manifest(vec![binding(SupervisorMiddlewareOperation::HttpRequest)])
+            ..session_manifest(vec![
+                binding(SupervisorMiddlewareOperation::HttpRequest),
+                binding(SupervisorMiddlewareOperation::HttpResponse),
+            ])
         }
     }
 
@@ -237,14 +248,27 @@ impl InProcessMiddleware for ScriptedStage {
             .then(|| self.order_mutation("pre"))
             .into_iter()
             .collect();
-        let late_mutations: Vec<_> = self
+        let mut late_mutations: Vec<_> = self
             .late_mutation
             .then(|| self.order_mutation("late"))
             .into_iter()
             .collect();
+        if let Some(content_type) = self.output_content_type {
+            late_mutations.push(HeaderMutation {
+                operation: Some(header_mutation::Operation::Write(WriteHeader {
+                    name: "content-type".into(),
+                    value: content_type.into(),
+                    on_existing: ExistingHeaderAction::Overwrite as i32,
+                })),
+            });
+        }
+        let inspect_content_type = self.inspect_content_type;
+        let output_after_input = self.output_after_input;
+        let ended = Arc::clone(&self.ended);
         let begun = Arc::clone(&self.begun);
         let preflights = Arc::clone(&self.preflights);
         tokio::spawn(async move {
+            let mut output_started = false;
             while let Some(event) = events.recv().await {
                 let reply = match event.event {
                     Some(http_request_session_event::Event::Preflight(preflight_event)) => {
@@ -253,7 +277,23 @@ impl InProcessMiddleware for ScriptedStage {
                         let buffered_limit = preflight_event
                             .limits
                             .map_or(0, |limits| limits.max_buffered_body_bytes);
-                        match &preflight {
+                        let applies = inspect_content_type.is_none_or(|content_type| {
+                            preflight_event
+                                .request
+                                .as_ref()
+                                .unwrap()
+                                .headers
+                                .iter()
+                                .any(|header| {
+                                    header.name.eq_ignore_ascii_case("content-type")
+                                        && header.value == content_type
+                                })
+                        });
+                        match if applies {
+                            &preflight
+                        } else {
+                            &Preflight::Continue
+                        } {
                             Preflight::Continue => {
                                 result(http_request_session_result::Result::PreflightResult(
                                     HttpPreflightResult {
@@ -299,7 +339,8 @@ impl InProcessMiddleware for ScriptedStage {
                     }
                     Some(http_request_session_event::Event::Begin(started)) => {
                         begun.lock().unwrap().push(started.headers);
-                        if matches!(body, Body::Uppercase) {
+                        if matches!(body, Body::Uppercase) && !output_after_input {
+                            output_started = true;
                             result(http_request_session_result::Result::OutputStart(
                                 HttpOutputStart {
                                     header_mutations: late_mutations.clone(),
@@ -327,15 +368,46 @@ impl InProcessMiddleware for ScriptedStage {
                             ..Default::default()
                         }),
                     ),
-                    Some(http_request_session_event::Event::InputChunk(chunk)) => result(
-                        http_request_session_result::Result::OutputChunk(HttpOutputChunk {
-                            data: chunk.data.to_ascii_uppercase(),
-                        }),
-                    ),
-                    Some(http_request_session_event::Event::InputEnd(_)) => result(
-                        http_request_session_result::Result::Finish(HttpFinish::default()),
-                    ),
-                    Some(http_request_session_event::Event::SessionEnd(_)) | None => break,
+                    Some(http_request_session_event::Event::InputChunk(chunk)) => {
+                        if !output_started {
+                            sender
+                                .send(result(http_request_session_result::Result::OutputStart(
+                                    HttpOutputStart {
+                                        header_mutations: late_mutations.clone(),
+                                        output_body_bytes: None,
+                                    },
+                                )))
+                                .await
+                                .unwrap();
+                            output_started = true;
+                        }
+                        result(http_request_session_result::Result::OutputChunk(
+                            HttpOutputChunk {
+                                data: chunk.data.to_ascii_uppercase(),
+                            },
+                        ))
+                    }
+                    Some(http_request_session_event::Event::InputEnd(_)) => {
+                        if !output_started {
+                            sender
+                                .send(result(http_request_session_result::Result::OutputStart(
+                                    HttpOutputStart {
+                                        header_mutations: late_mutations.clone(),
+                                        output_body_bytes: None,
+                                    },
+                                )))
+                                .await
+                                .unwrap();
+                        }
+                        result(http_request_session_result::Result::Finish(
+                            HttpFinish::default(),
+                        ))
+                    }
+                    Some(http_request_session_event::Event::SessionEnd(end)) => {
+                        ended.lock().unwrap().push(end.reason);
+                        break;
+                    }
+                    None => break,
                 };
                 let terminal = reply.is_err();
                 if sender.send(reply).await.is_err() || terminal {
@@ -346,6 +418,67 @@ impl InProcessMiddleware for ScriptedStage {
         Ok(Box::pin(tokio_stream::wrappers::ReceiverStream::new(
             receiver,
         )))
+    }
+    async fn open_http_response_session(
+        &self,
+        mut events: mpsc::Receiver<openshell_core::proto::HttpResponseSessionEvent>,
+    ) -> Result<crate::HttpResponseSessionResultStream, tonic::Status> {
+        use futures::StreamExt as _;
+        use openshell_core::proto::{
+            HttpResponseSessionResult, http_response_session_event::Event as E,
+            http_response_session_result::Result as R,
+        };
+        let (sender, receiver) = mpsc::channel(4);
+        tokio::spawn(async move {
+            while let Some(event) = events.recv().await {
+                let event = event.event.map(|event| match event {
+                    E::Preflight(p) => {
+                        let response = p.response.unwrap();
+                        http_request_session_event::Event::Preflight(HttpRequestSessionPreflight {
+                            request: Some(openshell_core::proto::HttpRequestPreflightHead {
+                                target: response.target,
+                                headers: response.headers,
+                            }),
+                            phase: p.phase,
+                            context: p.context,
+                            middleware_name: p.middleware_name,
+                            config: p.config,
+                            permitted_body_modes: p.permitted_body_modes,
+                            unavailable_body_modes: p.unavailable_body_modes,
+                            limits: p.limits,
+                            declared_body_bytes: p.declared_body_bytes,
+                        })
+                    }
+                    E::Begin(v) => http_request_session_event::Event::Begin(v),
+                    E::BufferedBody(v) => http_request_session_event::Event::BufferedBody(v),
+                    E::InputChunk(v) => http_request_session_event::Event::InputChunk(v),
+                    E::InputEnd(v) => http_request_session_event::Event::InputEnd(v),
+                    E::SessionEnd(v) => http_request_session_event::Event::SessionEnd(v),
+                });
+                if sender
+                    .send(HttpRequestSessionEvent { event })
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
+        let results = self.open_http_request_session(receiver).await?;
+        Ok(Box::pin(results.map(|result| {
+            result.map(|result| HttpResponseSessionResult {
+                result: result.result.map(|result| match result {
+                    http_request_session_result::Result::PreflightResult(v) => {
+                        R::PreflightResult(v)
+                    }
+                    http_request_session_result::Result::BufferedResult(v) => R::BufferedResult(v),
+                    http_request_session_result::Result::OutputStart(v) => R::OutputStart(v),
+                    http_request_session_result::Result::OutputChunk(v) => R::OutputChunk(v),
+                    http_request_session_result::Result::Finish(v) => R::Finish(v),
+                    http_request_session_result::Result::Deny(v) => R::BlockDelivery(v),
+                }),
+            })
+        })))
     }
 }
 
@@ -425,9 +558,17 @@ async fn scripted_chain(
 }
 
 async fn run(stages: Vec<Arc<ScriptedStage>>, body: &[u8]) -> Run {
+    run_input(stages, request_input(body), body).await
+}
+
+async fn run_input(
+    stages: Vec<Arc<ScriptedStage>>,
+    head: HttpRequestPreflightInput,
+    body: &[u8],
+) -> Run {
     let (runner, described) = scripted_chain(stages).await;
     let preflight = runner
-        .preflight_described_http_request(described, request_input(body))
+        .preflight_described_http_request(described, head)
         .await
         .expect("preflight");
     let mut outcomes: Vec<_> = preflight
@@ -451,17 +592,19 @@ async fn run(stages: Vec<Arc<ScriptedStage>>, body: &[u8]) -> Run {
     let (output, mut outputs) = mpsc::channel(4);
     let feed = async {
         for unit in body.chunks(3) {
-            input
+            if input
                 .send(HttpBodyInput::Chunk(unit.to_vec()))
                 .await
-                .unwrap();
+                .is_err()
+            {
+                return;
+            }
         }
-        input
+        let _ = input
             .send(HttpBodyInput::End {
                 trailers: Vec::new(),
             })
-            .await
-            .unwrap();
+            .await;
     };
     let collect = async {
         let mut late = Vec::new();
@@ -609,7 +752,7 @@ async fn request_stages_follow_the_protocol_2_state_machine() {
 }
 
 #[tokio::test]
-async fn late_header_mutations_apply_after_every_preflight_mutation_in_chain_order() {
+async fn each_stage_sees_only_earlier_stages_complete_header_mutations() {
     let mut first = ScriptedStage::new(
         "example/a",
         Preflight::Inspect(HttpBodyMode::Buffered),
@@ -627,11 +770,11 @@ async fn late_header_mutations_apply_after_every_preflight_mutation_in_chain_ord
     let (first, second) = (Arc::new(first), Arc::new(second));
     let outcome = run(vec![Arc::clone(&first), Arc::clone(&second)], b"hello").await;
     assert!(outcome.allowed, "{}", outcome.reason);
+    assert_eq!(outcome.preflight_mutations, ["example/a-pre"]);
     assert_eq!(
-        outcome.preflight_mutations,
-        ["example/a-pre", "example/b-pre"]
+        outcome.late_mutations,
+        ["example/a-late", "example/b-pre", "example/b-late"]
     );
-    assert_eq!(outcome.late_mutations, ["example/a-late", "example/b-late"]);
     assert_eq!(outcome.body, b"HELLO");
     let begun_order = |stage: &ScriptedStage| -> Vec<String> {
         let begun = stage.begun.lock().unwrap();
@@ -642,19 +785,14 @@ async fn late_header_mutations_apply_after_every_preflight_mutation_in_chain_ord
             .map(|header| header.value.clone())
             .collect()
     };
-    // Every stage begins on the original head and every preflight mutation,
-    // including those of later stages, then earlier stages' late mutations.
-    assert_eq!(
-        begun_order(&first),
-        ["original", "example/a-pre", "example/b-pre"]
-    );
+    assert_eq!(begun_order(&first), ["original", "example/a-pre"]);
     assert_eq!(
         begun_order(&second),
         [
             "original",
             "example/a-pre",
-            "example/b-pre",
-            "example/a-late"
+            "example/a-late",
+            "example/b-pre"
         ]
     );
 }
@@ -778,8 +916,8 @@ async fn a_message_holds_session_slots_only_while_a_stage_inspects_it() {
         let Some(session) = preflight.session else {
             continue;
         };
-        let buffers = session.withholds_output();
-        let streams = session.streams();
+        let buffers = held.0 < full.0;
+        let streams = session.may_stream();
         let (input, inputs) = mpsc::channel(4);
         input
             .send(HttpBodyInput::Chunk(b"hello".to_vec()))
@@ -906,8 +1044,7 @@ async fn waiting_for_a_stream_slot_does_not_hold_a_preflight_slot() {
     assert_eq!(started.elapsed(), std::time::Duration::ZERO);
     drop(short);
 
-    // A freed stream slot goes to the first waiter; the mixed message takes
-    // a preflight slot back once it has a stream slot.
+    // Deferred stages reserve their preflight slot only once input is ready.
     for message in &waiting {
         message.abort();
     }
@@ -920,7 +1057,7 @@ async fn waiting_for_a_stream_slot_does_not_hold_a_preflight_slot() {
     assert!(mixed.session.is_some());
     assert_eq!(
         free_slots(&runner),
-        (MAX_CONCURRENT_HTTP_MIDDLEWARE_SESSIONS - 1, 0),
+        (MAX_CONCURRENT_HTTP_MIDDLEWARE_SESSIONS, 0),
     );
 }
 
@@ -1081,33 +1218,414 @@ async fn an_encoded_request_offers_no_body_mode() {
 }
 
 #[tokio::test]
-async fn only_stages_before_an_inspecting_stage_learn_the_declared_length() {
-    use HttpBodyMode::Buffered;
-    for (case, first, declared) in [
-        ("after a continuing stage", Preflight::Continue, Some(5)),
+async fn downstream_preflight_receives_the_transformed_length() {
+    for (preflight, body, length) in [
+        (Preflight::Continue, Body::Unchanged, Some(5)),
         (
-            "after an inspecting stage",
-            Preflight::Inspect(Buffered),
+            Preflight::Inspect(HttpBodyMode::Buffered),
+            Body::Replace(b"replacement"),
+            Some(11),
+        ),
+        (
+            Preflight::Inspect(HttpBodyMode::Stream),
+            Body::Uppercase,
             None,
         ),
     ] {
-        let first = scripted("example/a", first, Body::Unchanged);
+        let first = scripted("example/a", preflight, body);
         let second = scripted("example/b", Preflight::Continue, Body::Unchanged);
-        let (runner, described) =
-            scripted_chain(vec![Arc::clone(&first), Arc::clone(&second)]).await;
-        runner
-            .preflight_described_http_request(described, request_input(b"hello"))
-            .await
-            .expect("preflight");
-        assert_eq!(
-            first.preflights.lock().unwrap()[0].declared_body_bytes,
-            Some(5),
-            "{case}"
-        );
+        let result = run(vec![first, Arc::clone(&second)], b"hello").await;
+        assert!(result.allowed, "{}", result.reason);
         assert_eq!(
             second.preflights.lock().unwrap()[0].declared_body_bytes,
-            declared,
-            "{case}"
+            length
         );
     }
+}
+
+async fn run_response(
+    stages: Vec<Arc<ScriptedStage>>,
+    body: &[u8],
+) -> (crate::HttpPipelineFinish, Vec<u8>) {
+    let (runner, described) = scripted_chain(stages).await;
+    let request = request_input(body);
+    let preflight = runner
+        .preflight_http_response_pipeline(
+            described,
+            crate::HttpResponsePreflightInput {
+                context: request.context,
+                target: request.target,
+                status_code: 200,
+                headers: request.headers,
+                declared_body_length: request.declared_body_length,
+                connection_nominated_headers: Vec::new(),
+            },
+            crate::HttpResponseDelivery::new(true),
+        )
+        .await
+        .unwrap();
+    assert!(preflight.allowed, "{}", preflight.reason);
+    let session = preflight.session.unwrap();
+    let (input, inputs) = mpsc::channel(4);
+    let (output, mut outputs) = mpsc::channel(4);
+    let feed = async {
+        input
+            .send(HttpBodyInput::Chunk(body.to_vec()))
+            .await
+            .unwrap();
+        input
+            .send(HttpBodyInput::End {
+                trailers: Vec::new(),
+            })
+            .await
+            .unwrap();
+    };
+    let collect = async {
+        let mut body = Vec::new();
+        let mut starts = 0;
+        let mut ends = 0;
+        while let Some(event) = outputs.recv().await {
+            match event {
+                HttpBodyOutput::Start { .. } => {
+                    starts += 1;
+                    assert_eq!(ends, 0);
+                }
+                HttpBodyOutput::Chunk(data) => {
+                    assert_eq!(starts, 1);
+                    assert_eq!(ends, 0);
+                    body.extend(data);
+                }
+                HttpBodyOutput::End { .. } => ends += 1,
+            }
+        }
+        assert_eq!((starts, ends), (1, 1));
+        body
+    };
+    let (finish, (), body) = tokio::join!(
+        session.run_until(inputs, output, std::future::pending()),
+        feed,
+        collect
+    );
+    (finish.expect("response pipeline"), body)
+}
+
+#[tokio::test]
+async fn downstream_inspects_the_content_type_produced_by_each_body_mode() {
+    for response in [false, true] {
+        for mode in [HttpBodyMode::Buffered, HttpBodyMode::Stream] {
+            let mut first = ScriptedStage::new(
+                "example/a",
+                Preflight::Inspect(mode),
+                if mode == HttpBodyMode::Buffered {
+                    Body::Replace(b"{\"safe\":true}")
+                } else {
+                    Body::Uppercase
+                },
+            );
+            first.output_content_type = Some("application/json");
+            first.output_after_input = true;
+            let mut second = ScriptedStage::new(
+                "example/b",
+                Preflight::Inspect(HttpBodyMode::Buffered),
+                Body::Unchanged,
+            );
+            second.inspect_content_type = Some("application/json");
+            let (first, second) = (Arc::new(first), Arc::new(second));
+            let original = b"{\"safe\":true}";
+            let expected = if mode == HttpBodyMode::Buffered {
+                original.to_vec()
+            } else {
+                original.to_ascii_uppercase()
+            };
+            if response {
+                let (_, body) = run_response(vec![first, Arc::clone(&second)], original).await;
+                assert_eq!(body, expected);
+            } else {
+                let mut head = request_input(original);
+                head.headers.push(HttpHeader {
+                    name: "content-type".into(),
+                    value: "application/octet-stream".into(),
+                });
+                let outcome = run_input(vec![first, Arc::clone(&second)], head, original).await;
+                assert!(outcome.allowed, "{}", outcome.reason);
+                assert_eq!(outcome.body, expected);
+            }
+            assert_eq!(
+                second.begun.lock().unwrap().len(),
+                1,
+                "response={response}, mode={mode:?}: JSON must be inspected"
+            );
+            let preflights = second.preflights.lock().unwrap();
+            let head = preflights[0].request.as_ref().unwrap();
+            assert!(
+                head.headers
+                    .iter()
+                    .any(|h| h.name == "content-type" && h.value == "application/json")
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn downstream_can_deny_after_an_earlier_stage_changes_the_content_type() {
+    let mut first = ScriptedStage::new(
+        "example/a",
+        Preflight::Inspect(HttpBodyMode::Stream),
+        Body::Uppercase,
+    );
+    first.output_content_type = Some("application/json");
+    first.output_after_input = true;
+    let mut second = ScriptedStage::new(
+        "example/b",
+        Preflight::Deny("json_forbidden"),
+        Body::Unchanged,
+    );
+    second.inspect_content_type = Some("application/json");
+    let third = scripted("example/c", Preflight::Continue, Body::Unchanged);
+    let outcome = run(
+        vec![Arc::new(first), Arc::new(second), Arc::clone(&third)],
+        b"some content",
+    )
+    .await;
+    assert!(!outcome.allowed);
+    assert_eq!(
+        outcome.reason,
+        "middleware_denied:example_b-config:json_forbidden"
+    );
+    assert!(outcome.body.is_empty());
+    assert!(third.preflights.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn adjacent_streams_preserve_all_chunks_before_completion() {
+    for response in [false, true] {
+        let first = scripted(
+            "example/a",
+            Preflight::Inspect(HttpBodyMode::Stream),
+            Body::Uppercase,
+        );
+        let mut second = ScriptedStage::new(
+            "example/b",
+            Preflight::Inspect(HttpBodyMode::Stream),
+            Body::Uppercase,
+        );
+        second.output_after_input = true;
+        let body = b"abc".repeat(30000);
+        let stages = vec![first, Arc::new(second)];
+        if response {
+            assert_eq!(
+                run_response(stages, &body).await.1,
+                body.to_ascii_uppercase()
+            );
+        } else {
+            let outcome = run(stages, &body).await;
+            assert!(outcome.allowed, "{}", outcome.reason);
+            assert_eq!(outcome.body, body.to_ascii_uppercase());
+        }
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn downstream_preflight_waits_for_output_headers_without_spending_its_timeout() {
+    let mut first = ScriptedStage::new(
+        "example/a",
+        Preflight::Inspect(HttpBodyMode::Stream),
+        Body::Uppercase,
+    );
+    first.output_after_input = true;
+    let second = scripted("example/b", Preflight::Continue, Body::Unchanged);
+    let (runner, described) = scripted_chain(vec![Arc::new(first), Arc::clone(&second)]).await;
+    let preflight = runner
+        .preflight_described_http_request(described, request_input(b"hello"))
+        .await
+        .unwrap();
+    assert!(second.preflights.lock().unwrap().is_empty());
+    let (input, inputs) = mpsc::channel(4);
+    let (output, mut outputs) = mpsc::channel(4);
+    let task = tokio::spawn(preflight.session.unwrap().run_with_body_policy(
+        inputs,
+        output,
+        TransformedBodyPolicy::NotPolicyRelevant,
+    ));
+    tokio::task::yield_now().await;
+    tokio::time::sleep(MAX_MIDDLEWARE_CHAIN_TIMEOUT * 3).await;
+    assert!(!task.is_finished());
+    assert!(second.preflights.lock().unwrap().is_empty());
+    input
+        .send(HttpBodyInput::Chunk(b"hello".to_vec()))
+        .await
+        .unwrap();
+    input
+        .send(HttpBodyInput::End {
+            trailers: Vec::new(),
+        })
+        .await
+        .unwrap();
+    let mut body = Vec::new();
+    while let Some(event) = outputs.recv().await {
+        if let HttpBodyOutput::Chunk(data) = event {
+            body.extend(data);
+        }
+    }
+    task.await.unwrap().unwrap();
+    assert_eq!(body, b"HELLO");
+    assert_eq!(second.preflights.lock().unwrap().len(), 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn adjacent_buffered_stages_share_capacity_instead_of_deadlocking() {
+    let stages = vec![
+        scripted(
+            "example/a",
+            Preflight::Inspect(HttpBodyMode::Buffered),
+            Body::Unchanged,
+        ),
+        scripted(
+            "example/b",
+            Preflight::Inspect(HttpBodyMode::Buffered),
+            Body::Unchanged,
+        ),
+    ];
+    let (runner, described) = scripted_chain(stages).await;
+    let preflight = runner
+        .preflight_described_http_request(described, request_input(b"hello"))
+        .await
+        .unwrap();
+    let held = Arc::clone(&runner.registry.http_session_admission)
+        .acquire_many_owned(u32::try_from(MAX_CONCURRENT_HTTP_MIDDLEWARE_SESSIONS - 1).unwrap())
+        .await
+        .unwrap();
+    let (input, inputs) = mpsc::channel(4);
+    input
+        .send(HttpBodyInput::Chunk(b"hello".to_vec()))
+        .await
+        .unwrap();
+    input
+        .send(HttpBodyInput::End {
+            trailers: Vec::new(),
+        })
+        .await
+        .unwrap();
+    let (output, mut outputs) = mpsc::channel(4);
+    let collect = async { while outputs.recv().await.is_some() {} };
+    let execute = async {
+        let (finish, ()) = tokio::join!(
+            preflight.session.unwrap().run_with_body_policy(
+                inputs,
+                output,
+                TransformedBodyPolicy::NotPolicyRelevant
+            ),
+            collect
+        );
+        finish.unwrap();
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(5), execute)
+        .await
+        .expect("shared permit must not wait for capacity");
+    drop(held);
+    assert_eq!(
+        free_slots(&runner),
+        (
+            MAX_CONCURRENT_HTTP_MIDDLEWARE_SESSIONS,
+            MAX_CONCURRENT_HTTP_MIDDLEWARE_STREAMS
+        )
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn deferred_preflight_capacity_wait_is_bounded_and_releases_the_stream_slot() {
+    let first = scripted(
+        "example/a",
+        Preflight::Inspect(HttpBodyMode::Stream),
+        Body::Uppercase,
+    );
+    let second = scripted(
+        "example/b",
+        Preflight::Inspect(HttpBodyMode::Buffered),
+        Body::Unchanged,
+    );
+    let (runner, described) = scripted_chain(vec![first, Arc::clone(&second)]).await;
+    let preflight = runner
+        .preflight_described_http_request(described, request_input(b"hello"))
+        .await
+        .unwrap();
+    let held = Arc::clone(&runner.registry.http_session_admission)
+        .acquire_many_owned(u32::try_from(MAX_CONCURRENT_HTTP_MIDDLEWARE_SESSIONS).unwrap())
+        .await
+        .unwrap();
+    let (input, inputs) = mpsc::channel(4);
+    input
+        .send(HttpBodyInput::Chunk(b"hello".to_vec()))
+        .await
+        .unwrap();
+    input
+        .send(HttpBodyInput::End {
+            trailers: Vec::new(),
+        })
+        .await
+        .unwrap();
+    let (output, mut outputs) = mpsc::channel(4);
+    let collect = async { while outputs.recv().await.is_some() {} };
+    let (finish, ()) = tokio::join!(
+        preflight.session.unwrap().run_with_body_policy(
+            inputs,
+            output,
+            TransformedBodyPolicy::NotPolicyRelevant
+        ),
+        collect
+    );
+    let failure = finish.expect_err("no preflight capacity");
+    assert_eq!(failure.failure.unwrap().code, HttpFailureCode::Unavailable);
+    assert!(second.preflights.lock().unwrap().is_empty());
+    drop(held);
+    assert_eq!(
+        free_slots(&runner),
+        (
+            MAX_CONCURRENT_HTTP_MIDDLEWARE_SESSIONS,
+            MAX_CONCURRENT_HTTP_MIDDLEWARE_STREAMS
+        )
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn cancellation_closes_only_opened_stages_and_releases_capacity() {
+    let mut first = ScriptedStage::new(
+        "example/a",
+        Preflight::Inspect(HttpBodyMode::Stream),
+        Body::Uppercase,
+    );
+    first.output_after_input = true;
+    let (first, second) = (
+        Arc::new(first),
+        scripted("example/b", Preflight::Continue, Body::Unchanged),
+    );
+    let (runner, described) = scripted_chain(vec![Arc::clone(&first), Arc::clone(&second)]).await;
+    let preflight = runner
+        .preflight_described_http_request(described, request_input(b"hello"))
+        .await
+        .unwrap();
+    let (_input, inputs) = mpsc::channel(4);
+    let (output, _outputs) = mpsc::channel(4);
+    let task = tokio::spawn(preflight.session.unwrap().run_with_body_policy(
+        inputs,
+        output,
+        TransformedBodyPolicy::NotPolicyRelevant,
+    ));
+    tokio::task::yield_now().await;
+    task.abort();
+    assert!(task.await.unwrap_err().is_cancelled());
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    assert_eq!(
+        *first.ended.lock().unwrap(),
+        [openshell_core::proto::MiddlewareSessionEndReason::Cancellation as i32]
+    );
+    assert!(second.preflights.lock().unwrap().is_empty());
+    assert!(second.ended.lock().unwrap().is_empty());
+    assert_eq!(
+        free_slots(&runner),
+        (
+            MAX_CONCURRENT_HTTP_MIDDLEWARE_SESSIONS,
+            MAX_CONCURRENT_HTTP_MIDDLEWARE_STREAMS
+        )
+    );
 }

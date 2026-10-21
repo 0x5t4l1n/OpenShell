@@ -3,9 +3,11 @@
 
 //! HTTP session hook request middleware at `PRE_CREDENTIALS`.
 //!
-//! Preflight runs before any request body byte is read. A chain whose stages
-//! all continue at preflight forwards the body untouched; otherwise the
-//! returned [`HttpRequestSession`] runs the body stages.
+//! Initial preflight stops at the first inspecting stage. The returned
+//! [`HttpRequestSession`] opens later stages as their input headers become
+//! available. A chain whose stages all continue forwards the body untouched.
+
+use std::sync::Arc;
 
 use openshell_core::proto::{
     HeaderMutation, HttpBodyMode, HttpBodyUnavailableReason, HttpHeader, HttpRequestPreflightHead,
@@ -51,7 +53,7 @@ pub struct HttpRequestPreflightOutcome {
     pub denial: Option<MiddlewareDenial>,
     /// Present when the chain failed closed for a reason the sandbox may see.
     pub failure: Option<MiddlewareFailureDetail>,
-    /// Head after every preflight mutation.
+    /// Head after the initial preflight prefix.
     pub headers: Vec<HttpHeader>,
     /// Preflight mutations in chain order, to replay on the raw request head.
     pub header_mutations: Vec<HeaderMutation>,
@@ -63,7 +65,7 @@ pub struct HttpRequestPreflightOutcome {
     pub session_capacity_exhausted: bool,
 }
 
-/// Request body stages selected at preflight.
+/// Request stages, including deferred preflights.
 ///
 /// The session holds its HTTP session hook budget slots while its body
 /// stages run.
@@ -78,17 +80,18 @@ impl HttpRequestSession {
         self.pipeline.input_unit_limit()
     }
 
-    /// True when a BUFFERED stage withholds the head until its body result.
+    /// True when final output is known to be buffered. A chain with deferred
+    /// decisions uses incremental delivery because a later stage may stream.
     #[must_use]
-    pub fn withholds_output(&self) -> bool {
-        self.pipeline.withholds_output()
+    pub fn buffers_final_output(&self) -> bool {
+        self.pipeline.buffers_final_output()
     }
 
-    /// True when a STREAM stage runs. STREAM has no total deadline, so the
-    /// caller bounds how long the sandbox may pause its upload.
+    /// True when a stage runs or may later select STREAM. The caller bounds
+    /// how long the sandbox may pause its upload.
     #[must_use]
-    pub fn streams(&self) -> bool {
-        self.pipeline.streams()
+    pub fn may_stream(&self) -> bool {
+        self.pipeline.may_stream()
     }
 
     #[cfg(test)]
@@ -118,11 +121,11 @@ impl HttpRequestSession {
     }
 }
 
-struct RequestHead<'a> {
-    input: &'a HttpRequestPreflightInput,
+struct RequestHead {
+    input: HttpRequestPreflightInput,
 }
 
-impl StageHead for RequestHead<'_> {
+impl StageHead for RequestHead {
     fn context(&self) -> &RequestContext {
         &self.input.context
     }
@@ -137,6 +140,7 @@ impl StageHead for RequestHead<'_> {
     fn body_modes(
         &self,
         entry: &DescribedChainEntry,
+        headers: &[HttpHeader],
         declared_body_bytes: Option<u64>,
     ) -> BodyModeOffer {
         let limit = entry.max_payload_bytes();
@@ -146,7 +150,7 @@ impl StageHead for RequestHead<'_> {
         }
         // The original head decides: no stage sees an encoded body, so none
         // can decode it for the next.
-        if has_content_coding(&self.input.headers) {
+        if has_content_coding(headers) {
             offer.withhold(HttpBodyMode::Buffered, HttpBodyUnavailableReason::Encoded);
             offer.withhold(HttpBodyMode::Stream, HttpBodyUnavailableReason::Encoded);
             return offer;
@@ -172,7 +176,7 @@ fn request_spec(input: &HttpRequestPreflightInput) -> PipelineSpec {
 }
 
 impl ChainRunner {
-    /// Run HTTP session hook request preflight over a described chain. Returns
+    /// Prepare a described chain through its first inspecting stage. Returns
     /// an error only for a chain over platform capacity.
     ///
     /// Preflight waits for an HTTP session hook slot within the chain
@@ -209,7 +213,9 @@ impl ChainRunner {
             request_spec(&input),
             input.headers.clone(),
             input.declared_body_length,
-            &RequestHead { input: &input },
+            Arc::new(RequestHead {
+                input: input.clone(),
+            }),
             chain_deadline,
         )
         .await;

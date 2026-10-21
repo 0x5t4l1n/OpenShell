@@ -3,11 +3,10 @@
 
 //! HTTP session hook response middleware at `PRE_RETURN`.
 //!
-//! Preflight runs on the final upstream response head before the relay reads
-//! any body byte. A chain whose stages all continue at preflight delivers the
-//! body untouched; otherwise the returned [`HttpResponsePipelineSession`]
-//! runs the body stages, and the relay commits the response head on the
-//! output `Start`.
+//! Initial preflight stops at the first inspecting stage. The returned
+//! [`HttpResponsePipelineSession`] opens later stages on the preceding
+//! stage's output headers. The relay commits the response head on the final
+//! output `Start`. A chain whose stages all continue delivers the body untouched.
 //!
 //! Message eligibility narrows the body modes offered to each stage, in this
 //! order:
@@ -22,6 +21,7 @@
 //!    BUFFERED.
 
 use std::future::Future;
+use std::sync::Arc;
 use std::time::Duration;
 
 use openshell_core::proto::{
@@ -73,7 +73,7 @@ pub struct HttpResponsePipelinePreflight {
     pub denial: Option<MiddlewareDenial>,
     /// Present when the chain failed closed for a reason the sandbox may see.
     pub failure: Option<MiddlewareFailureDetail>,
-    /// Head after every preflight mutation.
+    /// Head after the initial preflight prefix.
     pub headers: Vec<HttpHeader>,
     /// Present when a stage selected a body mode.
     pub session: Option<HttpResponsePipelineSession>,
@@ -200,17 +200,17 @@ fn media_type_is(content_type: &str, media_type: &str) -> bool {
         .is_some_and(|value| value.trim().eq_ignore_ascii_case(media_type))
 }
 
-struct ResponseHead<'a> {
-    input: &'a HttpResponsePreflightInput,
+struct ResponseHead {
+    input: HttpResponsePreflightInput,
     restriction: Option<BodyRestriction>,
     open_ended: bool,
     chunked: bool,
 }
 
-impl<'a> ResponseHead<'a> {
-    fn new(input: &'a HttpResponsePreflightInput, chunked: bool) -> Self {
+impl ResponseHead {
+    fn new(input: &HttpResponsePreflightInput, chunked: bool) -> Self {
         Self {
-            input,
+            input: input.clone(),
             restriction: body_restriction(input),
             open_ended: is_open_ended(input),
             chunked,
@@ -244,7 +244,7 @@ impl<'a> ResponseHead<'a> {
     }
 }
 
-impl StageHead for ResponseHead<'_> {
+impl StageHead for ResponseHead {
     fn context(&self) -> &RequestContext {
         &self.input.context
     }
@@ -257,18 +257,54 @@ impl StageHead for ResponseHead<'_> {
         })
     }
 
+    fn current_headers(
+        &self,
+        headers: &[HttpHeader],
+        declared_body_bytes: Option<u64>,
+    ) -> Vec<HttpHeader> {
+        let mut current: Vec<_> = headers
+            .iter()
+            .filter(|header| !header.name.eq_ignore_ascii_case("content-length"))
+            .cloned()
+            .collect();
+        if let Some(length) = declared_body_bytes
+            && !self
+                .input
+                .connection_nominated_headers
+                .iter()
+                .any(|name| name.eq_ignore_ascii_case("content-length"))
+        {
+            current.push(HttpHeader {
+                name: "content-length".into(),
+                value: length.to_string(),
+            });
+        }
+        current
+    }
+
     fn body_modes(
         &self,
         entry: &DescribedChainEntry,
+        headers: &[HttpHeader],
         declared_body_bytes: Option<u64>,
     ) -> BodyModeOffer {
+        let current = HttpResponsePreflightInput {
+            headers: headers.to_vec(),
+            ..self.input.clone()
+        };
+        let head = Self {
+            restriction: self.restriction.or_else(|| body_restriction(&current)),
+            open_ended: is_open_ended(&current),
+            input: current,
+            chunked: self.chunked,
+        };
         let limit = entry.max_payload_bytes();
         let mut offer = BodyModeOffer::default();
         if limit == 0 {
             return offer;
         }
         for mode in [HttpBodyMode::Buffered, HttpBodyMode::Stream] {
-            match self.unavailable(mode, limit, declared_body_bytes) {
+            match head.unavailable(mode, limit, declared_body_bytes) {
                 Some(reason) => offer.withhold(mode, reason),
                 None => offer.permit(mode),
             }
@@ -278,7 +314,7 @@ impl StageHead for ResponseHead<'_> {
 }
 
 impl ChainRunner {
-    /// Run HTTP session hook response preflight over a described chain.
+    /// Prepare a described response chain through its first inspecting stage.
     /// Returns an error only for a chain over platform capacity.
     ///
     /// Preflight waits for an HTTP session hook slot within the chain
@@ -321,7 +357,7 @@ impl ChainRunner {
             spec,
             input.headers.clone(),
             input.declared_body_length,
-            &head,
+            Arc::new(head),
             chain_deadline,
         )
         .await;
@@ -611,8 +647,11 @@ mod tests {
             ),
         ];
         for (case, input, chunked, permitted, unavailable) in cases {
-            let offer = ResponseHead::new(&input, chunked)
-                .body_modes(&entry(1024), input.declared_body_length);
+            let offer = ResponseHead::new(&input, chunked).body_modes(
+                &entry(1024),
+                &input.headers,
+                input.declared_body_length,
+            );
             assert_eq!(offer.permitted, permitted, "{case}");
             assert_eq!(
                 offer.unavailable,
@@ -626,5 +665,57 @@ mod tests {
                 "{case}"
             );
         }
+    }
+    #[test]
+    fn deferred_response_metadata_tracks_the_current_representation() {
+        use HttpBodyMode::{Buffered, Stream};
+        let original = response(
+            "GET",
+            200,
+            &[
+                ("content-type", "text/event-stream"),
+                ("content-length", "100"),
+            ],
+            Some(100),
+        );
+        let head = ResponseHead::new(&original, true);
+        let changed = vec![
+            HttpHeader {
+                name: "content-type".into(),
+                value: "application/json".into(),
+            },
+            HttpHeader {
+                name: "content-length".into(),
+                value: "100".into(),
+            },
+        ];
+        let current = head.current_headers(&changed, Some(5));
+        assert!(
+            current
+                .iter()
+                .any(|header| header.name == "content-length" && header.value == "5")
+        );
+        assert_eq!(
+            head.body_modes(&entry(10), &current, Some(5)).permitted,
+            [Buffered, Stream]
+        );
+        assert_eq!(
+            head.body_modes(&entry(4), &current, Some(5)).permitted,
+            [Stream]
+        );
+        assert!(
+            !head
+                .current_headers(&changed, None)
+                .iter()
+                .any(|header| header.name == "content-length")
+        );
+
+        let protected = response("GET", 200, &[("cache-control", "no-transform")], Some(100));
+        assert!(
+            ResponseHead::new(&protected, true)
+                .body_modes(&entry(1024), &changed, Some(5))
+                .permitted
+                .is_empty()
+        );
     }
 }
