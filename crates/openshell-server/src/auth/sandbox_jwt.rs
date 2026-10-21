@@ -23,7 +23,6 @@ pub use openshell_extension_core::{
     MAX_EXTENSION_TOKEN_TTL,
 };
 use serde::Serialize;
-use sha2::{Digest as _, Sha256};
 use std::{
     io::Cursor,
     sync::Arc,
@@ -33,14 +32,12 @@ use tonic::Status;
 use tracing::warn;
 use x509_parser::{oid_registry::OID_SIG_ED25519, prelude::FromDer, x509::SubjectPublicKeyInfo};
 
-use openshell_core::SandboxSessionId;
 use openshell_core::jwt::{
-    AuthenticatedSandboxSession, CredentialEpoch, GATEWAY_SESSION_JWT_TYPE, SandboxId,
-    SandboxLaunchAuthentication, SandboxRuntimeIdentity, SessionJwtError, SessionJwtIssuer,
+    AuthenticatedSandboxSession, GATEWAY_SESSION_JWT_TYPE, SandboxId, SandboxLaunchAuthentication,
+    SandboxLaunchIdentity, SandboxRuntimeIdentity, SessionJwtError, SessionJwtIssuer,
     SessionJwtVerifier, SessionTokenProfile, SessionVerificationKey, SupervisorAuthBundle,
     SystemJwtClock,
 };
-use openshell_core::sandbox_generation::SandboxGenerationId;
 
 /// SPIFFE-shaped subject prefix. Embedded in the `sub` claim of every
 /// minted token so a future migration to per-sandbox certs or SPIRE can
@@ -169,27 +166,9 @@ impl SandboxSessionJwtAuthority {
             .map_err(|error| Status::internal(error.to_string()))?;
         self.mint_launch_with_metadata(
             sandbox_id,
-            identity.runtime_generation.clone(),
-            identity.auth_epoch,
+            &identity.launch,
             identity.gateway_token_id,
             token_metadata,
-        )
-    }
-
-    #[allow(clippy::result_large_err)]
-    pub fn mint_launch(
-        &self,
-        sandbox_id: &str,
-        runtime_generation: SandboxGenerationId,
-        auth_epoch: CredentialEpoch,
-        gateway_token_id: uuid::Uuid,
-    ) -> Result<SandboxLaunchAuthentication, Status> {
-        self.mint_launch_with_metadata(
-            sandbox_id,
-            runtime_generation,
-            auth_epoch,
-            gateway_token_id,
-            None,
         )
     }
 
@@ -197,30 +176,19 @@ impl SandboxSessionJwtAuthority {
     fn mint_launch_with_metadata(
         &self,
         sandbox_id: &str,
-        runtime_generation: SandboxGenerationId,
-        auth_epoch: CredentialEpoch,
+        launch: &SandboxLaunchIdentity,
         gateway_token_id: uuid::Uuid,
         token_metadata: Option<(uuid::Uuid, i64)>,
     ) -> Result<SandboxLaunchAuthentication, Status> {
-        // Derive the session from durable launch identity, not token IDs or
-        // minting time. Retries and credential renewal retain this session;
-        // a fresh generation gets a different one without new stored metadata.
-        let mut digest = Sha256::new();
-        digest.update(b"openshell-launch-session-v1\0");
-        digest.update(sandbox_id.as_bytes());
-        digest.update(b"\0");
-        digest.update(runtime_generation.as_str().as_bytes());
-        let mut session_bytes = [0_u8; 16];
-        session_bytes.copy_from_slice(&digest.finalize()[..16]);
-        let session_id = uuid::Uuid::from_bytes(session_bytes)
-            .to_string()
-            .parse::<SandboxSessionId>()
-            .map_err(|_| Status::internal("invalid derived sandbox session identity"))?;
+        let sandbox_id = SandboxId::parse(sandbox_id)
+            .map_err(|_| Status::invalid_argument("sandbox ID is invalid"))?;
+        let session_id = launch
+            .session_id(&sandbox_id)
+            .map_err(|error| Status::internal(format!("derive sandbox launch session: {error}")))?;
         let identity = SandboxRuntimeIdentity {
-            sandbox_id: SandboxId::parse(sandbox_id)
-                .map_err(|_| Status::invalid_argument("sandbox ID is invalid"))?,
-            runtime_generation: runtime_generation.clone(),
-            auth_epoch,
+            sandbox_id,
+            runtime_generation: launch.generation().clone(),
+            auth_epoch: launch.auth_epoch(),
         };
         let pair = token_metadata
             .map_or_else(
@@ -244,7 +212,7 @@ impl SandboxSessionJwtAuthority {
         Ok(SandboxLaunchAuthentication {
             supervisor: SupervisorAuthBundle {
                 session_id,
-                runtime_generation,
+                runtime_generation: launch.generation().clone(),
                 session_rotation: openshell_core::jwt::SessionRotation::new(1)
                     .map_err(|error| Status::internal(error.to_string()))?,
                 auth_epoch: pair.auth_epoch,
@@ -525,6 +493,42 @@ mod tests {
     use jsonwebtoken::{DecodingKey, Validation, decode};
     use openshell_bootstrap::jwt::generate_jwt_key;
 
+    #[test]
+    fn restored_launch_sessions_match_the_legacy_hash_implementation() {
+        use openshell_core::jwt::CredentialEpoch;
+        use openshell_core::sandbox_generation::SandboxGenerationId;
+        use sha2::{Digest as _, Sha256};
+
+        for sandbox_id in ["sandbox-a", "sandbox-b"] {
+            for generation in [
+                "generation-a",
+                "g000000000000002a",
+                "550e8400-e29b-41d4-a716-446655440000",
+            ] {
+                // Independent reference: the algorithm used before the shared
+                // identity moved derivation behind openshell-crypto.
+                let mut digest = Sha256::new();
+                digest.update(b"openshell-launch-session-v1\0");
+                digest.update(sandbox_id.as_bytes());
+                digest.update(b"\0");
+                digest.update(generation.as_bytes());
+                let mut bytes = [0_u8; 16];
+                bytes.copy_from_slice(&digest.finalize()[..16]);
+                let expected = uuid::Uuid::from_bytes(bytes).to_string();
+                let launch = SandboxLaunchIdentity::from_parts(
+                    SandboxGenerationId::parse(generation).unwrap(),
+                    CredentialEpoch::new(7).unwrap(),
+                );
+                assert_eq!(
+                    launch
+                        .session_id(&SandboxId::parse(sandbox_id).unwrap())
+                        .unwrap()
+                        .to_string(),
+                    expected
+                );
+            }
+        }
+    }
     fn issuer(ttl: Duration) -> ExtensionJwtIssuer {
         let mat = generate_jwt_key().expect("jwt key");
         ExtensionJwtIssuer::from_pem(

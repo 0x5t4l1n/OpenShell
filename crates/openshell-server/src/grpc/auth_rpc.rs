@@ -1233,11 +1233,11 @@ mod tests {
             &state,
             "sandbox-a",
             &crate::auth::sandbox_session::PersistedSandboxIdentity {
-                runtime_generation: openshell_core::sandbox_generation::SandboxGenerationId::parse(
-                    "generation-1",
-                )
-                .expect("runtime generation"),
-                auth_epoch: openshell_core::jwt::CredentialEpoch::new(1).expect("auth epoch"),
+                launch: openshell_core::jwt::SandboxLaunchIdentity::from_parts(
+                    openshell_core::sandbox_generation::SandboxGenerationId::parse("generation-1")
+                        .expect("runtime generation"),
+                    openshell_core::jwt::CredentialEpoch::new(1).expect("auth epoch"),
+                ),
                 gateway_token_id: uuid::Uuid::new_v4(),
                 refresh_replay: None,
             },

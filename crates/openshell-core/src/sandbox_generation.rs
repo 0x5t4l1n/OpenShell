@@ -7,8 +7,8 @@ use serde::{Deserialize, Serialize};
 
 /// Identifies one requested start of a stable sandbox.
 ///
-/// The gateway derives this value from the durable lifecycle transition so a
-/// retried driver call carries the same identity after process restart.
+/// The gateway persists this value with the lifecycle transition so a retried
+/// driver call carries the same identity after process restart.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct SandboxGenerationId(String);

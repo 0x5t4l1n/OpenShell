@@ -7514,16 +7514,9 @@ fn next_runtime_identity(
     let current =
         crate::auth::sandbox_session::PersistedSandboxIdentity::read(&metadata.annotations)
             .map_err(|error| Status::failed_precondition(error.to_string()))?;
-    let next_epoch = current
-        .auth_epoch
-        .get()
-        .checked_add(1)
-        .and_then(|epoch| openshell_core::jwt::CredentialEpoch::new(epoch).ok())
-        .ok_or_else(|| Status::internal("sandbox authorization epoch overflow"))?;
-    let mut next = crate::auth::sandbox_session::PersistedSandboxIdentity::new()
-        .map_err(|error| Status::internal(error.to_string()))?;
-    next.auth_epoch = next_epoch;
-    Ok(next)
+    current
+        .next_launch()
+        .map_err(|error| Status::internal(error.to_string()))
 }
 
 fn serialize_launch_authentication(
@@ -9991,11 +9984,13 @@ mod tests {
     fn sandbox_record(id: &str, name: &str, phase: SandboxPhase) -> Sandbox {
         let mut annotations = HashMap::new();
         crate::auth::sandbox_session::PersistedSandboxIdentity {
-            runtime_generation: openshell_core::sandbox_generation::SandboxGenerationId::parse(
-                format!("test-{id}"),
-            )
-            .expect("test runtime generation"),
-            auth_epoch: openshell_core::jwt::CredentialEpoch::new(1).expect("test auth epoch"),
+            launch: openshell_core::jwt::SandboxLaunchIdentity::from_parts(
+                openshell_core::sandbox_generation::SandboxGenerationId::parse(format!(
+                    "test-{id}"
+                ))
+                .expect("test runtime generation"),
+                openshell_core::jwt::CredentialEpoch::new(1).expect("test auth epoch"),
+            ),
             gateway_token_id: uuid::Uuid::new_v4(),
             refresh_replay: None,
         }
@@ -12621,10 +12616,10 @@ mod tests {
             )
             .unwrap();
             assert_eq!(stored.phase(), SandboxPhase::Starting as i32);
-            assert_eq!(stored_identity.auth_epoch.get(), 2);
+            assert_eq!(stored_identity.launch.auth_epoch().get(), 2);
             assert_ne!(
-                stored_identity.runtime_generation,
-                before_identity.runtime_generation
+                stored_identity.launch.generation(),
+                before_identity.launch.generation()
             );
             assert_ne!(
                 stored_identity.gateway_token_id,
@@ -12672,11 +12667,11 @@ mod tests {
                 );
                 assert_eq!(
                     authentication.supervisor.auth_epoch,
-                    stored_identity.auth_epoch
+                    stored_identity.launch.auth_epoch()
                 );
                 assert_eq!(
-                    authentication.supervisor.runtime_generation,
-                    stored_identity.runtime_generation
+                    &authentication.supervisor.runtime_generation,
+                    stored_identity.launch.generation()
                 );
             }
             assert!(
@@ -12685,7 +12680,7 @@ mod tests {
                     .lock()
                     .unwrap()
                     .iter()
-                    .all(|generation| generation == stored_identity.runtime_generation.as_str())
+                    .all(|generation| generation == stored_identity.launch.generation().as_str())
             );
             let after_retry = runtime
                 .store
@@ -18243,14 +18238,14 @@ endpoint = { kind = "unix", socket_path = "/run/agent-substrate/isolation.sock" 
             &owned.metadata.as_ref().unwrap().annotations,
         )
         .unwrap();
-        assert_ne!(identity.runtime_generation, old_generation);
-        assert_eq!(identity.auth_epoch.get(), 2);
+        assert_ne!(identity.launch.generation(), &old_generation);
+        assert_eq!(identity.launch.auth_epoch().get(), 2);
         let encoded = driver.start_authentications();
         let authentication: openshell_core::jwt::SandboxLaunchAuthentication =
             serde_json::from_slice(&encoded[0]).unwrap();
         assert_eq!(
-            authentication.supervisor.runtime_generation,
-            identity.runtime_generation
+            &authentication.supervisor.runtime_generation,
+            identity.launch.generation()
         );
         let retry = runtime
             .encode_persisted_launch_authentication(
@@ -18282,8 +18277,8 @@ endpoint = { kind = "unix", socket_path = "/run/agent-substrate/isolation.sock" 
         let settled = wait_driver_pending(&other, sandbox.object_id(), false).await;
         assert!(provisioning_operation::same_operation(&owned, &settled));
         assert_eq!(
-            sandbox_runtime_generation(&settled).unwrap(),
-            identity.runtime_generation
+            &sandbox_runtime_generation(&settled).unwrap(),
+            identity.launch.generation()
         );
     }
 

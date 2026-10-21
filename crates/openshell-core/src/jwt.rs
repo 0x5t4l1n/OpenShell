@@ -101,6 +101,91 @@ mod session {
         }
     }
 
+    /// Durable ownership of one sandbox launch.
+    ///
+    /// Retained across retries and credential renewal. The epoch remains part of
+    /// the wire protocol, but advances together with the generation when the
+    /// gateway starts a launch.
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub struct SandboxLaunchIdentity {
+        runtime_generation: SandboxGenerationId,
+        auth_epoch: CredentialEpoch,
+    }
+
+    impl SandboxLaunchIdentity {
+        /// Restore an identity from the existing persistence or wire format.
+        #[must_use]
+        pub const fn from_parts(
+            runtime_generation: SandboxGenerationId,
+            auth_epoch: CredentialEpoch,
+        ) -> Self {
+            Self {
+                runtime_generation,
+                auth_epoch,
+            }
+        }
+
+        /// Create the first launch of a sandbox.
+        pub fn new() -> Result<Self, SessionJwtError> {
+            Self::with_epoch(CredentialEpoch::new(1)?)
+        }
+
+        fn with_epoch(auth_epoch: CredentialEpoch) -> Result<Self, SessionJwtError> {
+            let generation = SandboxGenerationId::parse(Uuid::new_v4().to_string())
+                .map_err(|_| SessionJwtError::InvalidRuntimeIdentity)?;
+            Ok(Self::from_parts(generation, auth_epoch))
+        }
+
+        /// Prepare a later launch. Persist it with the lifecycle transition
+        /// before submitting driver work; retrying that work reuses this value.
+        pub fn next(&self) -> Result<Self, SessionJwtError> {
+            let epoch = self
+                .auth_epoch
+                .get()
+                .checked_add(1)
+                .ok_or(SessionJwtError::CredentialEpochOverflow)?;
+            Self::with_epoch(CredentialEpoch::new(epoch)?)
+        }
+
+        #[must_use]
+        pub const fn generation(&self) -> &SandboxGenerationId {
+            &self.runtime_generation
+        }
+
+        #[must_use]
+        pub const fn auth_epoch(&self) -> CredentialEpoch {
+            self.auth_epoch
+        }
+
+        /// Compare launch ownership after looking up the sandbox by its ID.
+        /// This value does not contain the sandbox ID and cannot validate it.
+        #[must_use]
+        pub fn matches_launch_of(&self, session: &AuthenticatedSandboxSession) -> bool {
+            self.runtime_generation == session.runtime_generation
+                && self.auth_epoch == session.auth_epoch
+        }
+
+        /// Derive the existing protocol correlation ID without another stored
+        /// identity. Preserve the original domain separator and byte layout.
+        pub fn session_id(
+            &self,
+            sandbox_id: &SandboxId,
+        ) -> Result<SandboxSessionId, openshell_crypto::CryptoError> {
+            let mut digest = openshell_crypto::sha256_digest()?;
+            digest.update(b"openshell-launch-session-v1\0")?;
+            digest.update(sandbox_id.as_str().as_bytes())?;
+            digest.update(b"\0")?;
+            digest.update(self.runtime_generation.as_str().as_bytes())?;
+            let digest = digest.finish()?;
+            let mut bytes = [0_u8; 16];
+            bytes.copy_from_slice(&digest[..16]);
+            Uuid::from_bytes(bytes)
+                .to_string()
+                .parse()
+                .map_err(|_| openshell_crypto::CryptoError::Operation)
+        }
+    }
+
     /// Monotonic identity for Sandbox Protocol attachment state.
     ///
     /// This is a protocol coordination value, not part of JWT authorization.
@@ -846,6 +931,8 @@ mod session {
         InvalidGatewayId,
         #[error("credential epoch must be positive")]
         InvalidCredentialEpoch,
+        #[error("sandbox authorization epoch overflow")]
+        CredentialEpochOverflow,
         #[error("credential epoch does not advance the active credential")]
         StaleCredentialEpoch,
         #[error("session rotation must be positive")]
@@ -1005,6 +1092,64 @@ mod tests {
             fn now_unix_seconds(&self) -> i64 {
                 self.0
             }
+        }
+
+        #[test]
+        fn launch_session_preserves_existing_derivation_and_sandbox_scope() {
+            let launch = SandboxLaunchIdentity::from_parts(
+                SandboxGenerationId::parse("generation-a").unwrap(),
+                CredentialEpoch::new(7).unwrap(),
+            );
+            let sandbox = SandboxId::parse("sandbox-a").unwrap();
+            let session = launch.session_id(&sandbox).unwrap();
+            assert_eq!(session.to_string(), "a501cb7a-c471-00d8-fff9-20f185055d58");
+            assert_eq!(launch.session_id(&sandbox).unwrap(), session);
+            assert_ne!(
+                launch
+                    .session_id(&SandboxId::parse("sandbox-b").unwrap())
+                    .unwrap(),
+                session
+            );
+            let next = launch.next().unwrap();
+            assert_ne!(next.generation(), launch.generation());
+            assert_eq!(next.auth_epoch().get(), 8);
+            assert_ne!(next.session_id(&sandbox).unwrap(), session);
+            assert_eq!(
+                launch.auth_epoch().get(),
+                7,
+                "preparing a launch does not mutate its predecessor"
+            );
+        }
+
+        #[test]
+        fn launch_epoch_exhaustion_fails_without_replacing_identity() {
+            let launch = SandboxLaunchIdentity::from_parts(
+                SandboxGenerationId::parse("generation-a").unwrap(),
+                CredentialEpoch::new(u64::MAX).unwrap(),
+            );
+            assert_eq!(launch.next(), Err(SessionJwtError::CredentialEpochOverflow));
+            assert_eq!(launch.generation().as_str(), "generation-a");
+            assert_eq!(launch.auth_epoch().get(), u64::MAX);
+        }
+
+        #[test]
+        fn launch_matching_rejects_stale_generation_or_epoch() {
+            let (issuer, verifier, _, identity) = fixture();
+            let pair = issuer.mint_pair(&identity).unwrap();
+            let principal = verifier.verify(pair.gateway.token.expose_secret()).unwrap();
+            let launch =
+                SandboxLaunchIdentity::from_parts(identity.runtime_generation, identity.auth_epoch);
+            assert!(launch.matches_launch_of(&principal));
+            let wrong_generation = SandboxLaunchIdentity::from_parts(
+                SandboxGenerationId::parse("another-generation").unwrap(),
+                launch.auth_epoch(),
+            );
+            assert!(!wrong_generation.matches_launch_of(&principal));
+            let wrong_epoch = SandboxLaunchIdentity::from_parts(
+                launch.generation().clone(),
+                CredentialEpoch::new(2).unwrap(),
+            );
+            assert!(!wrong_epoch.matches_launch_of(&principal));
         }
 
         fn fixture() -> (

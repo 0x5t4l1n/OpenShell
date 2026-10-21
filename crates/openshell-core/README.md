@@ -3,6 +3,15 @@
 Shared types, constants, configuration, and helpers used across OpenShell
 crates.
 
+## Sandbox launch identity
+
+With the `jwt` feature, `SandboxLaunchIdentity` owns the generation and
+authorization epoch of one sandbox launch. Persist `next()` with the gateway's
+start transition; retries and credential renewal retain that value. Its
+`session_id` method derives the existing Sandbox Protocol correlation ID from
+sandbox ID and generation through `openshell-crypto`. Wire structs continue to
+carry their existing generation and epoch fields.
+
 ## Isolation registrations
 
 `isolation_registration` owns the operator registry's backend names, byte-stream

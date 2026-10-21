@@ -5,7 +5,9 @@
 
 use std::collections::HashMap;
 
-use openshell_core::jwt::{AuthenticatedSandboxSession, CredentialEpoch, SessionJwtError};
+use openshell_core::jwt::{
+    AuthenticatedSandboxSession, CredentialEpoch, SandboxLaunchIdentity, SessionJwtError,
+};
 use openshell_core::proto::{Sandbox, SandboxPhase};
 use openshell_core::sandbox_generation::SandboxGenerationId;
 use openshell_crypto::CryptoError;
@@ -97,8 +99,7 @@ fn derive_token_id(rotation_id: Uuid, label: &[u8]) -> Result<Uuid, CryptoError>
 /// The complete durable authorization identity for one sandbox runtime.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PersistedSandboxIdentity {
-    pub runtime_generation: SandboxGenerationId,
-    pub auth_epoch: CredentialEpoch,
+    pub launch: SandboxLaunchIdentity,
     pub gateway_token_id: Uuid,
     pub refresh_replay: Option<GatewayRefreshReplay>,
 }
@@ -106,9 +107,16 @@ pub struct PersistedSandboxIdentity {
 impl PersistedSandboxIdentity {
     pub fn new() -> Result<Self, SessionJwtError> {
         Ok(Self {
-            runtime_generation: SandboxGenerationId::parse(Uuid::new_v4().to_string())
-                .map_err(|_| SessionJwtError::InvalidRuntimeIdentity)?,
-            auth_epoch: CredentialEpoch::new(1)?,
+            launch: SandboxLaunchIdentity::new()?,
+            gateway_token_id: Uuid::new_v4(),
+            refresh_replay: None,
+        })
+    }
+
+    /// Start a new launch without carrying over a previous token lineage.
+    pub fn next_launch(&self) -> Result<Self, SessionJwtError> {
+        Ok(Self {
+            launch: self.launch.next()?,
             gateway_token_id: Uuid::new_v4(),
             refresh_replay: None,
         })
@@ -170,8 +178,7 @@ impl PersistedSandboxIdentity {
             _ => return Err(SessionJwtError::InvalidRuntimeIdentity),
         };
         Ok(Self {
-            runtime_generation,
-            auth_epoch,
+            launch: SandboxLaunchIdentity::from_parts(runtime_generation, auth_epoch),
             gateway_token_id,
             refresh_replay,
         })
@@ -180,11 +187,11 @@ impl PersistedSandboxIdentity {
     pub fn write(&self, annotations: &mut HashMap<String, String>) {
         annotations.insert(
             RUNTIME_GENERATION_ANNOTATION.to_string(),
-            self.runtime_generation.to_string(),
+            self.launch.generation().to_string(),
         );
         annotations.insert(
             AUTH_EPOCH_ANNOTATION.to_string(),
-            self.auth_epoch.get().to_string(),
+            self.launch.auth_epoch().get().to_string(),
         );
         annotations.insert(
             GATEWAY_TOKEN_ID_ANNOTATION.to_string(),
@@ -232,8 +239,7 @@ impl PersistedSandboxIdentity {
     ) -> Result<Self, CryptoError> {
         let rotation_id = Uuid::new_v4();
         Ok(Self {
-            runtime_generation: self.runtime_generation.clone(),
-            auth_epoch: self.auth_epoch,
+            launch: self.launch.clone(),
             gateway_token_id: derive_token_id(rotation_id, b"gateway")?,
             refresh_replay: Some(GatewayRefreshReplay {
                 previous_gateway_token_id: self.gateway_token_id,
@@ -305,9 +311,7 @@ async fn load_identity(
             Status::unauthenticated("sandbox runtime identity is invalid"),
         )
     })?;
-    if principal.runtime_generation != identity.runtime_generation
-        || principal.auth_epoch != identity.auth_epoch
-    {
+    if !identity.launch.matches_launch_of(principal) {
         return Err(stale_identity());
     }
     Ok((sandbox, identity))
@@ -378,10 +382,7 @@ pub async fn rotate_gateway_token(
             "gateway token does not match the active sandbox identity",
         ));
     }
-    if next.runtime_generation != current.runtime_generation
-        || next.auth_epoch != current.auth_epoch
-        || next.gateway_token_id == current.gateway_token_id
-    {
+    if next.launch != current.launch || next.gateway_token_id == current.gateway_token_id {
         return Err(Status::internal("gateway token successor is invalid"));
     }
     let metadata = sandbox
@@ -410,6 +411,47 @@ mod tests {
     use openshell_core::proto::SandboxStatus;
     use openshell_core::proto::datamodel::v1::ObjectMeta;
     use uuid::Uuid;
+
+    #[test]
+    fn launch_transition_clears_refresh_lineage_and_preserves_annotation_format() {
+        let mut annotations = HashMap::from([
+            (RUNTIME_GENERATION_ANNOTATION.into(), "generation-a".into()),
+            (AUTH_EPOCH_ANNOTATION.into(), "7".into()),
+            (
+                GATEWAY_TOKEN_ID_ANNOTATION.into(),
+                Uuid::from_u128(1).to_string(),
+            ),
+        ]);
+        let original_annotations = annotations.clone();
+        let original = PersistedSandboxIdentity::read(&annotations).unwrap();
+        original.write(&mut annotations);
+        assert_eq!(annotations, original_annotations);
+
+        let renewed = original
+            .next_gateway_token(
+                RefreshRequestHash::from_extension_services(&[]).unwrap(),
+                100,
+                30,
+            )
+            .unwrap();
+        assert_eq!(renewed.launch, original.launch);
+        assert_ne!(renewed.gateway_token_id, original.gateway_token_id);
+        assert!(renewed.refresh_replay.is_some());
+        renewed.write(&mut annotations);
+        assert_eq!(
+            PersistedSandboxIdentity::read(&annotations).unwrap(),
+            renewed
+        );
+
+        let next = renewed.next_launch().unwrap();
+        assert_ne!(next.launch.generation(), original.launch.generation());
+        assert_eq!(next.launch.auth_epoch().get(), 8);
+        assert_ne!(next.gateway_token_id, renewed.gateway_token_id);
+        assert!(next.refresh_replay.is_none());
+        next.write(&mut annotations);
+        assert_eq!(annotations.len(), original_annotations.len());
+        assert_eq!(PersistedSandboxIdentity::read(&annotations).unwrap(), next);
+    }
 
     #[test]
     fn refresh_hashes_and_token_ids_preserve_legacy_bytes() {
@@ -443,9 +485,10 @@ mod tests {
     }
     async fn persist_sandbox(store: &Store, phase: SandboxPhase) {
         let identity = PersistedSandboxIdentity {
-            runtime_generation: SandboxGenerationId::parse("generation-a")
-                .expect("runtime generation"),
-            auth_epoch: CredentialEpoch::new(1).expect("auth epoch"),
+            launch: SandboxLaunchIdentity::from_parts(
+                SandboxGenerationId::parse("generation-a").expect("runtime generation"),
+                CredentialEpoch::new(1).expect("auth epoch"),
+            ),
             gateway_token_id: Uuid::from_u128(1),
             refresh_replay: None,
         };
@@ -500,9 +543,10 @@ mod tests {
         store
             .update_message_cas::<Sandbox, _>("sandbox-a", 0, |sandbox| {
                 let next = PersistedSandboxIdentity {
-                    runtime_generation: SandboxGenerationId::parse("generation-a")
-                        .expect("runtime generation"),
-                    auth_epoch: CredentialEpoch::new(2).expect("auth epoch"),
+                    launch: SandboxLaunchIdentity::from_parts(
+                        SandboxGenerationId::parse("generation-a").expect("runtime generation"),
+                        CredentialEpoch::new(2).expect("auth epoch"),
+                    ),
                     gateway_token_id: Uuid::from_u128(2),
                     refresh_replay: None,
                 };

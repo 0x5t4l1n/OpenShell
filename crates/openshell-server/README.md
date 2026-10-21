@@ -18,6 +18,19 @@ Retries reuse that generation and session, including after gateway restart.
 Credential renewal retains both; credentials for an older launch cannot
 authorize the new one.
 
+The gateway holds generation and epoch together as `SandboxLaunchIdentity`.
+Its `next` transition replaces both, and credential renewal clones the launch
+while rotating only the bearer lineage. The protocol session ID is derived by
+the shared type from sandbox ID and generation through `openshell-crypto`.
+The existing annotation keys, JWT claims, and launch bundles remain unchanged.
+
+This prototype retains the epoch for wire compatibility. The Sandbox Protocol
+registry contains epoch-ordering branches, but its authenticator accepts only
+the launch's fixed epoch, so those branches cannot order production connections.
+A follow-up can remove the redundant epoch and ordering branches together while
+retaining connection-ID and supervisor-instance ownership. Driver operation IDs
+retain their distinct operation lifetime.
+
 ## Operator credential export
 
 `GetProviderCredentials` exports selected profile-declared runtime environment
