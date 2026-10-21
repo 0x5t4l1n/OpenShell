@@ -42,6 +42,10 @@ leave driver behavior alone.
 - If a behavior is left to the driver, declare it with
   `#[testkit::test(requires = [...])]`. The runner supplies the environment's
   capabilities, and the test fails if one is missing.
+  The tmachine playbooks and `mise run e2e:testkit` don't supply capabilities
+  yet, so a test with `requires` fails there. That is why
+  `persistent_workspace_survives_stop_start` doesn't declare
+  `persistent_workspace`; add it when the runner drives those lanes.
 - Use the CLI for upload, download, connect and forward. Rely on its exit code
   and `--output json`.
 - Add a testkit helper instead of calling raw gRPC from a test.
