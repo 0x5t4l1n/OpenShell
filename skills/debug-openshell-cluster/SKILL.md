@@ -227,6 +227,8 @@ Inspect sandbox OCSF configuration and finding events for the validation
 rationale, configured and effective modes, active generation, and the explicit
 `previous_policy_active` state.
 
+For certificate authority incidents, update OpenShell binaries and the gateway and supervisor images, then recreate affected sandboxes. The default supervisor combines bundled and system CA roots, so a host CA update alone cannot repair an older binary. Custom base and workload images need updated CA packages and language runtimes. See [certificate trust updates](https://docs.nvidia.com/openshell/latest/security/best-practices.md#certificate-trust-updates).
+
 The published supervisor image uses a shell-free distroless Debian 13 base.
 For custom builds using `SUPERVISOR_BASE_IMAGE`, check the selected base's GNU
 runtime libraries, CA certificates, and inherited user and working directory.

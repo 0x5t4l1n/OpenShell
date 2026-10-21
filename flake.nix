@@ -46,7 +46,30 @@
         };
         testGuestPkgs = import nixpkgs-test-guest { inherit system; };
         tmachineRuntimePkgs = if pkgs.stdenv.hostPlatform.isDarwin then testGuestPkgs else pkgs;
+        patchedCa = pkgs.cacert.overrideAttrs {
+          version = "3.131.1";
+          src = pkgs.fetchurl {
+            url = "https://raw.githubusercontent.com/nss-dev/nss/refs/tags/NSS_3_131_1_RTM/lib/ckfw/builtins/certdata.txt";
+            hash = "sha256-PsK00kDcEsdH6vRQBh24SvdXxIO72jAvninOtdcL5RA=";
+          };
+        };
+        patchedUv = pkgs.uv.overrideAttrs (
+          finalAttrs: _: {
+            version = "0.13.4";
+            src = pkgs.fetchFromGitHub {
+              owner = "astral-sh";
+              repo = "uv";
+              tag = finalAttrs.version;
+              hash = "sha256-US3SjwhWE3v4/i46YuBon2GA6PupC4Z0NRUqcV9CPLM=";
+            };
+            cargoDeps = pkgs.rustPlatform.fetchCargoVendor {
+              inherit (finalAttrs) pname version src;
+              hash = "sha256-9L47CTlkOVYfGuzE4e7e2FYAI192pAsipzzScF7B1j4=";
+            };
+          }
+        );
         commonDevShellPackages = with pkgs; [
+          patchedCa
           actionlint
           cargo-auditable
           cargo-deny
@@ -70,14 +93,19 @@
           kubernetes-helm
           syft
           trivy
-          uv
+          patchedUv
           yq-go
           zizmor
           zstd
         ];
         commonDevShell = {
           packages = [ rustToolchain ] ++ commonDevShellPackages;
-          env = pkgs.lib.foldl' (env: toolchain: env // toolchain.env) { } (builtins.attrValues toolchains);
+          env =
+            (pkgs.lib.foldl' (env: toolchain: env // toolchain.env) { } (builtins.attrValues toolchains))
+            // {
+              SSL_CERT_FILE = "${patchedCa}/etc/ssl/certs/ca-bundle.crt";
+              NIX_SSL_CERT_FILE = "${patchedCa}/etc/ssl/certs/ca-bundle.crt";
+            };
         };
         treefmtEval = treefmt-nix.lib.evalModule pkgs {
           projectRootFile = "flake.nix";

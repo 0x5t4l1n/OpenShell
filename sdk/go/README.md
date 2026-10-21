@@ -316,7 +316,7 @@ stream completion.
 
 ## Prerequisites
 
-- Go 1.25.13 or later
+- Go 1.26.10 or later. On the 1.27 line, use at least 1.27.3 for the certificate authority distrust fix. Keep newer release lines updated with their current security patches.
 - [mise](https://mise.jdx.dev) (recommended for reproducible builds)
 
 ## Build and Test

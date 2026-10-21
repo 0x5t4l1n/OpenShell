@@ -25,6 +25,7 @@ the one-shot SHA-256 helper propagates the first failure without fallback.
 
 Callers use `aead`, `pki`, `tls`, and `jwt`, or an explicit `CryptoContext`.
 Certificate policy and JWT claim validation remain at their existing callers.
+Rustls certificate verification also applies WebPKI's explicit key distrust policy. Updating platform CA certificates does not replace this policy, because applications import trust anchors rather than the platform's complete revocation rules. The offline CA distrust regression test checks compromised intermediate keys even when their issuing roots are explicitly trusted.
 `pki::KeyPair` owns a backend `SigningKey` and implements rcgen 0.14's
 `PublicKeyData` and `SigningKey` traits directly.
 The backend generates/imports keys, signs messages, and exports PKCS#8 DER.

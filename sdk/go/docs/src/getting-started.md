@@ -4,7 +4,7 @@ This guide walks you through installing the OpenShell Go SDK, connecting to a ga
 
 ## Prerequisites
 
-- Go 1.25.13 or later
+- Go 1.26.10 or later. On the 1.27 line, use at least 1.27.3 for the certificate authority distrust fix. Keep newer release lines updated with their current security patches.
 - Access to an OpenShell gateway (address and authentication token)
 
 ## Installation
