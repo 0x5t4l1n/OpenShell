@@ -396,6 +396,12 @@ pub trait StageHead: Send + Sync {
         headers: &[HttpHeader],
         declared_body_bytes: Option<u64>,
     ) -> BodyModeOffer;
+
+    /// Largest final output the caller accepts, when it holds the complete
+    /// output before delivery. `None` when the output streams uncapped.
+    fn max_output_body_bytes(&self) -> Option<u64> {
+        None
+    }
 }
 
 /// Preflight fields both RPCs carry.
@@ -758,7 +764,7 @@ pub(super) fn preflight_event(
             config: entry.entry.config.clone(),
             permitted_body_modes: permitted.iter().map(|mode| *mode as i32).collect(),
             unavailable_body_modes: offer.unavailable,
-            limits: body_limits(entry, &permitted, timeouts),
+            limits: body_limits(entry, &permitted, timeouts, head.max_output_body_bytes()),
             declared_body_bytes,
         },
     )
@@ -2308,6 +2314,7 @@ fn body_limits(
     entry: &DescribedChainEntry,
     permitted: &[HttpBodyMode],
     timeouts: PipelineTimeouts,
+    max_output_body_bytes: Option<u64>,
 ) -> HttpBodyLimits {
     let buffered_limit = entry.max_payload_bytes();
     let chunk = if permitted.is_empty() {
@@ -2315,6 +2322,7 @@ fn body_limits(
     } else {
         stage_chunk_limit(entry) as u64
     };
+    let streams = permitted.contains(&HttpBodyMode::Stream);
     HttpBodyLimits {
         max_chunk_bytes: chunk,
         max_buffered_body_bytes: if permitted.contains(&HttpBodyMode::Buffered) {
@@ -2322,9 +2330,8 @@ fn body_limits(
         } else {
             0
         },
-        idle_timeout: permitted
-            .contains(&HttpBodyMode::Stream)
-            .then(|| duration_to_proto(timeouts.stream_idle)),
+        idle_timeout: streams.then(|| duration_to_proto(timeouts.stream_idle)),
+        max_output_body_bytes: max_output_body_bytes.filter(|_| streams),
     }
 }
 

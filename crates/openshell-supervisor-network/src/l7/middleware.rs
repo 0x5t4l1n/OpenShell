@@ -92,9 +92,34 @@ pub enum RequestBodyDelivery {
     #[default]
     Incremental,
     /// A later step needs the complete body before upstream contact, so the
-    /// output is withheld and inlined into the request (at most
-    /// [`openshell_supervisor_middleware::MAX_HTTP_REQUEST_WITHHELD_BYTES`]).
-    Withhold,
+    /// output is withheld and inlined into the request, up to `max_bytes`.
+    Withhold { max_bytes: usize },
+}
+
+impl RequestBodyDelivery {
+    /// Withhold up to the default
+    /// [`openshell_supervisor_middleware::MAX_HTTP_REQUEST_WITHHELD_BYTES`].
+    pub const WITHHOLD: Self = Self::Withhold {
+        max_bytes: openshell_supervisor_middleware::MAX_HTTP_REQUEST_WITHHELD_BYTES,
+    };
+
+    /// Withhold, keeping the route's limit when it already withholds.
+    #[must_use]
+    pub const fn or_withhold(self) -> Self {
+        match self {
+            Self::Incremental => Self::WITHHOLD,
+            withhold @ Self::Withhold { .. } => withhold,
+        }
+    }
+
+    /// Largest withheld output, or `None` for incremental delivery.
+    #[must_use]
+    pub const fn withheld_limit(self) -> Option<usize> {
+        match self {
+            Self::Incremental => None,
+            Self::Withhold { max_bytes } => Some(max_bytes),
+        }
+    }
 }
 
 /// One destination-selected middleware chain shared by an HTTP request and
@@ -856,7 +881,7 @@ pub async fn apply_middleware_chain_for_scheme_with_request_id_and_delivery<
                     delivery
                 }
                 openshell_supervisor_middleware::TransformedBodyPolicy::Reevaluate(_) => {
-                    RequestBodyDelivery::Withhold
+                    delivery.or_withhold()
                 }
             };
             Box::pin(apply_pipeline_middleware_chain(
@@ -1009,7 +1034,16 @@ async fn apply_pipeline_middleware_chain<C: AsyncRead + AsyncWrite + Unpin + Sen
     delivery: RequestBodyDelivery,
 ) -> Result<MiddlewareApplyResult> {
     let head = &req.raw_header[..request_header_end(&req.raw_header)];
-    let input = request_preflight_input(scheme, &req, ctx, request_id)?;
+    // Output that cannot stream to the upstream is withheld up to the route's
+    // limit, and STREAM stages learn that limit at preflight. A chain whose
+    // final stage buffers is withheld too, but within its smaller BUFFERED cap.
+    let withheld_limit = delivery.withheld_limit().or_else(|| {
+        (matches!(req.body_length, crate::l7::provider::BodyLength::None)
+            || !request_line_is_http11(head)
+            || crate::l7::rest::request_has_upgrade_header(head))
+        .then_some(openshell_supervisor_middleware::MAX_HTTP_REQUEST_WITHHELD_BYTES)
+    });
+    let input = request_preflight_input(scheme, &req, ctx, request_id, withheld_limit)?;
     let mut preflight = runner
         .preflight_described_http_request(chain, input)
         .await?;
@@ -1045,12 +1079,7 @@ async fn apply_pipeline_middleware_chain<C: AsyncRead + AsyncWrite + Unpin + Sen
 
     let (prepared_headers, mut reader) =
         crate::l7::rest::prepare_request_body_stream(&req, client).await?;
-    if delivery == RequestBodyDelivery::Incremental
-        && !session.buffers_final_output()
-        && !matches!(req.body_length, crate::l7::provider::BodyLength::None)
-        && request_line_is_http11(head)
-        && !crate::l7::rest::request_has_upgrade_header(head)
-    {
+    if withheld_limit.is_none() && !session.buffers_final_output() {
         let request = crate::l7::rest::rebuild_request_for_live_body(
             &req,
             &prepared_headers,
@@ -1071,6 +1100,8 @@ async fn apply_pipeline_middleware_chain<C: AsyncRead + AsyncWrite + Unpin + Sen
     let progress = session
         .may_stream()
         .then_some(REQUEST_CLIENT_PROGRESS_TIMEOUT);
+    let output_limit =
+        withheld_limit.unwrap_or(openshell_supervisor_middleware::MAX_HTTP_REQUEST_WITHHELD_BYTES);
     let (output, mut outputs) = mpsc::channel(4);
     let collect = async move {
         let mut late = Vec::new();
@@ -1081,9 +1112,7 @@ async fn apply_pipeline_middleware_chain<C: AsyncRead + AsyncWrite + Unpin + Sen
                     header_mutations, ..
                 } => late = header_mutations,
                 HttpBodyOutput::Chunk(data) => {
-                    if body.len().saturating_add(data.len())
-                        > openshell_supervisor_middleware::MAX_HTTP_REQUEST_WITHHELD_BYTES
-                    {
+                    if body.len().saturating_add(data.len()) > output_limit {
                         return None;
                     }
                     body.extend_from_slice(&data);
@@ -1142,6 +1171,7 @@ fn request_preflight_input(
     req: &crate::l7::provider::L7Request,
     ctx: &L7EvalContext,
     request_id: &str,
+    withheld_limit: Option<usize>,
 ) -> Result<HttpRequestPreflightInput> {
     let head = &req.raw_header[..request_header_end(&req.raw_header)];
     let headers = safe_middleware_headers(head)?;
@@ -1166,6 +1196,7 @@ fn request_preflight_input(
             .map(|(name, value)| openshell_core::proto::HttpHeader { name, value })
             .collect(),
         connection_nominated_headers: headers.connection_nominated,
+        max_output_body_bytes: withheld_limit.map(|limit| limit as u64),
     })
 }
 

@@ -59,7 +59,7 @@ Your service receives the request target, headers, and context before it receive
 
 OpenShell applies middleware changes before it injects provider credentials. Middleware never sees those credentials. If middleware replaces a body, OpenShell checks it against body-aware policy, such as GraphQL, JSON-RPC, or MCP rules, before forwarding it.
 
-Request output streams to the external service while the sandbox uploads. OpenShell instead buffers output, up to 4 MiB, when a stage selects BUFFERED, the route needs SigV4 signing or body credential rewriting, or the request uses the forward proxy, HTTP/1.0, or `Upgrade`. JSON-RPC, MCP, and GraphQL endpoints also buffer output so OpenShell can check the replaced body against policy.
+Request output streams to the external service while the sandbox uploads. OpenShell instead buffers output when a stage selects BUFFERED, the route needs SigV4 signing or body credential rewriting, or the request uses the forward proxy, HTTP/1.0, or `Upgrade`. JSON-RPC, MCP, and GraphQL endpoints also buffer output so OpenShell can check the replaced body against policy. Buffered output can be up to 10 MiB for SigV4 signing, 256 KiB for body credential rewriting, and 4 MiB otherwise. The preflight reports this limit to STREAM stages as `limits.max_output_body_bytes`. Larger output fails with `body_over_limit`.
 
 ### Responses
 
@@ -243,7 +243,7 @@ Gateways and supervisors that predate this hook reject a manifest that binds it.
 | Preflight | HTTP session hooks | Binding timeout per stage. Initial preflights share a 30-second setup budget; each deferred preflight gets a new 30-second setup budget when its input headers arrive. Capacity waits use that budget. |
 | Concurrent messages | HTTP session hooks | 64 messages in preflight or BUFFERED processing, and 256 with STREAM or deferred stages, per sandbox. Buffered stages of one message share a slot. Streaming releases the buffering slot until another stage needs it. |
 | Buffered body | HTTP session hooks | Stage payload limit, up to 4 MiB. Two minutes to receive, process, and deliver; individual exchanges also obey the binding timeout. |
-| Streamed body | HTTP session hooks | No total size or duration limit. Chunks are at most 64 KiB or the stage payload limit, whichever is smaller. |
+| Streamed body | HTTP session hooks | No total duration limit. No total size limit unless the preflight sets `limits.max_output_body_bytes` for buffered request output. Chunks are at most 64 KiB or the stage payload limit, whichever is smaller. |
 | Middleware stall | HTTP STREAM | 30 seconds to accept the next input, or between results after `input_end`. Waiting for the sandbox or external service to produce input does not count. |
 | Request upload stall | HTTP STREAM or deferred stages | 30 seconds without progress from the sandbox. |
 | Payload per middleware | Legacy HTTP hooks and WebSocket | Registration `max_payload_bytes`, up to 4 MiB, for each body, response piece, message, or replacement. |

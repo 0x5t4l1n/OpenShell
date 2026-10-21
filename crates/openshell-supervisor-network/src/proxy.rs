@@ -1836,7 +1836,7 @@ impl ForwardMiddlewarePipeline<'_> {
                 self.ctx,
                 self.scheme,
                 transformed_body_policy,
-                crate::l7::middleware::RequestBodyDelivery::Withhold,
+                crate::l7::middleware::RequestBodyDelivery::WITHHOLD,
             )
             .await
     }

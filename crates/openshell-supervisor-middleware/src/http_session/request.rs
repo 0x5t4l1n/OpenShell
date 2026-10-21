@@ -28,8 +28,10 @@ use crate::{
     MiddlewareDenial, TransformedBodyPolicy, ensure_chain_capacity,
 };
 
-/// Largest request body middleware output the supervisor withholds in memory
-/// before it contacts the upstream.
+/// Default largest request body output withheld before upstream contact.
+///
+/// The supervisor holds this output in memory. A route with its own buffering
+/// limit, such as `SigV4` body signing, may withhold up to that limit instead.
 pub const MAX_HTTP_REQUEST_WITHHELD_BYTES: usize = MAX_MIDDLEWARE_PAYLOAD_BYTES;
 
 /// Request head and framing offered to request middleware.
@@ -44,6 +46,10 @@ pub struct HttpRequestPreflightInput {
     pub headers: Vec<HttpHeader>,
     /// Lowercased names nominated by the request's `Connection` fields.
     pub connection_nominated_headers: Vec<String>,
+    /// Largest final body output the caller accepts when it withholds the
+    /// output until the chain finishes. `None` when output streams to the
+    /// upstream. Advertised to STREAM stages as `max_output_body_bytes`.
+    pub max_output_body_bytes: Option<u64>,
 }
 
 /// Outcome of request preflight across a chain.
@@ -162,6 +168,10 @@ impl StageHead for RequestHead {
         }
         offer.permit(HttpBodyMode::Stream);
         offer
+    }
+
+    fn max_output_body_bytes(&self) -> Option<u64> {
+        self.input.max_output_body_bytes
     }
 }
 

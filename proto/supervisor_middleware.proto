@@ -231,7 +231,8 @@ enum HttpBodyMode {
   // does not fall back to STREAM.
   HTTP_BODY_MODE_BUFFERED = 1;
   // Independent ordered input and output streams. The stage returns every
-  // output byte and owns any working storage. No total size or time limit.
+  // output byte and owns any working storage. No total time limit, and no
+  // total size limit unless limits.max_output_body_bytes is set.
   HTTP_BODY_MODE_STREAM = 2;
 }
 
@@ -393,9 +394,10 @@ message HttpResponsePreflightHead {
 
 // Limits for one stage exchange. max_buffered_body_bytes is 0 unless BUFFERED
 // is permitted, and max_chunk_bytes is 0 when no body mode is permitted.
-// STREAM has no total byte cap and no total deadline. BUFFERED has 2 minutes
-// to receive, process, and deliver one body, and each body exchange is also
-// bounded by the binding timeout.
+// STREAM has no total deadline, and no total byte cap unless
+// max_output_body_bytes is set. BUFFERED has 2 minutes to receive, process,
+// and deliver one body, and each body exchange is also bounded by the binding
+// timeout.
 message HttpBodyLimits {
   // Largest input_chunk and output_chunk payload.
   uint64 max_chunk_bytes = 1;
@@ -406,6 +408,12 @@ message HttpBodyLimits {
   // this duration after input_end. Time the sandbox or upstream takes to
   // produce input does not count. OpenShell uses 30 seconds.
   google.protobuf.Duration idle_timeout = 3;
+  // Largest request body OpenShell forwards after every stage, set when
+  // STREAM is permitted and OpenShell holds the complete output before it
+  // contacts the upstream, such as to sign it. Output beyond it fails the
+  // message with body_over_limit. Unset when the output streams without a
+  // total cap.
+  optional uint64 max_output_body_bytes = 4;
 }
 
 // Preflight decision. To deny, return deny (requests) or block_delivery

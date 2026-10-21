@@ -945,14 +945,21 @@ async fn reject_live_request_body<C: AsyncRead + AsyncWrite + Unpin>(
 }
 
 /// Credential signing and body rewriting need the complete request body
-/// before upstream contact, so middleware output is withheld on those routes.
+/// before upstream contact, so middleware output is withheld on those routes,
+/// up to the smallest body those steps accept. Adding middleware therefore
+/// does not lower the body size a route already handles.
 fn request_body_delivery(config: &L7EndpointConfig) -> RequestBodyDelivery {
-    if config.credential_signing.is_sigv4()
-        || (config.protocol == L7Protocol::Rest && config.request_body_credential_rewrite)
-    {
-        RequestBodyDelivery::Withhold
-    } else {
-        RequestBodyDelivery::Incremental
+    let sigv4 = config
+        .credential_signing
+        .is_sigv4()
+        .then_some(crate::l7::rest::MAX_SIGV4_BODY_BYTES);
+    let rewrite = (config.protocol == L7Protocol::Rest && config.request_body_credential_rewrite)
+        .then_some(crate::l7::rest::MAX_REWRITE_BODY_BYTES);
+    match (sigv4, rewrite) {
+        (None, None) => RequestBodyDelivery::Incremental,
+        (sigv4, rewrite) => RequestBodyDelivery::Withhold {
+            max_bytes: sigv4.into_iter().chain(rewrite).min().unwrap_or_default(),
+        },
     }
 }
 
@@ -11662,10 +11669,12 @@ network_policies:
 
     /// HTTP session hook request stage that streams the body through and
     /// declares its original length, or with `drop_body` declares and emits
-    /// an empty body. It rejects at `input_end` when `reject` is set.
+    /// an empty body. It rejects at `input_end` when `reject` is set, and
+    /// records every preflight it receives.
     struct SessionEchoRequestStage {
         drop_body: bool,
         reject: bool,
+        preflights: Arc<std::sync::Mutex<Vec<openshell_core::proto::HttpRequestSessionPreflight>>>,
     }
 
     #[tonic::async_trait]
@@ -11720,12 +11729,14 @@ network_policies:
                 http_request_session_event, http_request_session_result,
             };
             let (drop_body, reject) = (self.drop_body, self.reject);
+            let preflights = Arc::clone(&self.preflights);
             let (sender, receiver) = tokio::sync::mpsc::channel(4);
             tokio::spawn(async move {
                 let mut declared = None;
                 while let Some(event) = events.recv().await {
                     let result = match event.event {
                         Some(http_request_session_event::Event::Preflight(preflight)) => {
+                            preflights.lock().unwrap().push(preflight.clone());
                             declared = if drop_body {
                                 Some(0)
                             } else {
@@ -11824,7 +11835,11 @@ network_policies:
             let engine = OpaEngine::from_strings(TEST_POLICY, data).expect("test policy");
             engine.set_middleware_runner_for_tests(
                 openshell_supervisor_middleware::ChainRunner::new(Arc::new(
-                    SessionEchoRequestStage { drop_body, reject },
+                    SessionEchoRequestStage {
+                        drop_body,
+                        reject,
+                        preflights: Arc::default(),
+                    },
                 )),
             );
             let input = NetworkInput {
@@ -11927,6 +11942,225 @@ network_policies:
                 assert!(response.contains("middleware_denied"), "{name}: {response}");
             } else {
                 assert!(response.starts_with("HTTP/1.1 204"), "{name}: {response}");
+            }
+        }
+    }
+
+    #[test]
+    fn withheld_routes_keep_the_body_limit_of_their_signing_or_rewrite_step() {
+        let delivery = |fields: &str| {
+            let val = regorus::Value::from_json_str(&format!(
+                r#"{{"protocol": "rest", "host": "api.example.test", "port": 443{fields}}}"#
+            ))
+            .unwrap();
+            request_body_delivery(&crate::l7::parse_l7_config(&val).unwrap())
+        };
+        let sigv4 = r#", "credential_signing": "sigv4", "signing_service": "bedrock""#;
+        let rewrite = r#", "request_body_credential_rewrite": true"#;
+        assert_eq!(delivery(""), RequestBodyDelivery::Incremental);
+        assert_eq!(
+            delivery(sigv4),
+            RequestBodyDelivery::Withhold {
+                max_bytes: crate::l7::rest::MAX_SIGV4_BODY_BYTES
+            }
+        );
+        assert_eq!(
+            delivery(rewrite),
+            RequestBodyDelivery::Withhold {
+                max_bytes: crate::l7::rest::MAX_REWRITE_BODY_BYTES
+            }
+        );
+        assert_eq!(
+            delivery(&format!("{sigv4}{rewrite}")),
+            RequestBodyDelivery::Withhold {
+                max_bytes: crate::l7::rest::MAX_REWRITE_BODY_BYTES
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn sigv4_route_withholds_stream_output_up_to_the_signing_limit() {
+        let data = r#"
+network_middlewares:
+  echo:
+    middleware: test/session-echo
+    on_error: fail_closed
+    endpoints:
+      include: ["bedrock-runtime.us-east-1.amazonaws.com"]
+network_policies:
+  bedrock:
+    name: bedrock
+    endpoints:
+      - host: bedrock-runtime.us-east-1.amazonaws.com
+        port: 8080
+        protocol: rest
+        enforcement: enforce
+        credential_signing: sigv4
+        signing_service: bedrock
+        signing_region: us-east-1
+        rules:
+          - allow:
+              method: POST
+              path: "/model/**"
+    binaries:
+      - { path: /usr/bin/curl }
+"#;
+        let limit = crate::l7::rest::MAX_SIGV4_BODY_BYTES;
+        // A pass-through STREAM stage keeps the route's 10 MiB signing limit
+        // instead of the 4 MiB default: a 6 MiB body is signed and forwarded,
+        // and one byte over the limit fails before upstream contact.
+        for body_len in [6 * 1024 * 1024, limit + 1] {
+            let forwards = body_len <= limit;
+            let engine = OpaEngine::from_strings(TEST_POLICY, data).expect("test policy");
+            let preflights = Arc::default();
+            engine.set_middleware_runner_for_tests(
+                openshell_supervisor_middleware::ChainRunner::new(Arc::new(
+                    SessionEchoRequestStage {
+                        drop_body: false,
+                        reject: false,
+                        preflights: Arc::clone(&preflights),
+                    },
+                )),
+            );
+            let input = NetworkInput {
+                host: "bedrock-runtime.us-east-1.amazonaws.com".into(),
+                port: 8080,
+                binary_path: PathBuf::from("/usr/bin/curl"),
+                binary_sha256: "unused".into(),
+                ancestors: vec![],
+                cmdline_paths: vec![],
+            };
+            let (endpoint_config, generation) = engine
+                .query_endpoint_config_with_generation(&input)
+                .expect("endpoint config");
+            let config = crate::l7::parse_l7_config(&endpoint_config.expect("configured endpoint"))
+                .expect("REST config");
+            assert!(config.credential_signing.is_sigv4());
+            let tunnel_engine = engine
+                .clone_engine_for_tunnel(generation)
+                .expect("tunnel engine");
+            let (_, resolver) = SecretResolver::from_provider_env(
+                [
+                    ("AWS_ACCESS_KEY_ID".to_string(), "AKIATESTKEY".to_string()),
+                    (
+                        "AWS_SECRET_ACCESS_KEY".to_string(),
+                        "test-secret-key".to_string(),
+                    ),
+                ]
+                .into_iter()
+                .collect(),
+            );
+            let ctx = L7EvalContext {
+                host: "bedrock-runtime.us-east-1.amazonaws.com".into(),
+                port: 8080,
+                request_default_port: Some(8080),
+                policy_name: "bedrock".into(),
+                binary_path: "/usr/bin/curl".into(),
+                secret_resolver: Some(Arc::new(resolver.expect("resolver"))),
+                ..Default::default()
+            };
+            let (app, mut relay_client) = tokio::io::duplex(64 * 1024);
+            let (mut relay_upstream, mut upstream) = tokio::io::duplex(64 * 1024);
+            let relay = tokio::spawn(async move {
+                relay_rest(
+                    &config,
+                    &tunnel_engine,
+                    &mut relay_client,
+                    &mut relay_upstream,
+                    &ctx,
+                )
+                .await
+            });
+            let (mut app_read, mut app_write) = tokio::io::split(app);
+            // The relay stops reading an over-limit upload, so a failed write
+            // is expected there.
+            let upload = tokio::spawn(async move {
+                let head = format!(
+                    "POST /model/test-model/converse HTTP/1.1\r\n\
+                     Host: bedrock-runtime.us-east-1.amazonaws.com\r\n\
+                     Content-Type: application/json\r\n\
+                     Content-Length: {body_len}\r\n\r\n"
+                );
+                app_write.write_all(head.as_bytes()).await?;
+                let chunk = vec![b'a'; 64 * 1024];
+                let mut remaining = body_len;
+                while remaining > 0 {
+                    let count = remaining.min(chunk.len());
+                    app_write.write_all(&chunk[..count]).await?;
+                    remaining -= count;
+                }
+                Ok::<_, std::io::Error>(app_write)
+            });
+
+            let mut forwarded = Vec::new();
+            let mut response = Vec::new();
+            tokio::time::timeout(std::time::Duration::from_secs(30), async {
+                if !forwards {
+                    app_read.read_to_end(&mut response).await.unwrap();
+                    return;
+                }
+                let mut buffer = vec![0u8; 64 * 1024];
+                while forwarded
+                    .windows(4)
+                    .position(|window| window == b"\r\n\r\n")
+                    .is_none_or(|end| forwarded.len() < end + 4 + body_len)
+                {
+                    let count = upstream.read(&mut buffer).await.unwrap();
+                    assert!(count > 0, "upstream closed early");
+                    forwarded.extend_from_slice(&buffer[..count]);
+                }
+                upstream
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
+                    )
+                    .await
+                    .unwrap();
+                app_read.read_to_end(&mut response).await.unwrap();
+            })
+            .await
+            .unwrap_or_else(|_| panic!("{body_len}: relay stalled"));
+            let _ = upload.await.expect("join upload");
+            relay
+                .await
+                .expect("join REST relay")
+                .expect("REST relay result");
+            if !forwards {
+                upstream.read_to_end(&mut forwarded).await.unwrap();
+            }
+
+            let preflights = preflights.lock().unwrap();
+            assert_eq!(preflights.len(), 1, "{body_len}");
+            assert_eq!(
+                preflights[0].declared_body_bytes,
+                Some(body_len as u64),
+                "{body_len}"
+            );
+            assert_eq!(
+                preflights[0]
+                    .limits
+                    .as_ref()
+                    .and_then(|limits| limits.max_output_body_bytes),
+                Some(limit as u64),
+                "{body_len}"
+            );
+            let response = String::from_utf8_lossy(&response);
+            if forwards {
+                let end = forwarded
+                    .windows(4)
+                    .position(|window| window == b"\r\n\r\n")
+                    .expect("forwarded head");
+                let head = String::from_utf8_lossy(&forwarded[..end]).to_ascii_lowercase();
+                assert!(head.contains("authorization: aws4-hmac-sha256"), "{head}");
+                assert!(
+                    head.contains(&format!("content-length: {body_len}")),
+                    "{head}"
+                );
+                assert_eq!(forwarded.len() - end - 4, body_len);
+                assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+            } else {
+                assert!(forwarded.is_empty(), "upstream saw an over-limit request");
+                assert!(response.starts_with("HTTP/1.1 403"), "{response}");
+                assert!(response.contains("body_over_limit"), "{response}");
             }
         }
     }

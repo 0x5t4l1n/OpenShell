@@ -512,6 +512,7 @@ fn request_input(body: &[u8]) -> HttpRequestPreflightInput {
             value: "original".into(),
         }],
         connection_nominated_headers: Vec::new(),
+        max_output_body_bytes: None,
     }
 }
 
@@ -1215,6 +1216,49 @@ async fn an_encoded_request_offers_no_body_mode() {
             SupervisorMiddlewarePhase::PreCredentials as i32
         );
     }
+}
+
+#[tokio::test]
+async fn preflight_advertises_the_withheld_output_cap_only_with_stream() {
+    const CAP: u64 = 10 * 1024 * 1024;
+    for (coding, cap, advertised) in [
+        ("identity", Some(CAP), Some(CAP)),
+        ("identity", None, None),
+        // No body mode is offered, so there is no STREAM output to cap.
+        ("gzip", Some(CAP), None),
+    ] {
+        let stage = scripted("example/a", Preflight::Continue, Body::Unchanged);
+        let (runner, described) = scripted_chain(vec![Arc::clone(&stage)]).await;
+        let mut input = request_input(b"hello");
+        input.max_output_body_bytes = cap;
+        input.headers.push(HttpHeader {
+            name: "Content-Encoding".into(),
+            value: coding.into(),
+        });
+        runner
+            .preflight_described_http_request(described, input)
+            .await
+            .expect("preflight");
+        let preflights = stage.preflights.lock().unwrap();
+        let limits = preflights[0].limits.as_ref().expect("limits");
+        assert_eq!(limits.max_output_body_bytes, advertised, "{coding} {cap:?}");
+    }
+
+    // A deferred preflight, sent once the first stage starts its output,
+    // carries the same cap.
+    let first = scripted(
+        "example/a",
+        Preflight::Inspect(HttpBodyMode::Stream),
+        Body::Uppercase,
+    );
+    let second = scripted("example/b", Preflight::Continue, Body::Unchanged);
+    let mut input = request_input(b"hello");
+    input.max_output_body_bytes = Some(CAP);
+    let result = run_input(vec![first, Arc::clone(&second)], input, b"hello").await;
+    assert!(result.allowed, "{}", result.reason);
+    let preflights = second.preflights.lock().unwrap();
+    let limits = preflights[0].limits.as_ref().expect("limits");
+    assert_eq!(limits.max_output_body_bytes, Some(CAP));
 }
 
 #[tokio::test]
