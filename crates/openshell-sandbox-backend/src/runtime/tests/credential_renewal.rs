@@ -309,7 +309,7 @@ async fn renewal_rejects_mismatched_confirmation() {
 
         let result = client.ensure_current_credential_connection().await;
         assert!(
-            matches!(&result, Err(BackendError::Confirm(message)) if message.contains(field)),
+            matches!(&result, Err(BackendError::Confirm(message)) if message.contains(&format!("confirmation {field} does not match"))),
             "{case}: renewal must reject the confirmation: {result:?}"
         );
         let failed = client.grpc_channel.lock().await.clone().unwrap();
@@ -336,7 +336,7 @@ async fn reconnect_rejects_mismatched_confirmation() {
             .recover_after_unavailable(client.connection_generation().await)
             .await;
         assert!(
-            matches!(&result, Err(BackendError::Confirm(message)) if message.contains(field)),
+            matches!(&result, Err(BackendError::Confirm(message)) if message.contains(&format!("confirmation {field} does not match"))),
             "{case}: reconnect must reject the confirmation: {result:?}"
         );
         assert_eq!(accepted.load(Ordering::Acquire), 2);
