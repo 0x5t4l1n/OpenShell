@@ -24,6 +24,14 @@ depends = [
   "test:docs-nav",
   "test:maintainer-approval",
   "test:cargo-lockfile-alignment",
+  "test:expected-matrix",
+]
+
+["test:expected-matrix"]
+description = "Check tests/expected-matrix.json and the release workflow matrices against the test plans"
+run = [
+  "cargo run --locked --quiet --manifest-path tests/runner/Cargo.toml --bin openshell-test -- check-matrix",
+  "uv run tasks/scripts/check_plan_workflow_matrix.py",
 ]
 
 ["test:docs-website"]
@@ -125,6 +133,8 @@ run = [
   "cargo test -p openshell-server --features test-support",
   "cargo nextest run --config-file .config/nextest.toml --manifest-path examples/supervisor-middleware-content-guard/Cargo.toml",
   "cargo nextest run --config-file .config/nextest.toml --manifest-path tests/testkit/Cargo.toml",
+  "cargo nextest run --config-file .config/nextest.toml --manifest-path tests/tmachine/Cargo.toml",
+  "cargo nextest run --config-file .config/nextest.toml --manifest-path tests/runner/Cargo.toml",
 ]
 run_windows = "powershell -NoProfile -ExecutionPolicy Bypass -File tasks/scripts/windows-msvc.ps1 test-precommit native"
 hide = true

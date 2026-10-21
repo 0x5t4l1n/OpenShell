@@ -20,8 +20,11 @@
 //! ```
 //!
 //! Tests find the gateway the same way the `openshell` CLI does (see
-//! [`gateway`]).
+//! [`gateway`]). A test that needs something only some environments provide
+//! declares it with `#[testkit::test(requires = [...])]` (see
+//! [`Capability`]); `id = "t-..."` optionally gives a test a stable identity.
 
+mod capabilities;
 mod cli;
 mod context;
 mod error;
@@ -29,6 +32,7 @@ pub mod gateway;
 mod poll;
 mod run;
 
+pub use capabilities::{CAPABILITIES_ENV, Capabilities, Capability};
 pub use cli::{BIN_ENV, CLI_TIMEOUT, Cli, CliOutput};
 pub use context::{
     Context, DELETE_TIMEOUT, EXEC_TIMEOUT, ExecOutput, READY_TIMEOUT, STOP_TIMEOUT, Sandbox,

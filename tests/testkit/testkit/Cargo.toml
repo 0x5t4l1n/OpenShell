@@ -25,3 +25,6 @@ serde = "1"
 serde_json = "1"
 tokio = { version = "1.43", features = ["macros", "process", "rt", "time"] }
 tonic = { version = "0.14", features = ["tls-native-roots"] }
+
+[dev-dependencies]
+openshell-testkit-spec = { path = "../testkit-spec" }

@@ -39,8 +39,9 @@ leave driver behavior alone.
   published docs.
 - Assert `phase` and `exit_code`. Don't assert condition reasons.
 - Check that something did not happen by reading state, not by sleeping.
-- If a behavior is left to the driver, it needs a capability. Until testkit has
-  capabilities, keep that test out of this suite.
+- If a behavior is left to the driver, declare it with
+  `#[testkit::test(requires = [...])]`. The runner supplies the environment's
+  capabilities, and the test fails if one is missing.
 - Use the CLI for upload, download, connect and forward. Rely on its exit code
   and `--output json`.
 - Add a testkit helper instead of calling raw gRPC from a test.

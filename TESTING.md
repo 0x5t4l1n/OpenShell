@@ -18,6 +18,12 @@ e2e/python/            # Python E2E tests (test_*.py prefix)
 e2e/rust/              # Rust CLI E2E tests
 tests/testkit/         # Support library for SDK-driven E2E suites
 tests/suites/sandbox/  # E2E suites written on testkit
+tests/tmachine/        # QEMU test machines, Ansible playbooks, and the Session API
+tests/runner/          # openshell-test: runs test plans in environments
+tests/plans/           # Test plans: which suites run in which environments
+tests/environments/    # Environment definitions and the capabilities they provide
+tests/waivers.yaml     # Known bugs that skip a test in some environments
+tests/expected-matrix.json  # What the plans run where, checked in
 ```
 
 ## Rust Tests
@@ -164,6 +170,71 @@ dependencies the Nix toolchain doesn't support. `mise run rust:lockfiles:check`
 verifies this, and `uv run tasks/scripts/check_cargo_lockfile_alignment.py --fix`
 re-locks a workspace from the root lockfile. Add new testkit workspaces to
 `ALIGNED_WORKSPACES` in that script.
+
+### Test plans and the runner (`tests/runner/`)
+
+`openshell-test` runs testkit suites in provisioned environments. It is the
+runner and plan layer from NVIDIA/OpenShell#4629 by Evan Lezar, on top of the
+testkit and tmachine here. Tests say what they need, environments say what they
+provide, and a plan only selects which suites run where; nobody lists test and
+environment combinations by hand.
+
+- **Plans** (`tests/plans/*.yaml`) pair a family (a workspace under
+  `tests/suites/`, such as `sandbox`) and optionally some of its suites with
+  environment IDs. The `testkit` plan is what the `testkit-integration` job of
+  Branch E2E runs.
+- **Environments** (`tests/environments/*.yaml`) name the tmachine environment and
+  installer that provision them, the gateway name the installer registers, and
+  their capabilities: `compute_driver`, `rootless`, `gpu`,
+  `persistent_workspace` and `service_exposure`. The runner passes them to the
+  tests in `OPENSHELL_TEST_CAPABILITIES`, and points the tests at the registered
+  gateway and the installed CLI with `OPENSHELL_GATEWAY` and `OPENSHELL_BIN`.
+- **Capabilities** are optional on a test:
+  `#[testkit::test(requires = [persistent_workspace])]`. The runner leaves the
+  test out of environments without it. `id = "t-0123abcd"` is optional too and
+  gives a test an identity that survives renames. See
+  [tests/testkit/README.md](tests/testkit/README.md#capabilities).
+- **Waivers** (`tests/waivers.yaml`) skip a test in some environments because of
+  a known bug. Each names the test (by ID, or by function name when unique), an
+  issue link and a reason, and the runner lists what it skipped.
+- **Results** are checked, not trusted. A job passes only if nextest succeeds and
+  its JUnit report has a passing case for exactly the tests the runner selected.
+  A test missing from the report, skipped, or not selected fails the job.
+- **Strict mode** (`--strict`, or `OPENSHELL_TEST_STRICT=1`) is for CI. It fails
+  instead of skipping an environment the host can't provision, an environment
+  where no test is left to run, or a plan that selects nothing. Without it the
+  runner reports those and exits successfully, so a laptop can run the part of a
+  plan it can boot.
+
+```shell
+nix run .#test-runner -- test --plan tests/plans/testkit.yaml --dry-run
+nix run .#test-runner -- test --plan tests/plans/testkit.yaml --strict
+nix run .#test-runner -- matrix --host     # every test against every environment
+```
+
+`nix run .#test-runner` cross-builds the suites for the guest, boots each
+environment through tmachine (this needs KVM, or HVF on macOS), runs the suites
+over SSH, and writes JUnit reports, logs and gateway diagnostics to
+`artifacts/test-results/<plan>/`. Every SSH and nextest step has a timeout, and
+the runner kills its VMs if it receives SIGTERM. Two runs on one host need
+different `TMACHINE_SSH_PORT` values (default 2222).
+
+**The CI matrix comes from the plan.**
+`openshell-test test --plan tests/plans/<name>.yaml --emit-github-matrix` prints
+the `{"include": [...]}` a workflow reads with `fromJSON`: one job per
+environment with the runner label that can boot it and the number of tests it
+must run. `tests/expected-matrix.json` records that output, and the tests that
+run in each environment, for every plan. Dropping a capability, adding a test
+that needs one, adding a waiver or changing a plan changes the generated file, so
+the change shows up as a diff. Branch Checks and `mise run test:expected-matrix`
+fail until you review the change and regenerate the file:
+
+```shell
+mise run test:expected-matrix -- --write
+```
+
+The existing E2E job matrices in `.github/workflows/` are still written by hand;
+they switch to this matrix when the suites move onto the runner.
 
 ### Python E2E (`e2e/python/`)
 

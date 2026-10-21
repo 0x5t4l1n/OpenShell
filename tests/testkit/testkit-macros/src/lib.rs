@@ -13,17 +13,28 @@
 //! async fn expose_service(cx: &mut Context) -> testkit::Result { /* ... */ }
 //! ```
 //!
+//! Two arguments are optional:
+//!
+//! - `id = "t-0123abcd"` gives the test a stable identity that survives
+//!   renames and moves, for tools such as waivers and result history.
+//! - `requires = [service_exposure, gpu]` names the capabilities the
+//!   environment must provide. The test runner leaves the test out of
+//!   environments that lack them; a run that reaches the test anyway fails
+//!   instead of passing without testing the behavior.
+//!
 //! The attribute expands to a `#[tokio::test]` wrapper with the same name, so
 //! the nextest test name is the function name. The original function is nested
-//! in the wrapper and passed to `testkit::run`. Other attributes, such as
-//! `#[ignore]` or `#[cfg(...)]`, move to the wrapper. `#[should_panic]` is
-//! rejected: a testkit test panics on any failure, so it would pass for the
-//! wrong reason. Check the expected failure in the body instead.
+//! in the wrapper and passed to `testkit::run`. Parsing is done by
+//! `testkit-spec`, which the test runner's catalog also uses. Other
+//! attributes, such as `#[ignore]` or `#[cfg(...)]`, move to the wrapper.
+//! `#[should_panic]` is rejected: a testkit test panics on any failure, so it
+//! would pass for the wrong reason. Check the expected failure in the body
+//! instead.
 
 use proc_macro::TokenStream;
 use proc_macro2::TokenStream as TokenStream2;
 use quote::{format_ident, quote};
-use syn::{Attribute, Expr, ExprLit, ItemFn, Lit, LitStr, Meta};
+use syn::{Attribute, ItemFn, LitStr};
 
 #[proc_macro_attribute]
 pub fn test(attr: TokenStream, item: TokenStream) -> TokenStream {
@@ -34,24 +45,7 @@ pub fn test(attr: TokenStream, item: TokenStream) -> TokenStream {
 
 fn expand(attr: TokenStream2, item: TokenStream2) -> syn::Result<TokenStream2> {
     let mut body: ItemFn = syn::parse2(item)?;
-    if !attr.is_empty() {
-        return Err(syn::Error::new_spanned(
-            attr,
-            "`#[testkit::test]` takes no arguments",
-        ));
-    }
-    if body.sig.asyncness.is_none() {
-        return Err(syn::Error::new_spanned(
-            body.sig.fn_token,
-            "testkit tests must be `async fn`",
-        ));
-    }
-    if body.sig.inputs.len() != 1 {
-        return Err(syn::Error::new_spanned(
-            &body.sig.inputs,
-            "testkit tests take exactly one argument: `cx: &mut testkit::Context`",
-        ));
-    }
+    let spec = testkit_spec::parse(attr, &body)?;
     if let Some(attr) = body.attrs.iter().find(|attr| is_test_attr(attr)) {
         return Err(syn::Error::new_spanned(
             attr,
@@ -70,17 +64,21 @@ fn expand(attr: TokenStream2, item: TokenStream2) -> syn::Result<TokenStream2> {
              `CliOutput::failure` and `testkit::ensure!`",
         ));
     }
-    let description = doc_comment(&body.attrs);
-    if description.is_empty() {
-        return Err(syn::Error::new(
-            body.sig.ident.span(),
-            "testkit tests need a doc comment describing the behavior they verify",
-        ));
-    }
 
     let name = body.sig.ident.clone();
     let name_str = LitStr::new(&name.to_string(), name.span());
-    let description = LitStr::new(&description, name.span());
+    let description = LitStr::new(&spec.description, name.span());
+    let id = match &spec.id {
+        Some(id) => {
+            let id = LitStr::new(id, name.span());
+            quote! { ::core::option::Option::Some(#id) }
+        }
+        None => quote! { ::core::option::Option::None },
+    };
+    let requires = spec
+        .requires
+        .iter()
+        .map(|capability| format_ident!("{}", pascal_case(&capability.to_string())));
 
     let vis = body.vis.clone();
     let attrs = std::mem::take(&mut body.attrs);
@@ -95,7 +93,9 @@ fn expand(attr: TokenStream2, item: TokenStream2) -> syn::Result<TokenStream2> {
             ::testkit::run(
                 ::testkit::TestInfo {
                     name: #name_str,
+                    id: #id,
                     description: #description,
+                    requires: &[#(::testkit::Capability::#requires),*],
                 },
                 body,
             )
@@ -112,39 +112,59 @@ fn is_test_attr(attr: &Attribute) -> bool {
         .is_some_and(|segment| segment.ident == "test")
 }
 
-/// The doc comment, joined into one line. Empty if there is none.
-fn doc_comment(attrs: &[Attribute]) -> String {
-    attrs
-        .iter()
-        .filter_map(|attr| match &attr.meta {
-            Meta::NameValue(meta) if meta.path.is_ident("doc") => match &meta.value {
-                Expr::Lit(ExprLit {
-                    lit: Lit::Str(line),
-                    ..
-                }) => Some(line.value().trim().to_string()),
-                _ => None,
-            },
-            _ => None,
+/// `service_exposure` as `ServiceExposure`, the name of the `Capability`
+/// variant.
+fn pascal_case(snake: &str) -> String {
+    snake
+        .split('_')
+        .map(|word| {
+            let mut chars = word.chars();
+            chars
+                .next()
+                .map(|first| first.to_ascii_uppercase().to_string() + chars.as_str())
+                .unwrap_or_default()
         })
-        .filter(|line| !line.is_empty())
-        .collect::<Vec<_>>()
-        .join(" ")
+        .collect()
 }
 
 #[cfg(test)]
 mod tests {
-    use super::expand;
+    use super::{expand, pascal_case};
+
+    fn expand_str(attr: &str, item: &str) -> syn::Result<String> {
+        expand(attr.parse().unwrap(), item.parse().unwrap()).map(|tokens| tokens.to_string())
+    }
+
+    const ITEM: &str = "/// Doc.\nasync fn t(cx: &mut Context) -> testkit::Result { Ok(()) }";
+
+    #[test]
+    fn carries_id_and_requirements() {
+        let out = expand_str(
+            "id = \"t-0123abcd\", requires = [service_exposure, gpu]",
+            ITEM,
+        )
+        .unwrap();
+        assert!(out.contains("Some (\"t-0123abcd\")"), "{out}");
+        assert!(
+            out.contains(
+                "requires : & [:: testkit :: Capability :: ServiceExposure , :: testkit :: Capability :: Gpu]"
+            ),
+            "{out}"
+        );
+    }
 
     // A suite only compiles correct tests, so it never reaches these errors.
     #[test]
     fn rejects_misuse() {
         let ok_fn = "async fn t(cx: &mut Context) -> testkit::Result { Ok(()) }";
         for (attr, item, error) in [
+            ("id = \"nope\"", ITEM.to_string(), "test IDs are"),
             (
-                "id = \"t-1\"",
-                format!("/// Doc.\n{ok_fn}"),
-                "takes no arguments",
+                "requires = [teleport]",
+                ITEM.to_string(),
+                "unknown capability",
             ),
+            ("speed = fast", ITEM.to_string(), "unknown argument"),
             ("", ok_fn.to_string(), "doc comment"),
             (
                 "",
@@ -167,8 +187,14 @@ mod tests {
                 "`#[should_panic]`",
             ),
         ] {
-            let err = expand(attr.parse().unwrap(), item.parse().unwrap()).unwrap_err();
+            let err = expand_str(attr, &item).unwrap_err();
             assert!(err.to_string().contains(error), "{item}: {err}");
         }
+    }
+
+    #[test]
+    fn names_variants_in_pascal_case() {
+        assert_eq!(pascal_case("gpu"), "Gpu");
+        assert_eq!(pascal_case("persistent_workspace"), "PersistentWorkspace");
     }
 }

@@ -1990,6 +1990,7 @@ dependencies = [
  "openshell-core",
  "openshell-sdk",
  "openshell-testkit-macros",
+ "openshell-testkit-spec",
  "rand 0.9.4",
  "serde",
  "serde_json",
@@ -2001,8 +2002,17 @@ dependencies = [
 name = "openshell-testkit-macros"
 version = "0.0.0"
 dependencies = [
+ "openshell-testkit-spec",
  "proc-macro2",
  "quote",
+ "syn 2.0.117",
+]
+
+[[package]]
+name = "openshell-testkit-spec"
+version = "0.0.0"
+dependencies = [
+ "proc-macro2",
  "syn 2.0.117",
 ]
 

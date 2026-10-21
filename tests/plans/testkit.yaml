@@ -1,0 +1,31 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# The testkit suites under tests/suites, in the environments the conformance and
+# feature lanes of Branch E2E, Release Dev and release qualification run today.
+# `type` names a family under tests/suites/; omit `suites` to run every suite in
+# it, or list suite crate directories to run only those.
+matrix:
+  # Driver-neutral sandbox behavior: the `sandbox` tmachine testsuite.
+  - type: sandbox
+    suites: [lifecycle, cli, persistent-workspace, file-transfer, policy-advisor]
+    environments:
+      - tmachine.ubuntu2404-amd64.docker-rootful.deb
+      - tmachine.ubuntu2404-amd64.k3s.k3s
+      - tmachine.ubuntu2404-amd64.k3s.k3s-ha
+      - tmachine.fedora44-amd64.podman-rootful.rpm
+      - tmachine.fedora44-amd64.podman-rootless.rpm
+
+  # Image identity and working directory; Docker and Podman drivers only.
+  - type: sandbox
+    suites: [oci-image]
+    environments:
+      - tmachine.ubuntu2404-amd64.docker-rootful.deb
+      - tmachine.fedora44-amd64.podman-rootful.rpm
+      - tmachine.fedora44-amd64.podman-rootless.rpm
+
+  # Provider credential refresh against Keycloak.
+  - type: providers
+    environments:
+      - tmachine.fedora44-amd64.podman-rootful.rpm
+      - tmachine.fedora44-amd64.podman-rootless.rpm

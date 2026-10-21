@@ -4,6 +4,7 @@
 {
   pkgs,
   toolchains,
+  rustToolchain,
   qemuPkgs ? pkgs,
   firmwarePkgs ? pkgs,
 }:
@@ -242,9 +243,41 @@ let
       exec ${tmachine}/bin/tmachine --config ${config} "$@"
     '';
   };
+
+  # Runs test plans with tests/runner (`nix run .#test-runner -- test --plan
+  # tests/plans/testkit.yaml`). It cross-builds guest test bundles and drives
+  # tmachine sessions, so it needs the toolchains and the VM tools. The runner
+  # itself is built by cargo on first use. By Evan Lezar (NVIDIA/OpenShell#4629).
+  testRunner = pkgs.writeShellApplication {
+    name = "test-runner";
+    runtimeInputs = [
+      qemu
+      pkgs.ansible
+      pkgs.cargo-nextest
+      pkgs.coreutils
+      pkgs.git
+      pkgs.gnutar
+      pkgs.sshpass
+      rustToolchain
+    ];
+    runtimeEnv =
+      pkgs.lib.foldl' (env: toolchain: env // toolchain.env) { } (builtins.attrValues toolchains)
+      // {
+        TMACHINE_CONFIG = "${config}";
+      }
+      // pkgs.lib.optionalAttrs isAarch64 {
+        TMACHINE_FIRMWARE_CODE = firmwarePkgs.OVMF.firmware;
+        TMACHINE_FIRMWARE_VARS = firmwarePkgs.OVMF.variables;
+      };
+    text = ''
+      root=$(git rev-parse --show-toplevel)
+      export ANSIBLE_CONFIG="$root/tests/tmachine/ansible/ansible.cfg"
+      exec cargo run --locked --quiet --manifest-path "$root/tests/runner/Cargo.toml" --bin openshell-test -- "$@"
+    '';
+  };
 in
 {
   package = runner;
   unwrapped = tmachine;
-  inherit config;
+  inherit config testRunner;
 }

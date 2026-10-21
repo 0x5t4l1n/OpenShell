@@ -1,0 +1,142 @@
+{
+  "plans": {
+    "testkit": {
+      "github_matrix": {
+        "include": [
+          {
+            "plan": "testkit",
+            "environment": "tmachine.fedora44-amd64.podman-rootful.rpm",
+            "runner": "ubuntu-24.04",
+            "expected_tests": 21
+          },
+          {
+            "plan": "testkit",
+            "environment": "tmachine.fedora44-amd64.podman-rootless.rpm",
+            "runner": "ubuntu-24.04",
+            "expected_tests": 21
+          },
+          {
+            "plan": "testkit",
+            "environment": "tmachine.ubuntu2404-amd64.docker-rootful.deb",
+            "runner": "ubuntu-24.04",
+            "expected_tests": 20
+          },
+          {
+            "plan": "testkit",
+            "environment": "tmachine.ubuntu2404-amd64.k3s.k3s",
+            "runner": "ubuntu-24.04",
+            "expected_tests": 14
+          },
+          {
+            "plan": "testkit",
+            "environment": "tmachine.ubuntu2404-amd64.k3s.k3s-ha",
+            "runner": "ubuntu-24.04",
+            "expected_tests": 14
+          }
+        ]
+      },
+      "tests": {
+        "tmachine.fedora44-amd64.podman-rootful.rpm": [
+          "providers/refresh-keycloak/revoked_refresh_grant_requires_user_reauthorization",
+          "sandbox/cli/cli_create_exec_list_delete",
+          "sandbox/cli/cli_stop_start_delete",
+          "sandbox/file-transfer/download_stays_inside_workspace",
+          "sandbox/file-transfer/upload_download_round_trip",
+          "sandbox/file-transfer/upload_respects_gitignore",
+          "sandbox/lifecycle/default_command_sandbox_is_listed_ready",
+          "sandbox/lifecycle/long_running_exec_delete",
+          "sandbox/lifecycle/restart_stopped_sandbox",
+          "sandbox/lifecycle/run_to_completion_exit_delete",
+          "sandbox/lifecycle/stopped_sandbox_can_be_deleted",
+          "sandbox/oci-image/custom_workdir_with_named_user",
+          "sandbox/oci-image/custom_workdir_with_numeric_user_and_private_parents",
+          "sandbox/oci-image/default_workdir_uses_managed_workspace",
+          "sandbox/oci-image/policy_identity_overrides_root_image_user",
+          "sandbox/oci-image/unwritable_custom_workdir_is_rejected",
+          "sandbox/oci-image/userless_image_uses_default_identity",
+          "sandbox/persistent-workspace/persistent_workspace_survives_stop_start",
+          "sandbox/policy-advisor/denied_address_produces_draft_rule",
+          "sandbox/policy-advisor/denied_hostname_produces_draft_rule",
+          "sandbox/policy-advisor/policy_local_accepts_proposals"
+        ],
+        "tmachine.fedora44-amd64.podman-rootless.rpm": [
+          "providers/refresh-keycloak/revoked_refresh_grant_requires_user_reauthorization",
+          "sandbox/cli/cli_create_exec_list_delete",
+          "sandbox/cli/cli_stop_start_delete",
+          "sandbox/file-transfer/download_stays_inside_workspace",
+          "sandbox/file-transfer/upload_download_round_trip",
+          "sandbox/file-transfer/upload_respects_gitignore",
+          "sandbox/lifecycle/default_command_sandbox_is_listed_ready",
+          "sandbox/lifecycle/long_running_exec_delete",
+          "sandbox/lifecycle/restart_stopped_sandbox",
+          "sandbox/lifecycle/run_to_completion_exit_delete",
+          "sandbox/lifecycle/stopped_sandbox_can_be_deleted",
+          "sandbox/oci-image/custom_workdir_with_named_user",
+          "sandbox/oci-image/custom_workdir_with_numeric_user_and_private_parents",
+          "sandbox/oci-image/default_workdir_uses_managed_workspace",
+          "sandbox/oci-image/policy_identity_overrides_root_image_user",
+          "sandbox/oci-image/unwritable_custom_workdir_is_rejected",
+          "sandbox/oci-image/userless_image_uses_default_identity",
+          "sandbox/persistent-workspace/persistent_workspace_survives_stop_start",
+          "sandbox/policy-advisor/denied_address_produces_draft_rule",
+          "sandbox/policy-advisor/denied_hostname_produces_draft_rule",
+          "sandbox/policy-advisor/policy_local_accepts_proposals"
+        ],
+        "tmachine.ubuntu2404-amd64.docker-rootful.deb": [
+          "sandbox/cli/cli_create_exec_list_delete",
+          "sandbox/cli/cli_stop_start_delete",
+          "sandbox/file-transfer/download_stays_inside_workspace",
+          "sandbox/file-transfer/upload_download_round_trip",
+          "sandbox/file-transfer/upload_respects_gitignore",
+          "sandbox/lifecycle/default_command_sandbox_is_listed_ready",
+          "sandbox/lifecycle/long_running_exec_delete",
+          "sandbox/lifecycle/restart_stopped_sandbox",
+          "sandbox/lifecycle/run_to_completion_exit_delete",
+          "sandbox/lifecycle/stopped_sandbox_can_be_deleted",
+          "sandbox/oci-image/custom_workdir_with_named_user",
+          "sandbox/oci-image/custom_workdir_with_numeric_user_and_private_parents",
+          "sandbox/oci-image/default_workdir_uses_managed_workspace",
+          "sandbox/oci-image/policy_identity_overrides_root_image_user",
+          "sandbox/oci-image/unwritable_custom_workdir_is_rejected",
+          "sandbox/oci-image/userless_image_uses_default_identity",
+          "sandbox/persistent-workspace/persistent_workspace_survives_stop_start",
+          "sandbox/policy-advisor/denied_address_produces_draft_rule",
+          "sandbox/policy-advisor/denied_hostname_produces_draft_rule",
+          "sandbox/policy-advisor/policy_local_accepts_proposals"
+        ],
+        "tmachine.ubuntu2404-amd64.k3s.k3s": [
+          "sandbox/cli/cli_create_exec_list_delete",
+          "sandbox/cli/cli_stop_start_delete",
+          "sandbox/file-transfer/download_stays_inside_workspace",
+          "sandbox/file-transfer/upload_download_round_trip",
+          "sandbox/file-transfer/upload_respects_gitignore",
+          "sandbox/lifecycle/default_command_sandbox_is_listed_ready",
+          "sandbox/lifecycle/long_running_exec_delete",
+          "sandbox/lifecycle/restart_stopped_sandbox",
+          "sandbox/lifecycle/run_to_completion_exit_delete",
+          "sandbox/lifecycle/stopped_sandbox_can_be_deleted",
+          "sandbox/persistent-workspace/persistent_workspace_survives_stop_start",
+          "sandbox/policy-advisor/denied_address_produces_draft_rule",
+          "sandbox/policy-advisor/denied_hostname_produces_draft_rule",
+          "sandbox/policy-advisor/policy_local_accepts_proposals"
+        ],
+        "tmachine.ubuntu2404-amd64.k3s.k3s-ha": [
+          "sandbox/cli/cli_create_exec_list_delete",
+          "sandbox/cli/cli_stop_start_delete",
+          "sandbox/file-transfer/download_stays_inside_workspace",
+          "sandbox/file-transfer/upload_download_round_trip",
+          "sandbox/file-transfer/upload_respects_gitignore",
+          "sandbox/lifecycle/default_command_sandbox_is_listed_ready",
+          "sandbox/lifecycle/long_running_exec_delete",
+          "sandbox/lifecycle/restart_stopped_sandbox",
+          "sandbox/lifecycle/run_to_completion_exit_delete",
+          "sandbox/lifecycle/stopped_sandbox_can_be_deleted",
+          "sandbox/persistent-workspace/persistent_workspace_survives_stop_start",
+          "sandbox/policy-advisor/denied_address_produces_draft_rule",
+          "sandbox/policy-advisor/denied_hostname_produces_draft_rule",
+          "sandbox/policy-advisor/policy_local_accepts_proposals"
+        ]
+      }
+    }
+  }
+}
