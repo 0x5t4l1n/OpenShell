@@ -505,7 +505,7 @@ fn validate_manifest_http_session_capability(
 
 /// v1 HTTP hooks and WebSocket bindings carry payloads. An HTTP session hook
 /// binding that advertises no payload limit is offered no body modes, so it
-/// can only continue or reject at preflight.
+/// can only continue or deny at preflight.
 fn binding_requires_payload_limit(
     manifest: &MiddlewareManifest,
     binding: &MiddlewareBinding,

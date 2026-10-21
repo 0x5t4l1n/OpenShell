@@ -7,7 +7,7 @@
 //! The guard selects its configured body mode, BUFFERED by default, and falls
 //! back to the other mode when OpenShell offers only that one. A message
 //! without a body continues. A message the guard cannot inspect, such as an
-//! encoded body, is rejected with reason code `cannot_inspect`.
+//! encoded body, is denied with reason code `cannot_inspect`.
 //!
 //! OpenShell leaves integrity headers such as `ETag` and `Content-Digest`
 //! alone. When the guard may change a body, it removes them itself.
@@ -18,8 +18,8 @@ use openshell_core::middleware::{HttpRequestSessionResultStream, HttpResponseSes
 use openshell_core::proto::{
     HeaderMutation, HttpBodyLimits, HttpBodyMode, HttpBodyModeUnavailable,
     HttpBodyUnavailableReason, HttpBufferedBody, HttpBufferedMode, HttpBufferedResult,
-    HttpContinue, HttpFinish, HttpInputChunk, HttpInspect, HttpOutputChunk, HttpOutputStart,
-    HttpPreflightResult, HttpReject, HttpRequestPreflightHead, HttpRequestSessionEvent,
+    HttpContinue, HttpDenial, HttpFinish, HttpInputChunk, HttpInspect, HttpOutputChunk,
+    HttpOutputStart, HttpPreflightResult, HttpRequestPreflightHead, HttpRequestSessionEvent,
     HttpRequestSessionResult, HttpResponseSessionEvent, HttpResponseSessionResult, HttpStreamMode,
     HttpUnchanged, MiddlewareDiagnostics, RemoveHeader, header_mutation, http_buffered_result,
     http_inspect, http_preflight_result, http_request_session_event, http_request_session_result,
@@ -174,7 +174,7 @@ enum Reply {
     OutputStart(HttpOutputStart),
     OutputChunk(HttpOutputChunk),
     Finish(HttpFinish),
-    Reject(HttpReject),
+    Deny(HttpDenial),
 }
 
 impl From<Reply> for http_request_session_result::Result {
@@ -185,7 +185,7 @@ impl From<Reply> for http_request_session_result::Result {
             Reply::OutputStart(start) => Self::OutputStart(start),
             Reply::OutputChunk(chunk) => Self::OutputChunk(chunk),
             Reply::Finish(finish) => Self::Finish(finish),
-            Reply::Reject(reject) => Self::Reject(reject),
+            Reply::Deny(deny) => Self::Deny(deny),
         }
     }
 }
@@ -198,7 +198,7 @@ impl From<Reply> for http_response_session_result::Result {
             Reply::OutputStart(start) => Self::OutputStart(start),
             Reply::OutputChunk(chunk) => Self::OutputChunk(chunk),
             Reply::Finish(finish) => Self::Finish(finish),
-            Reply::Reject(reject) => Self::BlockDelivery(reject),
+            Reply::Deny(deny) => Self::BlockDelivery(deny),
         }
     }
 }
@@ -224,7 +224,7 @@ impl Stage {
                         )),
                         ..Default::default()
                     })]),
-                    Decision::Reject(diagnostics) => Ok(vec![Reply::Reject(HttpReject {
+                    Decision::Deny(diagnostics) => Ok(vec![Reply::Deny(HttpDenial {
                         diagnostics: Some(diagnostics),
                     })]),
                     Decision::Inspect(config, selected) => {
@@ -272,7 +272,7 @@ impl Stage {
                         *self = Self::Stream(config, scanner, max_chunk_bytes);
                         Ok(output_chunks(&output, max_chunk_bytes))
                     }
-                    Err(_) => Ok(vec![reject(&config, &scanner)]),
+                    Err(_) => Ok(vec![deny(&config, &scanner)]),
                 }
             }
             (Self::Stream(config, mut scanner, max_chunk_bytes), Event::InputEnd) => {
@@ -289,7 +289,7 @@ impl Stage {
                         }));
                         Ok(replies)
                     }
-                    Err(_) => Ok(vec![reject(&config, &scanner)]),
+                    Err(_) => Ok(vec![deny(&config, &scanner)]),
                 }
             }
             _ => Err(Status::invalid_argument(
@@ -308,7 +308,7 @@ enum Selected {
 
 enum Decision {
     Continue,
-    Reject(MiddlewareDiagnostics),
+    Deny(MiddlewareDiagnostics),
     Inspect(GuardConfig, Selected),
 }
 
@@ -316,7 +316,7 @@ fn preflight_decision(preflight: Preflight) -> Result<Decision, Status> {
     let config = GuardConfig::parse(preflight.config.as_ref()).map_err(Status::invalid_argument)?;
     match &preflight.subject {
         // The request target cannot be redacted, so a configured term in the
-        // path or query rejects the request before its body is read or the
+        // path or query denies the request before its body is read or the
         // upstream is contacted.
         Subject::Request(head) => {
             let target = head.target.clone().unwrap_or_default();
@@ -330,7 +330,7 @@ fn preflight_decision(preflight: Preflight) -> Result<Decision, Status> {
                 let mut diagnostics = diagnostics(outcome(&config, finding.count, 1));
                 diagnostics.reason = "request target matched configured content".into();
                 diagnostics.reason_code = "content_match".into();
-                return Ok(Decision::Reject(diagnostics));
+                return Ok(Decision::Deny(diagnostics));
             }
         }
         Subject::Response => {}
@@ -367,7 +367,7 @@ fn preflight_decision(preflight: Preflight) -> Result<Decision, Status> {
         // A message without a body has nothing to guard. The guard never
         // passes a body it could not inspect.
         None if bodyless(&preflight) => Ok(Decision::Continue),
-        None => Ok(Decision::Reject(MiddlewareDiagnostics {
+        None => Ok(Decision::Deny(MiddlewareDiagnostics {
             reason: "content guard cannot inspect this body".into(),
             reason_code: "cannot_inspect".into(),
             ..Default::default()
@@ -393,7 +393,7 @@ fn diagnostics(outcome: GuardOutcome) -> MiddlewareDiagnostics {
 
 fn buffered_result(outcome: GuardOutcome) -> Reply {
     if outcome.denied {
-        return Reply::Reject(HttpReject {
+        return Reply::Deny(HttpDenial {
             diagnostics: Some(diagnostics(outcome)),
         });
     }
@@ -453,9 +453,9 @@ fn output_chunks(data: &[u8], max_chunk_bytes: usize) -> Vec<Reply> {
         .collect()
 }
 
-fn reject(config: &GuardConfig, scanner: &StreamScanner) -> Reply {
+fn deny(config: &GuardConfig, scanner: &StreamScanner) -> Reply {
     let (match_count, matched_term_count) = scanner.counts();
-    Reply::Reject(HttpReject {
+    Reply::Deny(HttpDenial {
         diagnostics: Some(diagnostics(outcome(
             config,
             match_count.max(1),
@@ -542,8 +542,8 @@ mod tests {
                 assert!(stage.handle(Event::Begin).unwrap().is_empty());
                 let body = only(stage.handle(buffered_body(input.as_bytes())).unwrap());
                 match (mode, expected, body) {
-                    ("deny", _, Reply::Reject(reject)) => {
-                        let diagnostics = reject.diagnostics.unwrap();
+                    ("deny", _, Reply::Deny(deny)) => {
+                        let diagnostics = deny.diagnostics.unwrap();
                         assert_eq!(diagnostics.reason_code, "content_match");
                         assert!(!diagnostics.reason.contains("prototype-secret"));
                     }
@@ -684,7 +684,7 @@ mod tests {
     }
 
     #[test]
-    fn preflight_rejects_a_body_it_is_not_offered() {
+    fn preflight_denies_a_body_it_is_not_offered() {
         // OpenShell offers no body mode for an encoded request or response.
         for subject in [request, || Subject::Response] {
             let mut encoded = preflight(subject(), "redact", &[], &[]);
@@ -698,15 +698,15 @@ mod tests {
                     reason: HttpBodyUnavailableReason::Encoded as i32,
                 })
                 .collect();
-            let Reply::Reject(reject) = only(Stage::Preflight.handle(encoded).unwrap()) else {
-                panic!("reject")
+            let Reply::Deny(deny) = only(Stage::Preflight.handle(encoded).unwrap()) else {
+                panic!("deny")
             };
-            assert_eq!(reject.diagnostics.unwrap().reason_code, "cannot_inspect");
+            assert_eq!(deny.diagnostics.unwrap().reason_code, "cannot_inspect");
         }
     }
 
     #[test]
-    fn preflight_rejects_a_term_in_the_request_target() {
+    fn preflight_denies_a_term_in_the_request_target() {
         for (path, query) in [
             ("/items/prototype-secret", ""),
             ("/items", "q=prototype-secret"),
@@ -719,15 +719,15 @@ mod tests {
                 }),
                 headers: Vec::new(),
             });
-            let rejected = only(
+            let denied = only(
                 Stage::Preflight
                     .handle(preflight(subject, "redact", &[], &[HttpBodyMode::Buffered]))
                     .unwrap(),
             );
-            let Reply::Reject(reject) = rejected else {
-                panic!("expected a rejection for {path}?{query}")
+            let Reply::Deny(deny) = denied else {
+                panic!("expected a denial for {path}?{query}")
             };
-            let diagnostics = reject.diagnostics.unwrap();
+            let diagnostics = deny.diagnostics.unwrap();
             assert_eq!(diagnostics.reason_code, "content_match");
             assert!(!diagnostics.reason.contains("prototype-secret"));
         }

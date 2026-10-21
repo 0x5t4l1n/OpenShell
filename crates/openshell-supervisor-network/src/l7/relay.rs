@@ -11714,10 +11714,10 @@ network_policies:
             tonic::Status,
         > {
             use openshell_core::proto::{
-                HttpFinish, HttpInspect, HttpOutputChunk, HttpOutputStart, HttpPreflightResult,
-                HttpReject, HttpRequestSessionResult, HttpStreamMode, MiddlewareDiagnostics,
-                http_inspect, http_preflight_result, http_request_session_event,
-                http_request_session_result,
+                HttpDenial, HttpFinish, HttpInspect, HttpOutputChunk, HttpOutputStart,
+                HttpPreflightResult, HttpRequestSessionResult, HttpStreamMode,
+                MiddlewareDiagnostics, http_inspect, http_preflight_result,
+                http_request_session_event, http_request_session_result,
             };
             let (drop_body, reject) = (self.drop_body, self.reject);
             let (sender, receiver) = tokio::sync::mpsc::channel(4);
@@ -11759,7 +11759,7 @@ network_policies:
                             })
                         }
                         Some(http_request_session_event::Event::InputEnd(_)) if reject => {
-                            http_request_session_result::Result::Reject(HttpReject {
+                            http_request_session_result::Result::Deny(HttpDenial {
                                 diagnostics: Some(MiddlewareDiagnostics {
                                     reason_code: "late_match".into(),
                                     ..Default::default()

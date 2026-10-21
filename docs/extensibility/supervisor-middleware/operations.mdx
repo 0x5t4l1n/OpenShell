@@ -55,7 +55,7 @@ Your service receives the request target, headers, and context before OpenShell 
 
 - `continue_without_body` to allow the request without inspecting its body, with optional header changes.
 - `inspect` to choose a [body mode](#body-inspection).
-- `reject` to deny the request, with an optional reason code. Use it, with a reason code that says so, when your service cannot inspect the message.
+- `deny` to deny the request, with an optional reason code. Use it, with a reason code that says so, when your service cannot inspect the message.
 
 OpenShell applies middleware changes before it injects provider credentials. Middleware never sees those credentials. If middleware replaces a body, OpenShell checks it against body-aware policy, such as GraphQL, JSON-RPC, or MCP rules, before forwarding it.
 
@@ -82,7 +82,7 @@ The preflight lists `permitted_body_modes`, unavailable modes with their reasons
 
 A STREAM stage must send `output_start` even for empty output. Set its `output_body_bytes` when you know the exact output length. OpenShell uses `Content-Length` when the output declares a length and chunked framing otherwise. It flushes each server-sent event chunk.
 
-Your service can deny a request with `reject` or stop a response with `block_delivery` throughout inspection. After a terminal result, close your result stream or wait for the best-effort `session_end` notification. An unset, unknown, or out-of-order result fails closed.
+Your service can deny a request with `deny` or stop a response with `block_delivery` throughout inspection. After a terminal result, close your result stream or wait for the best-effort `session_end` notification. An unset, unknown, or out-of-order result fails closed.
 
 Until all stages finish, OpenShell withholds the final byte or terminating chunk that would complete the message. This prevents a late denial from leaving the recipient with a response or request that appears complete.
 
@@ -122,7 +122,7 @@ HTTP session hooks always fail closed. The gateway rejects `on_error: fail_open`
 
 | Result | Before forwarding starts | After forwarding starts |
 | --- | --- | --- |
-| Request `reject` | `403 Forbidden`, `error: middleware_denied` | Close the upstream connection before the request completes. |
+| Request `deny` | `403 Forbidden`, `error: middleware_denied` | Close the upstream connection before the request completes. |
 | Request failure | `403 Forbidden`, `error: middleware_failed` | Close the upstream connection before the request completes. |
 | Response `block_delivery` | `403 Forbidden`, `error: middleware_denied` | Abort response delivery without an error body. |
 | Response failure | `502 Bad Gateway`, `error: response_delivery_failed` | Abort response delivery without an error body. |

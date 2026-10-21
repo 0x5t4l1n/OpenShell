@@ -11,8 +11,8 @@ use openshell_core::extension_protocol::{
 };
 use openshell_core::proto::{
     ExistingHeaderAction, HeaderMutation, HttpBodyMode, HttpBufferedMode, HttpBufferedResult,
-    HttpContinue, HttpFinish, HttpHeader, HttpInspect, HttpOutputChunk, HttpOutputStart,
-    HttpPreflightResult, HttpReject, HttpRequestResult, HttpRequestSessionEvent,
+    HttpContinue, HttpDenial, HttpFinish, HttpHeader, HttpInspect, HttpOutputChunk,
+    HttpOutputStart, HttpPreflightResult, HttpRequestResult, HttpRequestSessionEvent,
     HttpRequestSessionPreflight, HttpRequestSessionResult, HttpRequestTarget, HttpStreamMode,
     MiddlewareBinding, MiddlewareDiagnostics, MiddlewareManifest, RequestContext,
     SupervisorMiddlewareOperation, SupervisorMiddlewarePhase, WriteHeader, header_mutation,
@@ -141,7 +141,7 @@ fn registration_requires_the_http_session_capability_it_supports() {
 enum Preflight {
     Continue,
     Inspect(HttpBodyMode),
-    Reject(&'static str),
+    Deny(&'static str),
     Fail(tonic::Code),
 }
 
@@ -286,8 +286,8 @@ impl InProcessMiddleware for ScriptedStage {
                                     },
                                 ))
                             }
-                            Preflight::Reject(code) => {
-                                result(http_request_session_result::Result::Reject(HttpReject {
+                            Preflight::Deny(code) => {
+                                result(http_request_session_result::Result::Deny(HttpDenial {
                                     diagnostics: Some(MiddlewareDiagnostics {
                                         reason_code: (*code).to_string(),
                                         ..Default::default()
@@ -532,9 +532,9 @@ async fn request_stages_follow_the_protocol_2_state_machine() {
             },
         },
         Case {
-            name: "preflight reject denies before the body",
+            name: "preflight denial stops before the body",
             stages: vec![
-                stage("example/a", Preflight::Reject("blocked_term"), Body::Unchanged),
+                stage("example/a", Preflight::Deny("blocked_term"), Body::Unchanged),
                 stage("example/b", Preflight::Continue, Body::Unchanged),
             ],
             expected: Run {
@@ -543,7 +543,7 @@ async fn request_stages_follow_the_protocol_2_state_machine() {
                 preflight_mutations: Vec::new(),
                 late_mutations: Vec::new(),
                 body: b"hello world".to_vec(),
-                outcomes: vec![Outcome::Reject],
+                outcomes: vec![Outcome::Deny],
             },
         },
         Case {
@@ -976,16 +976,16 @@ async fn failures_name_the_failed_stage_and_a_platform_code() {
 
     let (runner, described) = scripted_chain(vec![scripted(
         "example/a",
-        Preflight::Reject("blocked_term"),
+        Preflight::Deny("blocked_term"),
         Body::Unchanged,
     )])
     .await;
-    let rejected = runner
+    let denied = runner
         .preflight_described_http_request(described, request_input(b"hello"))
         .await
         .expect("preflight");
-    assert!(rejected.denial.is_some());
-    assert!(rejected.failure.is_none());
+    assert!(denied.denial.is_some());
+    assert!(denied.failure.is_none());
 }
 
 #[tokio::test]

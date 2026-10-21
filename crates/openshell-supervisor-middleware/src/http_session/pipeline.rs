@@ -33,13 +33,13 @@ use tokio::time::Instant;
 
 use openshell_core::proto::{
     Decision, HeaderMutation, HttpBegin, HttpBodyLimits, HttpBodyMode, HttpBodyModeUnavailable,
-    HttpBodyUnavailableReason, HttpBufferedBody, HttpBufferedResult, HttpFinish, HttpHeader,
-    HttpInputChunk, HttpInputEnd, HttpOutputChunk, HttpOutputStart, HttpPreflightResult,
-    HttpReject, HttpRequestPreflightHead, HttpRequestSessionEvent, HttpRequestSessionPreflight,
-    HttpResponsePreflightHead, HttpResponseSessionEvent, HttpResponseSessionPreflight,
-    MiddlewareDiagnostics, MiddlewareSessionEnd, MiddlewareSessionEndReason, RequestContext,
-    SupervisorMiddlewarePhase, http_buffered_result, http_inspect, http_preflight_result,
-    http_request_session_event, http_response_session_event,
+    HttpBodyUnavailableReason, HttpBufferedBody, HttpBufferedResult, HttpDenial, HttpFinish,
+    HttpHeader, HttpInputChunk, HttpInputEnd, HttpOutputChunk, HttpOutputStart,
+    HttpPreflightResult, HttpRequestPreflightHead, HttpRequestSessionEvent,
+    HttpRequestSessionPreflight, HttpResponsePreflightHead, HttpResponseSessionEvent,
+    HttpResponseSessionPreflight, MiddlewareDiagnostics, MiddlewareSessionEnd,
+    MiddlewareSessionEndReason, RequestContext, SupervisorMiddlewarePhase, http_buffered_result,
+    http_inspect, http_preflight_result, http_request_session_event, http_response_session_event,
 };
 
 use crate::headers::{self, HeaderAuthority};
@@ -175,8 +175,8 @@ pub enum HttpBodyOutput {
 pub enum HttpStageOutcome {
     /// Preflight continued without the body.
     Continue,
-    /// The stage rejected the exchange.
-    Reject,
+    /// The stage denied the exchange.
+    Deny,
     /// Preflight selected BUFFERED.
     Buffered,
     /// Preflight selected STREAM.
@@ -227,7 +227,7 @@ impl HttpStageDiagnostics {
         self.invocations.extend(other.invocations);
     }
 
-    /// One invocation record per stage, in chain order: a stage that rejected
+    /// One invocation record per stage, in chain order: a stage that denied
     /// or failed closed in any phase denied, and a stage that failed in any
     /// phase is failed. A stage after the last stage that recorded an
     /// outcome, which only selected a body mode, made no decision before the
@@ -239,7 +239,7 @@ impl HttpStageDiagnostics {
         for invocation in &self.invocations {
             let denied = matches!(
                 invocation.outcome,
-                HttpStageOutcome::Reject | HttpStageOutcome::FailClosed
+                HttpStageOutcome::Deny | HttpStageOutcome::FailClosed
             );
             let decided = !matches!(
                 invocation.outcome,
@@ -284,14 +284,14 @@ impl HttpStageDiagnostics {
     }
 }
 
-/// The exchange failed closed or was rejected.
+/// The exchange failed closed or was denied.
 #[derive(Debug)]
 pub struct HttpMiddlewareFailure {
     /// Platform-owned reason: `middleware_denied:<config>[:<code>]` for a
-    /// rejection, `middleware_failed: <reason>` for a failure, and
+    /// denial, `middleware_failed: <reason>` for a failure, and
     /// `middleware_cancelled: <reason>` when the input producer went away.
     pub reason: String,
-    /// Present only when a stage rejected the exchange.
+    /// Present only when a stage denied the exchange.
     pub denial: Option<MiddlewareDenial>,
     /// Present when the exchange failed closed for a reason the sandbox may
     /// see.
@@ -456,7 +456,7 @@ pub(super) enum StageResult {
     OutputStart(HttpOutputStart),
     OutputChunk(HttpOutputChunk),
     Finish(HttpFinish),
-    Reject(HttpReject),
+    Deny(HttpDenial),
 }
 
 /// Results of one stage exchange. `None` is an unset or unknown result.
@@ -488,7 +488,7 @@ macro_rules! session_messages {
                     Wire::OutputStart(start) => Self::OutputStart(start),
                     Wire::OutputChunk(chunk) => Self::OutputChunk(chunk),
                     Wire::Finish(finish) => Self::Finish(finish),
-                    Wire::$denial(reject) => Self::Reject(reject),
+                    Wire::$denial(deny) => Self::Deny(deny),
                 }
             }
         }
@@ -498,7 +498,7 @@ macro_rules! session_messages {
 session_messages!(
     http_request_session_event,
     http_request_session_result,
-    Reject
+    Deny
 );
 session_messages!(
     http_response_session_event,
@@ -890,8 +890,8 @@ pub async fn preflight(
                     mode,
                 });
             }
-            StageResult::Reject(reject) => {
-                let failure = rejection(entry, reject.diagnostics.as_ref());
+            StageResult::Deny(deny) => {
+                let failure = denial(entry, deny.diagnostics.as_ref());
                 stream.end(failure.end_reason).await;
                 return state.fail(failure).await;
             }
@@ -1679,13 +1679,11 @@ async fn send_until(
     Err(closed_stream_failure(entry, next))
 }
 
-/// The stage stopped reading events. A rejection or RPC status it ended with
+/// The stage stopped reading events. A denial or RPC status it ended with
 /// explains why better than the closed stream does.
 fn closed_stream_failure(entry: &DescribedChainEntry, next: FirstResult) -> HttpMiddlewareFailure {
     match next {
-        Some(Ok(Some(StageResult::Reject(reject)))) => {
-            rejection(entry, reject.diagnostics.as_ref())
-        }
+        Some(Ok(Some(StageResult::Deny(deny)))) => denial(entry, deny.diagnostics.as_ref()),
         Some(Err(status)) => status_failure(entry, &status),
         _ => entry_failure(entry, "middleware_stream_closed"),
     }
@@ -1782,8 +1780,8 @@ async fn drive_buffered(
         .map_err(|_| entry_failure(entry, timeout_reason))??;
     let result = match classify_result(entry, next)? {
         StageResult::BufferedResult(result) => result,
-        StageResult::Reject(reject) => {
-            return Err(rejection(entry, reject.diagnostics.as_ref()).into());
+        StageResult::Deny(deny) => {
+            return Err(denial(entry, deny.diagnostics.as_ref()).into());
         }
         _ => return Err(entry_failure(entry, "buffered_result_expected").into()),
     };
@@ -2048,8 +2046,8 @@ async fn drive_stream(
                     send_frame(output, Frame::End(trailers)).await?;
                     return Ok::<_, StageError>((diagnostics, output_bytes));
                 }
-                StageResult::Reject(reject) => {
-                    return Err(rejection(entry, reject.diagnostics.as_ref()).into());
+                StageResult::Deny(deny) => {
+                    return Err(denial(entry, deny.diagnostics.as_ref()).into());
                 }
                 _ => return Err(entry_failure(entry, "stream_result_order_invalid").into()),
             }
@@ -2062,7 +2060,7 @@ async fn drive_stream(
     let (input_bytes, (diagnostics, output_bytes)) = tokio::select! {
         input = &mut input_pump => match input {
             Ok(input_bytes) => (input_bytes, output_pump.await?),
-            // A stage that rejects or fails stops reading input; its result
+            // A stage that denies or fails stops reading input; its result
             // stream carries the reason.
             Err(InputStop::Closed) => {
                 return Err(output_pump.await.err().unwrap_or_else(closed));
@@ -2233,7 +2231,7 @@ fn collect_diagnostics(
     }
 }
 
-pub(super) fn rejection(
+pub(super) fn denial(
     entry: &DescribedChainEntry,
     diagnostics: Option<&MiddlewareDiagnostics>,
 ) -> HttpMiddlewareFailure {
@@ -2250,7 +2248,7 @@ pub(super) fn rejection(
     collect_diagnostics(entry, diagnostics, &mut retained);
     retained
         .invocations
-        .push(invocation(entry, HttpStageOutcome::Reject, reason_code));
+        .push(invocation(entry, HttpStageOutcome::Deny, reason_code));
     HttpMiddlewareFailure {
         reason: middleware_denial_reason(&denial.config_name, denial.reason_code.as_deref()),
         denial: Some(denial),

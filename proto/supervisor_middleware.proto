@@ -187,14 +187,14 @@ message HttpResponseSessionEvent {
 }
 
 // HTTP session hooks. One ordered result in a HttpSessionMiddleware.EvaluateRequest
-// stream. Preflight requires preflight_result or reject. BUFFERED ends with
-// buffered_result or reject. STREAM sends output_start before any
-// output_chunk, even for an empty output, and ends with finish or reject. An
+// stream. Preflight requires preflight_result or deny. BUFFERED ends with
+// buffered_result or deny. STREAM sends output_start before any
+// output_chunk, even for an empty output, and ends with finish or deny. An
 // unset or unknown result fails the exchange closed.
 //
 // A service may close its result stream right after the result that ends its
 // part in the exchange (continue_without_body, buffered_result, finish, or
-// reject), or keep it open until session_end. OpenShell accepts both.
+// deny), or keep it open until session_end. OpenShell accepts both.
 message HttpRequestSessionResult {
   oneof result {
     HttpPreflightResult preflight_result = 1;
@@ -202,13 +202,13 @@ message HttpRequestSessionResult {
     HttpOutputStart output_start = 3;
     HttpOutputChunk output_chunk = 4;
     HttpFinish finish = 5;
-    HttpReject reject = 6;
+    HttpDenial deny = 6;
   }
 }
 
 // HTTP session hooks. One ordered result in a HttpSessionMiddleware.EvaluateResponse
 // stream, under the rules HttpRequestSessionResult describes, with
-// block_delivery instead of reject. Blocking delivery does not undo the
+// block_delivery instead of deny. Blocking delivery does not undo the
 // request already handled by the external service.
 message HttpResponseSessionResult {
   oneof result {
@@ -217,7 +217,7 @@ message HttpResponseSessionResult {
     HttpOutputStart output_start = 3;
     HttpOutputChunk output_chunk = 4;
     HttpFinish finish = 5;
-    HttpReject block_delivery = 6;
+    HttpDenial block_delivery = 6;
   }
 }
 
@@ -326,8 +326,8 @@ message HttpRequestSessionPreflight {
   // Validated service configuration. Limited to 64 KiB encoded.
   google.protobuf.Struct config = 6;
   // Body modes this request is eligible for. Empty permits only
-  // continue_without_body or reject. When no permitted mode suits the stage,
-  // it continues or rejects, with a reason_code saying why.
+  // continue_without_body or deny. When no permitted mode suits the stage,
+  // it continues or denies, with a reason_code saying why.
   repeated HttpBodyMode permitted_body_modes = 7;
   // One entry for each body mode that permitted_body_modes omits, with the
   // rule that removed it. Empty when the binding's max_payload_bytes is 0,
@@ -409,7 +409,7 @@ message HttpBodyLimits {
   google.protobuf.Duration idle_timeout = 3;
 }
 
-// Preflight decision. To deny, return reject (requests) or block_delivery
+// Preflight decision. To deny, return deny (requests) or block_delivery
 // (responses) instead, including when the stage cannot inspect the message.
 message HttpPreflightResult {
   oneof decision {
@@ -526,7 +526,7 @@ message HttpFinish {
 // or final byte, trailers, and any error body, and closes that connection.
 // A stage that cannot inspect an HTTP message, such as a body in a format it
 // does not understand, denies it with a reason_code that says so.
-message HttpReject {
+message HttpDenial {
   MiddlewareDiagnostics diagnostics = 1;
 }
 

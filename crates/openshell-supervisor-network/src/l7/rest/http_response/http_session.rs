@@ -737,7 +737,7 @@ fn http_response_stage_events(
             status_code,
             invocation,
         ));
-        if invocation.outcome == HttpStageOutcome::Reject {
+        if invocation.outcome == HttpStageOutcome::Deny {
             events.push(
                 openshell_ocsf::DetectionFindingBuilder::new(ocsf_ctx())
                     .severity(openshell_ocsf::SeverityId::Medium)
@@ -780,7 +780,7 @@ fn http_response_stage_event(
     invocation: &HttpStageInvocation,
 ) -> openshell_ocsf::OcsfEvent {
     let outcome = format!("{:?}", invocation.outcome).to_ascii_lowercase();
-    let blocked = invocation.outcome == HttpStageOutcome::Reject;
+    let blocked = invocation.outcome == HttpStageOutcome::Deny;
     let failed = invocation.failed;
     let reason = invocation.failure_reason.as_deref().unwrap_or("-");
     let port = u16::try_from(target.port).unwrap_or_default();

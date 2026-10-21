@@ -7344,8 +7344,8 @@ mod tests {
             tonic::Status,
         > {
             use openshell_core::proto::{
-                HttpFinish, HttpInspect, HttpOutputChunk, HttpOutputStart, HttpPreflightResult,
-                HttpReject, HttpStreamMode, MiddlewareDiagnostics, http_inspect,
+                HttpDenial, HttpFinish, HttpInspect, HttpOutputChunk, HttpOutputStart,
+                HttpPreflightResult, HttpStreamMode, MiddlewareDiagnostics, http_inspect,
                 http_preflight_result, http_response_session_event, http_response_session_result,
             };
             let (declared, reject, gate) = (self.declared, self.reject, self.gate.clone());
@@ -7420,7 +7420,7 @@ mod tests {
                         Some(http_response_session_event::Event::InputEnd(_)) if reject => {
                             emit_session_result(
                                 &sender,
-                                http_response_session_result::Result::BlockDelivery(HttpReject {
+                                http_response_session_result::Result::BlockDelivery(HttpDenial {
                                     diagnostics: Some(MiddlewareDiagnostics {
                                         reason_code: "late_match".into(),
                                         ..Default::default()
