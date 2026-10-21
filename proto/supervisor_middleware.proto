@@ -571,7 +571,13 @@ message HttpRequestEvaluation {
   string middleware_name = 7;
 }
 
-// HttpHeader is one HTTP header line.
+// HttpHeader is one HTTP header or trailer field.
+//
+// Values are valid UTF-8. OpenShell rejects a request whose head is not valid
+// UTF-8 before any middleware runs. When a response head is not valid UTF-8,
+// an HTTP session hook response chain fails closed with failure_code
+// middleware_cannot_inspect, and v1 response hooks follow on_error. HTTP
+// session hooks also fail a message whose trailers are not valid UTF-8.
 message HttpHeader {
   // Lowercased header name.
   string name = 1;
