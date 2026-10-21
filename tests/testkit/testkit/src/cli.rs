@@ -81,6 +81,21 @@ impl Cli {
         I: IntoIterator<Item = S>,
         S: AsRef<OsStr>,
     {
+        self.run_with(dir, &[], args).await
+    }
+
+    /// Like [`Cli::run_in`], with extra environment variables for the command,
+    /// such as a secret the CLI reads from the environment.
+    pub async fn run_with<I, S>(
+        &self,
+        dir: Option<&Path>,
+        env: &[(&str, &str)],
+        args: I,
+    ) -> Result<CliOutput>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<OsStr>,
+    {
         let args: Vec<_> = args
             .into_iter()
             .map(|arg| arg.as_ref().to_os_string())
@@ -95,6 +110,7 @@ impl Cli {
         process
             .args(&args)
             .env("NO_COLOR", "1")
+            .envs(env.iter().copied())
             .env(WORKSPACE_ENV, &self.gateway.workspace)
             .stdin(Stdio::null())
             .kill_on_drop(true);

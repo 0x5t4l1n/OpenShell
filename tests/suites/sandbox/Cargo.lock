@@ -1982,10 +1982,37 @@ dependencies = [
 ]
 
 [[package]]
+name = "openshell-test-sandbox-file-transfer"
+version = "0.0.0"
+dependencies = [
+ "openshell-testkit",
+ "tempfile",
+]
+
+[[package]]
 name = "openshell-test-sandbox-lifecycle"
 version = "0.0.0"
 dependencies = [
  "openshell-testkit",
+ "serde_json",
+]
+
+[[package]]
+name = "openshell-test-sandbox-policy-advisor"
+version = "0.0.0"
+dependencies = [
+ "openshell-testkit",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "openshell-test-sandbox-oci-image"
+version = "0.0.0"
+dependencies = [
+ "openshell-testkit",
+ "serde_json",
+ "tempfile",
 ]
 
 [[package]]

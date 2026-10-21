@@ -11,7 +11,7 @@
 //! from it, and inspects the real supervisor container. The workload's image
 //! ID, identity, network, and mounts, and what the main process and
 //! `sandbox exec` see, are shared with Docker and covered by the `oci-image`
-//! feature suite in `tests/suites/features`.
+//! suite in `tests/suites/sandbox/oci-image`.
 
 use std::process::Stdio;
 

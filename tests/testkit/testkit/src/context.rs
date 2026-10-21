@@ -72,6 +72,15 @@ impl Context {
         self.cli.run_in(Some(dir), args).await
     }
 
+    /// Like [`Context::cli`], with extra environment variables for the command.
+    pub async fn cli_env<I, S>(&self, env: &[(&str, &str)], args: I) -> Result<CliOutput>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<std::ffi::OsStr>,
+    {
+        self.cli.run_with(None, env, args).await
+    }
+
     /// The ID unique to this test run, used in resource names.
     pub fn run_id(&self) -> &str {
         &self.run_id
@@ -99,6 +108,49 @@ impl Context {
                 ..SandboxSpec::default()
             },
         }
+    }
+
+    /// Track a sandbox the test is about to create through the CLI, so cleanup
+    /// deletes it even if the test fails after the gateway accepted the create.
+    /// Call this before the CLI command; use [`Context::adopt`] afterwards.
+    pub fn track(&self, name: &str) {
+        lock(&self.sandboxes).insert(name.to_string());
+    }
+
+    /// A handle to a sandbox created outside the builder, e.g. by the CLI.
+    /// It is tracked for cleanup like a built one.
+    pub async fn adopt(&self, name: &str) -> Result<Sandbox> {
+        self.track(name);
+        let found = self
+            .client
+            .get_sandbox(name)
+            .await
+            .context(format!("get sandbox {name}"))?;
+        Ok(Sandbox {
+            client: self.client.clone(),
+            grpc: self.grpc.clone(),
+            sandboxes: Arc::clone(&self.sandboxes),
+            name: name.to_string(),
+            id: found.id,
+        })
+    }
+
+    /// Register the sandbox `cx.name(suffix)` for cleanup and return its name,
+    /// for a sandbox the test creates outside [`Context::sandbox`], such as
+    /// through the CLI. Call it before creating, so a create that fails after
+    /// the gateway accepted it is still cleaned up.
+    pub fn track_sandbox(&self, suffix: &str) -> String {
+        let name = self.name(suffix);
+        lock(&self.sandboxes).insert(name.clone());
+        name
+    }
+
+    /// Delete every tracked sandbox now, instead of after the test. For a test
+    /// that must remove something the sandboxes use, such as an image, first.
+    pub async fn delete_sandboxes(&self) -> Result {
+        let failures = self.cleanup().await;
+        crate::ensure!(failures.is_empty(), "{}", failures.join("; "));
+        Ok(())
     }
 
     /// Fail unless the sandbox is gone from both get and list.

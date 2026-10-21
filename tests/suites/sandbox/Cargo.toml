@@ -5,4 +5,4 @@
 # one suite crate; tests run against whatever gateway the environment registers.
 [workspace]
 resolver = "2"
-members = ["lifecycle"]
+members = ["file-transfer", "lifecycle", "oci-image", "policy-advisor"]

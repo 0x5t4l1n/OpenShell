@@ -108,3 +108,10 @@
       ansible.builtin.assert:
         that: provider_refresh_result.rc == 0
         fail_msg: Keycloak provider refresh test failed
+
+    - name: Require the expected number of tests
+      ansible.builtin.assert:
+        that:
+          - (provider_refresh_result.stderr | default('') | regex_findall('Summary \\[[^\\]]*\\]\\s+(\\d+) tests? run') | first | default(0) | int) >= (suite_expected_tests | int)
+        fail_msg: >-
+          Keycloak provider refresh suite ran fewer tests than the {{ suite_expected_tests }} expected; see the nextest summary

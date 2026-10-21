@@ -1,0 +1,9 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# End-to-end suites for the Podman compute driver, written on testkit. Each
+# member is one suite crate. Unlike the driver-agnostic suites, these require a
+# gateway whose only compute driver is Podman.
+[workspace]
+resolver = "2"
+members = ["userns"]

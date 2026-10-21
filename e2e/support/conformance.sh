@@ -2,8 +2,9 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-# Shared helpers for running conformance suites against an already
-# configured e2e gateway.
+# Shared helpers for running the testkit sandbox suites against an already
+# configured e2e gateway. testkit finds the gateway the way the CLI does, through
+# OPENSHELL_GATEWAY_ENDPOINT, OPENSHELL_GATEWAY, or the active gateway.
 
 e2e_require_openshell_bin() {
   if [ -z "${OPENSHELL_BIN:-}" ]; then
@@ -30,15 +31,15 @@ e2e_run_openshell_conformance() {
 
   e2e_require_openshell_bin || return
 
-  echo "==> Running conformance suites against the ${gateway_label} gateway"
-  cargo test \
+  echo "==> Running testkit sandbox suites against the ${gateway_label} gateway"
+  cargo nextest run \
     --locked \
-    --manifest-path "${root}/tests/suites/conformance/Cargo.toml" \
-    --package openshell-test-conformance-cli \
+    --manifest-path "${root}/tests/suites/sandbox/Cargo.toml" \
+    --package openshell-test-sandbox-lifecycle \
+    --package openshell-test-sandbox-file-transfer \
+    --package openshell-test-sandbox-policy-advisor \
     --no-fail-fast \
-    -- \
-    --test-threads=1 \
-    --nocapture
+    --test-threads 1
 }
 
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then

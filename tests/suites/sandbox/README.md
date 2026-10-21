@@ -7,17 +7,28 @@ every compute driver.
 
 | Suite | Covers |
 |---|---|
-| `lifecycle` | Create, wait for ready, exec, delete |
+| `lifecycle` | Create, ready, exec, stop, start and delete through the SDK, plus the same flow through the CLI |
+| `file-transfer` | Upload and download round trips, Git filtering, and path safety |
+| `policy-advisor` | Denied connections produce draft rules; `policy.local` accepts proposals |
+| `oci-image` | Image user and working-directory behavior on the Docker and Podman drivers |
 
 Run them against a local Docker gateway with `mise run e2e:testkit`, or against
-Podman with `mise run e2e:testkit:podman`.
+Podman with `mise run e2e:testkit:podman`. `oci-image` needs
+`OPENSHELL_TEST_CONTAINER_ENGINE`; use `mise run e2e:oci-image`.
+
+Driver-specific tests live in their own test file so a playbook can exclude
+them with a nextest filter. `lifecycle/tests/persistent_workspace.rs` needs a
+driver that keeps `/sandbox` across stop and start.
 
 ## Adding a test
 
 Add a `#[testkit::test]` function to an existing suite, or a new member crate to
-`Cargo.toml` for a new area. A new crate also needs its own entry in
-`tests/artifacts.nix` and `tests/config.nix`, and a playbook
-that checks the test count. Copy `ansible/playbooks/suites/sandbox-lifecycle.yaml`.
+`Cargo.toml` for a new area. The `sandbox` tmachine testsuite runs the
+`lifecycle`, `file-transfer` and `policy-advisor` crates from one nextest
+archive, so a test added there runs in every conformance lane. Raise
+`suite_expected_tests` in `tests/tmachine/config.nix` when you add one. A crate
+with its own environment needs, like `oci-image`, gets its own archive in
+`tests/tmachine/artifacts.nix` and its own testsuite in `config.nix`.
 
 ## What a test may assert
 

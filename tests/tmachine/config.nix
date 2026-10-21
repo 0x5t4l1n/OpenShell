@@ -156,24 +156,24 @@ let
         interactive = true;
       }
       {
-        name = "conformance";
-        playbooks = [ "ansible/playbooks/conformance/cli.yaml" ];
+        name = "sandbox";
+        playbooks = [ "ansible/playbooks/suites/nextest.yaml" ];
         inputs = {
-          openshell_conformance_test_bundle = "../../artifacts/test-archives/${muslTarget}/openshell-conformance-tests.tar";
-        };
-      }
-      {
-        name = "sandbox-lifecycle";
-        playbooks = [ "ansible/playbooks/suites/sandbox-lifecycle.yaml" ];
-        inputs = {
-          sandbox_lifecycle_test_bundle = "../../artifacts/test-archives/${muslTarget}/sandbox-lifecycle-tests.tar";
+          suite_bundle = "../../artifacts/test-archives/${muslTarget}/sandbox-tests.tar";
+          suite_name = "sandbox";
+          # The run fails if fewer tests than this execute, so a dropped or
+          # filtered test cannot pass silently. Raise it when a test is added.
+          suite_expected_tests = "14";
         };
       }
       {
         name = "policy-advisor";
-        playbooks = [ "ansible/playbooks/conformance/policy-advisor.yaml" ];
+        playbooks = [ "ansible/playbooks/suites/nextest.yaml" ];
         inputs = {
-          openshell_conformance_test_bundle = "../../artifacts/test-archives/${muslTarget}/openshell-conformance-tests.tar";
+          suite_bundle = "../../artifacts/test-archives/${muslTarget}/sandbox-tests.tar";
+          suite_name = "policy-advisor";
+          suite_filter = "binary(policy_advisor)";
+          suite_expected_tests = "3";
         };
       }
       {
@@ -181,14 +181,16 @@ let
         playbooks = [ "ansible/playbooks/features/provider-refresh/keycloak.yaml" ];
         inputs = {
           keycloak_realm_file = "../../scripts/keycloak-realm.json";
-          provider_refresh_keycloak_test_bundle = "../../artifacts/test-archives/${muslTarget}/provider-refresh-keycloak-tests.tar";
+          provider_refresh_keycloak_test_bundle = "../../artifacts/test-archives/${muslTarget}/providers-refresh-keycloak-tests.tar";
+          suite_expected_tests = "1";
         };
       }
       {
         name = "oci-image";
         playbooks = [ "ansible/playbooks/features/oci-image.yaml" ];
         inputs = {
-          oci_image_test_bundle = "../../artifacts/test-archives/${muslTarget}/oci-image-tests.tar";
+          oci_image_test_bundle = "../../artifacts/test-archives/${muslTarget}/sandbox-oci-image-tests.tar";
+          suite_expected_tests = "6";
         };
       }
       {
@@ -212,13 +214,14 @@ let
           "ansible/playbooks/drivers/podman/tests.yaml"
         ];
         inputs = {
-          openshell_podman_test_bundle = "../../artifacts/test-archives/${muslTarget}/openshell-podman-tests.tar";
+          openshell_podman_test_bundle = "../../artifacts/test-archives/${muslTarget}/podman-userns-tests.tar";
+          suite_expected_tests = "2";
           # Match OpenShell's compiled-in default so direct Podman and
           # OpenShell containers resolve the same workload image metadata.
           openshell_podman_reference_image = "nvcr.io/nvidia/base/ubuntu:24.04";
-          openshell_podman_userns_auto_config = "../suites/drivers/podman/fixtures/userns-auto.toml";
-          openshell_podman_userns_keep_id_config = "../suites/drivers/podman/fixtures/userns-keep-id.toml";
-          openshell_podman_userns_private_config = "../suites/drivers/podman/fixtures/userns-private.toml";
+          openshell_podman_userns_auto_config = "../suites/podman/fixtures/userns-auto.toml";
+          openshell_podman_userns_keep_id_config = "../suites/podman/fixtures/userns-keep-id.toml";
+          openshell_podman_userns_private_config = "../suites/podman/fixtures/userns-private.toml";
         };
       }
     ];

@@ -48,9 +48,15 @@ test creates, such as providers, in the test itself.
 - `cx.sandbox(suffix)` to build and create a sandbox with a run-unique name.
   The returned `Sandbox` can wait for ready or finished, stop, start, exec,
   read its config and draft policy, set a setting, and delete.
+- `cx.track_sandbox(suffix)` to register a sandbox created some other way, such
+  as through the CLI, for cleanup, and `cx.delete_sandboxes()` to delete the
+  tracked sandboxes before the test ends.
 - `cx.expect_listed` and `cx.expect_absent` to check a sandbox in list and get.
 - `cx.cli([...])` to run the installed CLI against the same gateway, with
-  `success()`, `failure()`, and `json()` on the output.
+  `success()`, `failure()`, and `json()` on the output. `cx.cli_env` adds
+  environment variables to one command.
+- `cx.track_sandbox(name)` to clean up a sandbox created some other way, such
+  as with `openshell sandbox create`.
 - `cx.client()` for SDK calls testkit does not wrap.
 - `poll_until` for waiting on other state.
 

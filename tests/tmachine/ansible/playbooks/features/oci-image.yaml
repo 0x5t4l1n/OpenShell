@@ -123,3 +123,10 @@
         that:
           - oci_image_result.rc == 0
         fail_msg: OCI image feature tests failed
+
+    - name: Require the expected number of tests
+      ansible.builtin.assert:
+        that:
+          - (oci_image_result.stderr | default('') | regex_findall('Summary \\[[^\\]]*\\]\\s+(\\d+) tests? run') | first | default(0) | int) >= (suite_expected_tests | int)
+        fail_msg: >-
+          OCI image suite ran fewer tests than the {{ suite_expected_tests }} expected; see the nextest summary

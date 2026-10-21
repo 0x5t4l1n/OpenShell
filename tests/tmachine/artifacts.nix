@@ -24,7 +24,7 @@ let
       name,
       workspacePath,
       manifestPath,
-      package,
+      packages,
       target,
       output,
       features ? null,
@@ -61,7 +61,7 @@ let
           --locked \
           --manifest-path "$manifest_path" \
           --target ${target} \
-          -p ${package} \
+          ${pkgs.lib.concatMapStringsSep " " (package: "-p ${package}") packages} \
           ${pkgs.lib.optionalString (features != null) "--features ${pkgs.lib.escapeShellArg features}"} \
           -E ${pkgs.lib.escapeShellArg filter} \
           --archive-file "$bundle_dir/tests.tar.zst"
@@ -83,37 +83,35 @@ let
       '';
     };
 
-  conformanceTestArchive = mkTestArchive {
-    name = "openshell-conformance";
-    workspacePath = "tests/suites/conformance";
-    manifestPath = "tests/suites/conformance/Cargo.toml";
-    package = "openshell-test-conformance-cli";
-    target = muslToolchain.target;
-    output = "artifacts/test-archives/${muslToolchain.target}/openshell-conformance-tests.tar";
-  };
-  sandboxLifecycleArchive = mkTestArchive {
-    name = "sandbox-lifecycle";
+  # Suites written on testkit. Each archive is one tmachine testsuite; the
+  # suites find the gateway the installer registered, like the CLI does.
+  sandboxArchive = mkTestArchive {
+    name = "sandbox";
     workspacePath = "tests/suites/sandbox";
     manifestPath = "tests/suites/sandbox/Cargo.toml";
-    package = "openshell-test-sandbox-lifecycle";
+    packages = [
+      "openshell-test-sandbox-lifecycle"
+      "openshell-test-sandbox-file-transfer"
+      "openshell-test-sandbox-policy-advisor"
+    ];
     target = muslToolchain.target;
-    output = "artifacts/test-archives/${muslToolchain.target}/sandbox-lifecycle-tests.tar";
+    output = "artifacts/test-archives/${muslToolchain.target}/sandbox-tests.tar";
   };
-  providerRefreshKeycloakArchive = mkTestArchive {
-    name = "provider-refresh-keycloak";
-    workspacePath = "tests/suites/features";
-    manifestPath = "tests/suites/features/Cargo.toml";
-    package = "openshell-test-feature-provider-refresh-keycloak";
+  sandboxOciImageArchive = mkTestArchive {
+    name = "sandbox-oci-image";
+    workspacePath = "tests/suites/sandbox";
+    manifestPath = "tests/suites/sandbox/Cargo.toml";
+    packages = [ "openshell-test-sandbox-oci-image" ];
     target = muslToolchain.target;
-    output = "artifacts/test-archives/${muslToolchain.target}/provider-refresh-keycloak-tests.tar";
+    output = "artifacts/test-archives/${muslToolchain.target}/sandbox-oci-image-tests.tar";
   };
-  ociImageArchive = mkTestArchive {
-    name = "oci-image";
-    workspacePath = "tests/suites/features";
-    manifestPath = "tests/suites/features/Cargo.toml";
-    package = "openshell-test-feature-oci-image";
+  providersRefreshKeycloakArchive = mkTestArchive {
+    name = "providers-refresh-keycloak";
+    workspacePath = "tests/suites/providers";
+    manifestPath = "tests/suites/providers/Cargo.toml";
+    packages = [ "openshell-test-providers-refresh-keycloak" ];
     target = muslToolchain.target;
-    output = "artifacts/test-archives/${muslToolchain.target}/oci-image-tests.tar";
+    output = "artifacts/test-archives/${muslToolchain.target}/providers-refresh-keycloak-tests.tar";
   };
 
   # Follow-up: binaries that do not yet run in the rootless tmachine guest. Each
@@ -191,19 +189,19 @@ let
     '';
   };
 
-  podmanDriverArchive = mkTestArchive {
-    name = "podman-driver";
-    workspacePath = "tests/suites/drivers";
-    manifestPath = "tests/suites/drivers/Cargo.toml";
-    package = "openshell-test-suite-podman";
+  podmanUsernsArchive = mkTestArchive {
+    name = "podman-userns";
+    workspacePath = "tests/suites/podman";
+    manifestPath = "tests/suites/podman/Cargo.toml";
+    packages = [ "openshell-test-podman-userns" ];
     target = muslToolchain.target;
-    output = "artifacts/test-archives/${muslToolchain.target}/openshell-podman-tests.tar";
+    output = "artifacts/test-archives/${muslToolchain.target}/podman-userns-tests.tar";
   };
   podmanE2eArchive = mkTestArchive {
     name = "podman-e2e";
     workspacePath = "e2e/rust";
     manifestPath = "e2e/rust/Cargo.toml";
-    package = "openshell-e2e";
+    packages = [ "openshell-e2e" ];
     target = muslToolchain.target;
     output = "artifacts/test-archives/${muslToolchain.target}/openshell-podman-e2e-tests.tar";
     features = "e2e-podman";
@@ -212,10 +210,10 @@ let
 in
 rec {
   inherit
-    conformanceTestArchive
-    providerRefreshKeycloakArchive
-    ociImageArchive
-    podmanDriverArchive
+    sandboxArchive
+    sandboxOciImageArchive
+    providersRefreshKeycloakArchive
+    podmanUsernsArchive
     podmanE2eArchive
     podmanE2eCiTests
     ;
@@ -325,19 +323,17 @@ rec {
   testArchives = pkgs.writeShellApplication {
     name = "build-artifacts-test-archives";
     runtimeInputs = [
-      conformanceTestArchive
-      sandboxLifecycleArchive
-      providerRefreshKeycloakArchive
-      ociImageArchive
-      podmanDriverArchive
+      sandboxArchive
+      sandboxOciImageArchive
+      providersRefreshKeycloakArchive
+      podmanUsernsArchive
       podmanE2eArchive
     ];
     text = ''
-      build-openshell-conformance-test-archive
-      build-sandbox-lifecycle-test-archive
-      build-provider-refresh-keycloak-test-archive
-      build-oci-image-test-archive
-      build-podman-driver-test-archive
+      build-sandbox-test-archive
+      build-sandbox-oci-image-test-archive
+      build-providers-refresh-keycloak-test-archive
+      build-podman-userns-test-archive
       build-podman-e2e-test-archive
     '';
   };

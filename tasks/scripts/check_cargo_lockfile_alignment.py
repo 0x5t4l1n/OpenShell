@@ -35,7 +35,12 @@ from pathlib import Path
 
 # Workspaces whose shared crates must match the root lockfile. Add a
 # workspace here once its lockfile has been aligned with `--fix`.
-ALIGNED_WORKSPACES = ("tests/testkit", "tests/suites/sandbox")
+ALIGNED_WORKSPACES = (
+    "tests/testkit",
+    "tests/suites/sandbox",
+    "tests/suites/providers",
+    "tests/suites/podman",
+)
 
 
 @dataclass(frozen=True)

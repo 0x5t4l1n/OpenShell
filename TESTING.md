@@ -141,23 +141,22 @@ by `OPENSHELL_BIN`. See
 [tests/testkit/README.md](tests/testkit/README.md) for how to write and run
 tests.
 
-**New end-to-end tests go in testkit.** The older suites under
-`tests/suites/conformance`, `features` and `drivers` and the `e2e/` suites take
-fixes only. Suites live under `tests/suites/<family>/`, for example
-`tests/suites/sandbox/`, and each family is its own Cargo workspace with its own
-lockfile. Run them against a local Docker gateway with:
+**New end-to-end tests go in testkit.** The `e2e/` suites take fixes only.
+Suites live under `tests/suites/<family>/` (`sandbox`, `providers`, `podman`),
+and each family is its own Cargo workspace with its own lockfile. Run the
+sandbox suites against a local Docker gateway with:
 
 ```shell
 mise run e2e:testkit
 ```
 
-CI runs them in two Branch E2E jobs (label `test:e2e`). `testkit-e2e` runs
-`mise run e2e:testkit` against a Docker-backed gateway. `testkit-integration`
-runs them through a tmachine lane that installs the Debian package. The suite's playbook
-fails the lane if fewer tests run than it expects, so raise
-`suite_expected_tests` in
-`tests/tmachine/ansible/playbooks/suites/sandbox-lifecycle.yaml` when you add a
-test.
+CI runs the sandbox suites as the `sandbox` testsuite in the conformance lanes
+of Branch E2E (label `test:e2e`), Release Dev and release qualification, through
+tmachine guests that install the packages. The playbook fails a lane if fewer
+tests run than the testsuite's `suite_expected_tests` in
+`tests/tmachine/config.nix`, so raise that number when you add a test.
+The `testkit-e2e` job in Branch E2E also runs `mise run e2e:testkit` against a
+Docker-backed gateway without a VM.
 
 Workspaces that build root crates through path dependencies must lock shared
 crates at the versions in the root `Cargo.lock`; otherwise CI can build against
@@ -272,12 +271,12 @@ HTTP `Host`, TLS SNI, and mTLS handling.
 Suites:
 
 - Common suite (`--features e2e`) - driver-neutral CLI behavior, sandbox lifecycle, sync, port forwarding, policy, and provider tests.
-- CLI conformance (`tests/suites/conformance`) - portable Cargo tests for
-  lifecycle, mechanistic drafts, file transfer, and the sandbox-local API,
-  including agent-authored permission requests. Driver E2E runs the complete
-  Cargo test package. The installed-artifact conformance suite runs the same
-  tests from a nextest archive and offers a focused `policy-advisor` testsuite
-  for manual integration runs.
+- Sandbox suites (`tests/suites/sandbox`) - driver-neutral testkit tests for
+  lifecycle, CLI create/exec/list/stop/delete, file transfer, and policy
+  advisor drafts and the sandbox-local API. Driver E2E runs the lifecycle,
+  file-transfer and policy-advisor packages. The installed-artifact `sandbox`
+  testsuite runs the same tests from a nextest archive and offers a focused
+  `policy-advisor` testsuite for manual integration runs.
 - Driver suites (`--features e2e-docker`, `e2e-podman`, `e2e-kubernetes`, or
   `e2e-vm`) - CLI conformance plus the common and driver-specific coverage for
   the selected deployment.
@@ -323,8 +322,8 @@ cargo build --package openshell-cli
 OPENSHELL_BIN="$PWD/target/debug/openshell" \
   cargo test \
     --locked \
-    --manifest-path tests/suites/conformance/Cargo.toml \
-    --package openshell-test-conformance-cli \
+    --manifest-path tests/suites/sandbox/Cargo.toml \
+    --workspace \
     --no-fail-fast \
     -- \
     --test-threads=1 \
@@ -407,12 +406,12 @@ store. The separate `driver-podman` testsuite compares OpenShell and direct
 Podman user-namespace mappings for the default, `auto`, `keep-id`, and private
 profiles. The E2E archive excludes binaries that still depend on wrapper-owned
 gateway controls, SPIFFE fixtures, the caller driver-config setting, or other
-guest setup. The `driver-podman` suite replaces the removed `podman_userns` E2E
+guest setup. The `driver-podman` suite (`tests/suites/podman`) replaces the removed `podman_userns` E2E
 binary. `tests/tmachine/artifacts.nix` keeps the follow-up exclusions explicit and uses
 the same filter for the generated inventory, so excluded binaries cannot appear
 as false passes or silently re-enter the archive.
 
-The `oci-image` feature testsuite (`tests/suites/features/oci-image`) checks
+The `oci-image` testsuite (`tests/suites/sandbox/oci-image`) checks
 OCI image identity and working-directory behavior shared by the Docker and
 Podman drivers against installed deb packages on Ubuntu and rpm packages on
 Fedora. CI runs it on Docker rootful, Podman rootful, and Podman rootless guests:

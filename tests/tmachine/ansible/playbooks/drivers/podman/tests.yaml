@@ -54,6 +54,7 @@
         argv: [cargo-nextest, nextest, run, --archive-file, "{{ podman_test_root }}/tests.tar.zst", --workspace-remap, "{{ podman_test_root }}", --no-capture]
       environment:
         OPENSHELL_BIN: /usr/local/bin/openshell
+        OPENSHELL_GATEWAY: tmachine
         OPENSHELL_TEST_INPUT_DIR: "{{ podman_test_input_dir }}"
         OPENSHELL_PODMAN_TEST_IMAGE: "{{ openshell_podman_test_image | default('') }}"
       register: podman_test_result
@@ -163,3 +164,10 @@
       ansible.builtin.assert:
         that: [podman_test_result.rc == 0]
         fail_msg: Podman archive tests failed
+
+    - name: Require the expected number of tests
+      ansible.builtin.assert:
+        that:
+          - (podman_test_result.stderr | default('') | regex_findall('Summary \\[[^\\]]*\\]\\s+(\\d+) tests? run') | first | default(0) | int) >= (suite_expected_tests | int)
+        fail_msg: >-
+          Podman userns suite ran fewer tests than the {{ suite_expected_tests }} expected; see the nextest summary
