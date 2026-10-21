@@ -1998,21 +1998,21 @@ dependencies = [
 ]
 
 [[package]]
-name = "openshell-test-sandbox-policy-advisor"
-version = "0.0.0"
-dependencies = [
- "openshell-testkit",
- "serde_json",
- "tokio",
-]
-
-[[package]]
 name = "openshell-test-sandbox-oci-image"
 version = "0.0.0"
 dependencies = [
  "openshell-testkit",
  "serde_json",
  "tempfile",
+]
+
+[[package]]
+name = "openshell-test-sandbox-policy-advisor"
+version = "0.0.0"
+dependencies = [
+ "openshell-testkit",
+ "serde_json",
+ "tokio",
 ]
 
 [[package]]
