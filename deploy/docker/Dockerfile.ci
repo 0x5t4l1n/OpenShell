@@ -6,7 +6,7 @@
 # CI runner image with all development tools pre-installed
 # Rebuild triggered automatically when mise.toml, mise.lock, tasks, or this file changes
 
-FROM nvcr.io/nvidia/base/ubuntu:noble-20251013
+FROM nvcr.io/nvidia/base/ubuntu:noble-20260917
 
 ARG DOCKER_VERSION=29.5.1
 ARG BUILDX_VERSION=v0.34.0
@@ -41,7 +41,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     rsync \
     zstd \
     && apt-get install -y --only-upgrade gpgv python3 \
-    && dpkg --compare-versions "$(dpkg-query -W -f='${Version}' ca-certificates)" ge 20260816ubuntu0.24.04.1 \
     && rm -rf /var/lib/apt/lists/*
 
 # Install Docker CLI and buildx plugin used by CI jobs

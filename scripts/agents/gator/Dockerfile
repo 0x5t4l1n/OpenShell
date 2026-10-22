@@ -9,9 +9,7 @@
 # tooling, but keeps the initial agent surface focused on Codex + GitHub tooling
 # for the gator-gate workflow.
 
-FROM public.ecr.aws/docker/library/node:22.23.4-bookworm-slim@sha256:5991875dfb80938dd8a6ba3fe3e96fd04929e70792762b3319d8caadbbe229bc AS node
-
-FROM public.ecr.aws/docker/library/ubuntu:24.04@sha256:68ee22004a9109b44973313b02ff7b1de250f1de0f5ecb628d73f579aaff33ac AS system
+FROM nvcr.io/nvidia/base/ubuntu:noble-20260917 AS system
 
 ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONDONTWRITEBYTECODE=1 \
@@ -37,7 +35,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         openssh-sftp-server \
         procps \
         traceroute \
-    && dpkg --compare-versions "$(dpkg-query -W -f='${Version}' ca-certificates)" ge 20260816ubuntu0.24.04.1 \
     && rm -rf /var/lib/apt/lists/*
 
 RUN groupadd -r supervisor && useradd -r -g supervisor -s /usr/sbin/nologin supervisor && \
@@ -45,20 +42,20 @@ RUN groupadd -r supervisor && useradd -r -g supervisor -s /usr/sbin/nologin supe
 
 FROM system AS devtools
 
-COPY --from=node /usr/local/bin/node /usr/bin/node
-COPY --from=node /usr/local/lib/node_modules/npm /usr/lib/node_modules/npm
-COPY --from=node /usr/local/include/node /usr/include/node
-
-RUN apt-get update && apt-get install -y --no-install-recommends \
+# Node.js 22 + build toolchain. Keep the default apt installs aligned with the
+# workload, then add the small CLI tools gator commonly needs.
+RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - && \
+    apt-get install -y --no-install-recommends \
         build-essential \
         git \
         jq \
         less \
+        nodejs=22.23.4-1nodesource1 \
         ripgrep \
         vim-tiny \
         nano \
     && rm -rf /var/lib/apt/lists/* \
-    && node /usr/lib/node_modules/npm/bin/npm-cli.js install -g npm@11.11.0
+    && npm install -g npm@11.11.0
 
 # GitHub CLI
 RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \

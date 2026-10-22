@@ -5,7 +5,6 @@ FROM public.ecr.aws/docker/library/node:22.23.4-bookworm-slim@sha256:5991875dfb8
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates iproute2 \
-    && dpkg --compare-versions "$(dpkg-query -W -f='${Version}' ca-certificates)" ge 20250419~deb12u2 \
     && rm -rf /var/lib/apt/lists/*
 
 ARG SANDBOX_UID=1000660000
