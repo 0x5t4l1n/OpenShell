@@ -4154,15 +4154,6 @@ pub async fn sandbox_suspend(
     workspace: &str,
     tls: &TlsOptions,
 ) -> Result<()> {
-    if let Ok(stopped) = stop_forwards_for_sandbox(workspace, name) {
-        for port in stopped {
-            eprintln!(
-                "{} Stopped forward of port {port} for sandbox {name}",
-                "✓".green().bold(),
-            );
-        }
-    }
-
     let mut client = grpc_client(server, tls).await?;
     let sandbox = client
         .suspend_sandbox(SuspendSandboxRequest {
@@ -4177,6 +4168,15 @@ pub async fn sandbox_suspend(
         .sandbox
         .ok_or_else(|| miette!("gateway returned no sandbox after suspend"))?;
     wait_for_lifecycle_phase(&mut client, sandbox, SandboxPhase::Suspended).await?;
+    if let Ok(stopped) = stop_forwards_for_sandbox(workspace, name) {
+        for port in stopped {
+            eprintln!(
+                "{} Stopped forward of port {port} for sandbox {name}",
+                "✓".green().bold(),
+            );
+        }
+    }
+
     println!("{} Suspended sandbox {name}", "✓".green().bold());
     Ok(())
 }

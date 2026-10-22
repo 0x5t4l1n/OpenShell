@@ -426,3 +426,115 @@ async fn gateway_restart_repeats_an_unresolved_resume() {
         &stored(&runtime, sandbox.object_id()).await
     ));
 }
+
+#[tokio::test]
+async fn main_process_exit_wins_over_pending_suspend() {
+    for outcome in [
+        ControlledLifecycleOutcome::Ok,
+        ControlledLifecycleOutcome::Error("process already exited"),
+    ] {
+        for exit_code in [0, 9] {
+            let driver = ControlledDriver::new();
+            driver.suspend_blocked.store(true, Ordering::SeqCst);
+            driver.set_suspend_outcome(outcome.clone());
+            let runtime = suspend_capable_runtime(driver.clone()).await;
+            let mut sandbox = sandbox_record("sb-exit-race", "exit-race", SandboxPhase::Ready);
+            sandbox.status.as_mut().unwrap().main_process_instance_id = "instance-1".into();
+            runtime.store.put_message(&sandbox).await.unwrap();
+            driver.set_get_outcome(ControlledGetOutcome::Sandbox(Box::new(
+                ready_driver_sandbox(sandbox.object_id(), sandbox.object_name()),
+            )));
+            let pending = {
+                let runtime = runtime.clone();
+                tokio::spawn(async move { runtime.suspend_sandbox("default", "exit-race").await })
+            };
+            driver.suspend_started.notified().await;
+            assert_eq!(
+                stored(&runtime, sandbox.object_id()).await.phase(),
+                SandboxPhase::Suspending as i32
+            );
+            runtime
+                .report_main_process_exit(sandbox.object_id(), "instance-1", exit_code)
+                .await
+                .unwrap();
+            runtime
+                .finalize_main_process_exit(sandbox.object_id(), "instance-1")
+                .await
+                .unwrap();
+            driver.suspend_release.add_permits(1);
+            pending.await.unwrap().unwrap_err();
+            let completed = stored(&runtime, sandbox.object_id()).await;
+            assert_eq!(
+                completed.phase(),
+                if exit_code == 0 {
+                    SandboxPhase::Completed
+                } else {
+                    SandboxPhase::Error
+                } as i32
+            );
+            assert_eq!(completed.status.unwrap().exit_code, Some(exit_code));
+        }
+    }
+}
+
+#[tokio::test]
+async fn failed_recovered_resume_preserves_retryable_state() {
+    for recover_on_startup in [false, true] {
+        for confirmed_stopped in [false, true] {
+            let driver = ControlledDriver::new();
+            driver.set_start_outcome(ControlledLifecycleOutcome::Error("restore failed"));
+            driver.set_get_outcome(ControlledGetOutcome::Error("driver unavailable"));
+            let mut runtime =
+                test_runtime_with_gateway_managed_lifecycle(driver.clone(), "test-driver").await;
+            enable_suspend_resume(&mut runtime);
+            let sandbox = sandbox_record(
+                "sb-recover-resume",
+                "recover-resume",
+                SandboxPhase::Suspended,
+            );
+            runtime.store.put_message(&sandbox).await.unwrap();
+            runtime
+                .resume_sandbox("default", "recover-resume", false)
+                .await
+                .unwrap_err();
+            let pending = stored(&runtime, sandbox.object_id()).await;
+            if confirmed_stopped {
+                driver.set_get_outcome(ControlledGetOutcome::Sandbox(Box::new(
+                    exited_driver_sandbox(&sandbox),
+                )));
+            }
+            if recover_on_startup {
+                runtime.start_persisted_sandboxes().await.unwrap();
+            } else {
+                runtime
+                    .resume_sandbox("default", "recover-resume", false)
+                    .await
+                    .unwrap_err();
+            }
+            let recovered = stored(&runtime, sandbox.object_id()).await;
+            assert_eq!(
+                driver.start_calls(),
+                2,
+                "startup must not retry an unresolved resume twice"
+            );
+            assert_eq!(
+                sandbox_runtime_generation(&recovered),
+                sandbox_runtime_generation(&pending)
+            );
+            assert_eq!(
+                recovered.phase(),
+                if confirmed_stopped {
+                    SandboxPhase::Suspended
+                } else {
+                    SandboxPhase::Starting
+                } as i32
+            );
+            assert_eq!(has_resume_intent(&recovered), !confirmed_stopped);
+            driver.set_start_outcome(ControlledLifecycleOutcome::Ok);
+            runtime
+                .resume_sandbox("default", "recover-resume", false)
+                .await
+                .unwrap();
+        }
+    }
+}

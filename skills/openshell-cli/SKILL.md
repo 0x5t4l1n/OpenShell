@@ -546,8 +546,9 @@ openshell sandbox suspend [name]
 openshell sandbox resume [name]
 ```
 
-Suspend stops background forwards and waits for `Suspended`; resume restores
-the state in a new runtime generation and waits for `Ready`. A gateway without
+Suspend waits for `Suspended`, then stops background forwards. A rejected
+suspend leaves forwards running. Resume restores the state in a new runtime
+generation and waits for `Ready`. A gateway without
 support rejects suspend with `FAILED_PRECONDITION`. Resume fails when retained
 state cannot be restored; use `sandbox start` for an explicit clean boot. `sandbox start`,
 `sandbox stop`, and `sandbox delete` on a suspended sandbox discard the

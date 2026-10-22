@@ -2806,13 +2806,28 @@ impl ComputeRuntime {
                 let runtime_restart_during_stop =
                     expected_stopped && driver_snapshot_reports_runtime_restart(&snapshot);
                 // A suspended runtime looks exited or failed to the driver.
-                // Unless the resume visibly produced a running runtime, the
-                // retained state is still the sandbox's durable state.
+                // Only a confirmed stopped runtime permits retrying retained
+                // state. An unknown or still-starting runtime remains ambiguous.
                 let resume_not_running = !expected_stopped
                     && in_flight_resume_intent(transition).is_some()
                     && backend_phase != SandboxPhase::Ready;
                 if resume_not_running {
-                    let _ = self.restore_lifecycle_snapshot(transition, previous).await;
+                    if observed_stopped {
+                        // Recovery and explicit retries may have Starting as
+                        // their previous snapshot. Keep the current generation
+                        // and credentials, but restore the retained-state phase.
+                        let mut suspended = transition.clone();
+                        apply_lifecycle_phase(
+                            &mut suspended,
+                            SandboxPhase::Suspended,
+                            "Suspended",
+                            "Sandbox remains suspended after failed resume",
+                            self.image_preparation_timeout_seconds,
+                        );
+                        let _ = self
+                            .restore_lifecycle_snapshot(transition, &suspended)
+                            .await;
+                    }
                 } else if suspension_progressing || runtime_restart_during_stop {
                     // The backend has accepted the stop but has not finished
                     // terminating the sandbox. A runtime restart can likewise
@@ -4008,7 +4023,9 @@ impl ComputeRuntime {
                 }
             };
 
-            if provisioning_deadline::driver_operation_pending(&sandbox) {
+            if provisioning_deadline::driver_operation_pending(&sandbox)
+                || in_flight_resume_intent(&sandbox).is_some()
+            {
                 warn!(
                     sandbox_id,
                     "Retaining pending driver operation during gateway recovery"
@@ -4245,7 +4262,7 @@ impl ComputeRuntime {
             .list_persisted_sandbox_ids("lifecycle recovery")
             .await?;
         for sandbox_id in sandbox_ids {
-            let _lifecycle_guard = self.lifecycle_gates.lock_for(&sandbox_id).await;
+            let lifecycle_guard = self.lifecycle_gates.lock_for(&sandbox_id).await;
             let sandbox = match self.store.get_message::<Sandbox>(&sandbox_id).await {
                 Ok(Some(sandbox)) => sandbox,
                 Ok(None) => continue,
@@ -4354,6 +4371,17 @@ impl ComputeRuntime {
                         }
                         Err(err) => {
                             warn!(sandbox_id = %sandbox.object_id(), error = %err, "Failed to recover sandbox start");
+                            if let ProvisioningOperationError::Driver { settled, .. } = err
+                                && in_flight_resume_intent(&settled).is_some()
+                            {
+                                Box::pin(self.recover_failed_lifecycle(
+                                    &lifecycle_guard,
+                                    &settled,
+                                    &sandbox,
+                                    false,
+                                ))
+                                .await;
+                            }
                         }
                     }
                 }
@@ -5756,7 +5784,6 @@ impl ComputeRuntime {
             SandboxPhase::Deleting
                 | SandboxPhase::Stopping
                 | SandboxPhase::Stopped
-                | SandboxPhase::Suspending
                 | SandboxPhase::Suspended
         ) {
             return Ok(());
@@ -5851,7 +5878,6 @@ impl ComputeRuntime {
             SandboxPhase::Deleting
                 | SandboxPhase::Stopping
                 | SandboxPhase::Stopped
-                | SandboxPhase::Suspending
                 | SandboxPhase::Suspended
         ) {
             // Lifecycle shutdown intentionally discards the canonical process
@@ -8926,6 +8952,9 @@ mod tests {
         start_expected_runtime_identities: TestMutex<Vec<String>>,
         start_outcome: TestMutex<ControlledLifecycleOutcome>,
         start_resume_requests: TestMutex<Vec<(bool, bool)>>,
+        suspend_started: Notify,
+        suspend_release: Semaphore,
+        suspend_blocked: AtomicBool,
         suspend_calls: AtomicUsize,
         suspend_outcome: TestMutex<ControlledLifecycleOutcome>,
         runtime_identity: TestMutex<String>,
@@ -8974,6 +9003,9 @@ mod tests {
                 start_expected_runtime_identities: TestMutex::new(Vec::new()),
                 start_outcome: TestMutex::new(ControlledLifecycleOutcome::Ok),
                 start_resume_requests: TestMutex::new(Vec::new()),
+                suspend_started: Notify::new(),
+                suspend_release: Semaphore::new(0),
+                suspend_blocked: AtomicBool::new(false),
                 suspend_calls: AtomicUsize::new(0),
                 suspend_outcome: TestMutex::new(ControlledLifecycleOutcome::Ok),
                 runtime_identity: TestMutex::new(String::new()),
@@ -9360,6 +9392,10 @@ mod tests {
             _request: Request<SuspendSandboxRequest>,
         ) -> Result<tonic::Response<SuspendSandboxResponse>, Status> {
             self.suspend_calls.fetch_add(1, Ordering::SeqCst);
+            self.suspend_started.notify_one();
+            if self.suspend_blocked.load(Ordering::SeqCst) {
+                self.suspend_release.acquire().await.unwrap().forget();
+            }
             let outcome = self
                 .suspend_outcome
                 .lock()
