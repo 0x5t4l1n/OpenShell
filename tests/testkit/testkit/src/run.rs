@@ -1,12 +1,13 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Running one test: find the gateway, run, clean up.
+//! Running one test: check requirements, find the gateway, run, clean up.
 
 use std::panic::AssertUnwindSafe;
 
 use futures::FutureExt;
 
+use crate::capabilities::{Capabilities, Capability, check_requirements};
 use crate::cli::Cli;
 use crate::context::Context;
 use crate::error::Result;
@@ -17,13 +18,20 @@ use crate::gateway::Gateway;
 pub struct TestInfo {
     /// The function name, which is also the nextest test name.
     pub name: &'static str,
+    /// The stable test ID, if the test declares one.
+    pub id: Option<&'static str>,
     pub description: &'static str,
+    /// Capabilities the environment must provide.
+    pub requires: &'static [Capability],
 }
 
 /// Run a test body against the gateway found by [`Gateway::from_env`].
 ///
-/// Cleanup runs whether the body passes, fails, or panics. The test fails if
-/// the body fails, or if cleanup fails after the body passed.
+/// A test that declares requirements first checks that the environment
+/// provides them (see [`Capabilities`]); one without requirements never reads
+/// the environment's capabilities. Cleanup runs whether the body passes,
+/// fails, or panics. The test fails if the body fails, or if cleanup fails
+/// after the body passed.
 ///
 /// # Panics
 ///
@@ -33,7 +41,20 @@ where
     F: AsyncFnOnce(&mut Context) -> Result,
 {
     let name = info.name;
-    eprintln!("[{name}] {}", info.description);
+    match info.id {
+        Some(id) => eprintln!("[{name}] {} ({id})", info.description),
+        None => eprintln!("[{name}] {}", info.description),
+    }
+
+    // The runner excludes tests the environment can't support. Reaching one
+    // here means it didn't, so fail rather than report a pass for behavior
+    // that was never tested.
+    if !info.requires.is_empty() {
+        let provided = Capabilities::from_env();
+        if let Err(problem) = check_requirements(info.requires, provided.as_ref()) {
+            panic!("[{name}] {problem}");
+        }
+    }
 
     let gateway = Gateway::from_env().unwrap_or_else(|error| panic!("[{name}] {error}"));
     eprintln!("[{name}] {}", gateway.describe());
