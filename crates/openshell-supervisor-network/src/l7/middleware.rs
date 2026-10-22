@@ -10,8 +10,7 @@ use openshell_core::proto::MiddlewareSessionEndReason;
 use openshell_core::secrets;
 use openshell_ocsf::{
     ActionId, ActivityId, DetectionFindingBuilder, DispositionId, Endpoint, FindingInfo,
-    HttpActivityBuilder, HttpRequest, NetworkActivityBuilder, SeverityId, StatusId, Url as OcsfUrl,
-    ocsf_emit,
+    HttpActivityBuilder, HttpRequest, NetworkActivityBuilder, SeverityId, StatusId, ocsf_emit,
 };
 use openshell_supervisor_middleware::{
     ChainHttpHookVersion, HttpBodyInput, HttpBodyOutput, HttpFailureCode, HttpMiddlewareFailure,
@@ -830,7 +829,7 @@ pub async fn apply_middleware_chain_with_request_id<C: AsyncRead + AsyncWrite + 
         req,
         client,
         ctx,
-        "https",
+        ctx.request_scheme(),
         chain,
         runner,
         generation_guard,
@@ -859,7 +858,7 @@ pub async fn apply_middleware_chain_with_request_id_and_delivery<
             req,
             client,
             ctx,
-            "https",
+            ctx.request_scheme(),
             chain,
             runner,
             generation_guard,
@@ -1661,10 +1660,7 @@ pub(super) fn request_client_timeout_event(
         .severity(SeverityId::Low)
         .status(StatusId::Failure)
         .status_detail("request_client_progress_timeout")
-        .http_request(HttpRequest::new(
-            action,
-            OcsfUrl::new("http", &ctx.host, target, ctx.port),
-        ))
+        .http_request(HttpRequest::new(action, ctx.ocsf_url(target)))
         .dst_endpoint(Endpoint::from_domain(&ctx.host, ctx.port))
         .firewall_rule(&ctx.policy_name, "middleware")
         .message(format!(
@@ -2055,10 +2051,7 @@ pub(super) fn middleware_events(
             } else {
                 SeverityId::Medium
             })
-            .http_request(HttpRequest::new(
-                &req.action,
-                OcsfUrl::new("http", &ctx.host, &req.target, ctx.port),
-            ))
+            .http_request(HttpRequest::new(&req.action, ctx.ocsf_url(&req.target)))
             .dst_endpoint(Endpoint::from_domain(&ctx.host, ctx.port))
             .firewall_rule(&ctx.policy_name, "middleware")
             .unmapped("transformed", invocation.transformed)

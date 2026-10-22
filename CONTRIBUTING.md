@@ -117,6 +117,7 @@ Contributor and maintainer skills live in `.agents/skills/`. They are marked int
 | Platform        | `build-openshell-mxc-windows` | Maintain and validate the build-only x64 and ARM64 Windows MSVC lane                             |
 | Documentation   | `update-docs-from-commits` | Scan recent commits and draft doc updates for user-facing changes                                  |
 | Maintenance     | `sync-agent-infra`        | Detect and fix drift across agent-first infrastructure files                                        |
+| Maintenance     | `release-captain`         | Run the weekly Monday pre-flight and Tuesday stable release checklist                               |
 | Reference       | `sbom`                    | Generate SBOMs and resolve dependency licenses                                                      |
 
 ### Issue Workflow
@@ -398,6 +399,8 @@ Issues and pull requests receive `state:stale` after 14 days without activity. O
 2. Make your changes with tests.
 3. Run the checks appropriate to the affected code and behavior, as described below.
 4. Open a PR using the `create-github-pr` skill or manually following the [PR template](.github/PULL_REQUEST_TEMPLATE.md).
+
+For release notes, describe the user-facing change in a few short, easy-to-read sentences in the optional **Release Notes** section of the PR description. Keep the section concise. Stable releases use it when non-empty; otherwise they summarize the PR title and description.
 
 Every PR except an automated dependency update must close an existing issue. In the PR's **Related Issue** section, use `Closes #NNN` for the issue covering that PR's scope. Split multi-PR work into a closable issue for each PR; a tracking issue can link them. Security fixes follow the private disclosure process in [SECURITY.md](SECURITY.md).
 

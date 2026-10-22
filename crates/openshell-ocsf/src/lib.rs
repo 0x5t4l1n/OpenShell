@@ -49,15 +49,15 @@ pub use events::{
 // --- Enum types ---
 pub use enums::{
     ActionId, ActivityId, AuthProtocolId, AuthTypeId, ConfidenceId, DeviceTypeId, DispositionId,
-    HttpMethod, LaunchTypeId, OcsfEnum, RiskLevelId, SecurityLevelId, SeverityId, StateId,
-    StatusId, UserTypeId,
+    HttpMethod, LaunchTypeId, OcsfEnum, OsTypeId, RiskLevelId, SecurityLevelId, SeverityId,
+    StateId, StatusId, UserTypeId,
 };
 
 // --- Object types ---
 pub use objects::{
     Actor, AiModel, Api, Attack, ConnectionInfo, Container, Device, Endpoint, Evidence,
     FindingInfo, FirewallRule, HttpRequest, HttpResponse, Image, Metadata, OsInfo, Process,
-    Product, Remediation, Service, Tactic, Technique, Url, User,
+    Product, Remediation, ResourceDetails, Service, Tactic, Technique, Url, User,
 };
 
 // --- Sanitizers ---

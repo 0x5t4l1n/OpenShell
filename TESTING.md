@@ -335,6 +335,21 @@ mise run e2e:podman
 host's Linux architecture (`arm64` or `amd64`). Set `OPENSHELL_DEB_VERSION` to
 override the default package version, `0.0.0-local`.
 
+It also builds `artifacts/packages/rpm/openshell.rpm` and
+`artifacts/packages/rpm/openshell-gateway.rpm` for tmachine's `rpm` installer.
+The RPM step runs `packit build locally` with `openshell.spec` in the Fedora
+container that CI uses, so it needs a Docker daemon that runs Linux containers
+for the host's architecture (`aarch64` or `x86_64`), such as Docker Desktop on
+macOS. The package version defaults to the development version that branch CI
+computes; set `OPENSHELL_RPM_VERSION` and `OPENSHELL_RPM_RELEASE` to override
+it. After `nix run .#build-artifacts-binaries`, `nix run .#build-artifacts-rpm`
+rebuilds only the RPMs. Run conformance against the installed RPMs:
+
+```shell
+nix run .#build-artifacts
+nix run .#tmachine -- test fedora-podman-rootful rpm conformance
+```
+
 Run the portable subset in a disposable rootless Podman guest:
 
 ```shell
@@ -356,7 +371,7 @@ Podman user-namespace mappings for the default, `auto`, `keep-id`, and private
 profiles. The E2E archive excludes binaries that still depend on wrapper-owned
 gateway controls, SPIFFE fixtures, the caller driver-config setting, or other
 guest setup. The `driver-podman` suite replaces the removed `podman_userns` E2E
-binary. `tests/artifacts.nix` keeps the follow-up exclusions explicit and uses
+binary. `tests/tmachine/artifacts.nix` keeps the follow-up exclusions explicit and uses
 the same filter for the generated inventory, so excluded binaries cannot appear
 as false passes or silently re-enter the archive.
 
@@ -432,14 +447,19 @@ OPENSHELL_E2E_KUBE_TEST=smoke mise run e2e:kubernetes
 ```
 
 **OpenShift**: when the target cluster exposes the `route.openshift.io` API
-group, the harness automatically applies SCC-compatible Helm overrides, grants
-the required SCCs (`privileged` to `openshell-sandbox`, and `anyuid` to the
-PostgreSQL fixture for DB scenarios), and drives the gateway through a
-passthrough Route with mandatory mTLS instead of port-forward. No extra flags are
-needed, but `oc` must be installed and authenticated against the target cluster
-with permission to modify SCC bindings (`oc adm policy add-scc-to-user`) — the
-harness exits early if `oc` is missing. The SCC grants and extracted client
-mTLS material are removed during cleanup, including on failure or interrupt.
+group, the harness automatically applies SCC-compatible Helm overrides and
+drives the gateway through a passthrough Route with mandatory mTLS instead of
+port-forward. No extra flags are needed, but `oc` must be installed and
+authenticated against the target cluster; the harness exits early if `oc` is
+missing. DB scenarios grant `anyuid` to the PostgreSQL fixture and require
+permission to modify SCC bindings (`oc adm policy add-scc-to-user`). That grant
+and extracted client mTLS material are removed during cleanup, including on
+failure or interrupt.
+
+Sandbox pods use the namespace-assigned UID/GID and run under `restricted-v2`
+without a privileged SCC grant to `openshell-sandbox`. Earlier versions required
+that grant for in-container isolation setup. [RFC 0012](https://github.com/NVIDIA/OpenShell/blob/main/rfc/0012-isolation-backend/README.md#motivation)
+explains the isolation backend separation behind the capability-free runtime.
 
 On a **remote** cluster, drop the `e2e-host-gateway` feature. Those tests rely
 on the sandbox-side `host.openshell.internal` alias reaching the machine running
