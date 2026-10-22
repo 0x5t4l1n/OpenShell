@@ -16,6 +16,7 @@ crates/*/tests/        # Rust integration tests
 python/openshell/      # Python unit tests (*_test.py suffix)
 e2e/python/            # Python E2E tests (test_*.py prefix)
 e2e/rust/              # Rust CLI E2E tests
+tests/testkit/         # Support library for SDK-driven E2E suites
 ```
 
 ## Rust Tests
@@ -128,6 +129,16 @@ requires mTLS.
 `mise run test:gateway-config` validates generated gateway TOML without a live
 runtime. It covers the current schema and the Podman in-tree versus external
 driver configuration boundary.
+
+### testkit (`tests/testkit/`)
+
+`testkit` is the support library for SDK-driven end-to-end suites. Tests are
+`#[testkit::test]` functions with a required doc comment. They find the
+gateway the same way the CLI does, through `OPENSHELL_GATEWAY_ENDPOINT`,
+`OPENSHELL_GATEWAY`, or the active gateway, and `cx.cli` runs the CLI named
+by `OPENSHELL_BIN`. See
+[tests/testkit/README.md](tests/testkit/README.md) for how to write and run
+tests.
 
 ### Python E2E (`e2e/python/`)
 

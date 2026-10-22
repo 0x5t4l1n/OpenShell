@@ -918,7 +918,7 @@ async fn apply_protocol1_middleware_chain<C: AsyncRead + AsyncWrite + Unpin + Se
         // unresolved binding is handled before the body is read) and forward
         // the original request unchanged if the chain allows.
         let input = middleware_request_input_with_id(
-            openshell_ocsf::ctx::ctx(),
+            &openshell_ocsf::ctx::ctx(),
             scheme,
             &req,
             ctx,
@@ -966,7 +966,7 @@ async fn apply_protocol1_middleware_chain<C: AsyncRead + AsyncWrite + Unpin + Se
     let headers = safe_middleware_headers(&buffered.headers)?;
     let query = raw_query_from_request_headers(&buffered.headers)?;
     let input = middleware_request_input_with_id(
-        openshell_ocsf::ctx::ctx(),
+        &openshell_ocsf::ctx::ctx(),
         scheme,
         &req,
         ctx,
