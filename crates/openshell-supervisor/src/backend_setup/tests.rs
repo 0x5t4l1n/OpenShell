@@ -950,31 +950,42 @@ async fn suspend_signal_exits_without_terminating_boundary() {
 
     let setup = TestSetup::new();
     let startup = || {
+        let config = crate::SandboxInstanceConfig {
+            command: vec!["test-agent".into(), "test-argument".into()],
+            workdir: Some("/test-workspace".into()),
+            timeout_secs: 15,
+            interactive: false,
+            await_main_process_attachment: false,
+            sandbox_id: Some(setup.sandbox_id.clone()),
+            sandbox: None,
+            container_image: String::new(),
+            openshell_endpoint: None,
+            policy_rules: Some(rules.to_string_lossy().into_owned()),
+            policy_data: Some(data.to_string_lossy().into_owned()),
+            ssh_socket_path: None,
+            shared_ssh_socket: false,
+            upstream_proxy_args: UpstreamProxyArgs::default(),
+            additional_ca_bundle: None,
+            backend_descriptor: TestSetup::descriptor(),
+            auth_bundle: setup.auth.clone(),
+            admitted_isolation_backend: Some(TEST_BACKEND.into()),
+            main_exit_marker: Some(marker.clone()),
+            trace_context: None,
+            provider_workload_api_socket: None,
+            // The binary loads the proxy trust directory from its environment.
+            proxy_tls: openshell_supervisor_network::run::ProxyTlsFiles::from_environment(),
+        };
+        let bindings = crate::SandboxInstanceBindings::dedicated(
+            &config,
+            openshell_core::grpc_client::GatewayCredentials::from_auth_bundle(&setup.auth).unwrap(),
+            openshell_ocsf::OcsfJsonSettings::default(),
+        );
         Box::pin(crate::run_sandbox_with_backend(
             &setup,
-            crate::SandboxRunConfig {
-                command: vec!["test-agent".into(), "test-argument".into()],
-                workdir: Some("/test-workspace".into()),
-                timeout_secs: 15,
-                interactive: false,
-                await_main_process_attachment: false,
-                sandbox_id: Some(setup.sandbox_id.clone()),
-                sandbox: None,
-                openshell_endpoint: None,
-                policy_rules: Some(rules.to_string_lossy().into_owned()),
-                policy_data: Some(data.to_string_lossy().into_owned()),
-                ssh_socket_path: None,
-                health_socket_path: Some(readiness.clone()),
-                health_port: None,
-                ocsf_enabled: Arc::new(AtomicBool::new(false)),
-                ocsf_schema_version: Arc::new(Mutex::new(String::new())),
-                upstream_proxy_args: UpstreamProxyArgs::default(),
-                additional_ca_bundle: None,
-                backend_descriptor: TestSetup::descriptor(),
-                auth_bundle: setup.auth.clone(),
-                admitted_isolation_backend: Some(TEST_BACKEND.into()),
-                main_exit_marker: Some(marker.clone()),
-            },
+            config,
+            bindings,
+            Some(readiness.clone()),
+            None,
         ))
     };
     let wait_ready = || async {
