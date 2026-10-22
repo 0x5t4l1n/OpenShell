@@ -16,7 +16,8 @@ use super::authenticator::{AuthRejection, Authentication, Authenticator, bearer_
 use super::principal::{Principal, SandboxIdentitySource, SandboxPrincipal};
 use async_trait::async_trait;
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
-use jsonwebtoken::{Algorithm, EncodingKey, Header, decode_header, encode};
+use jsonwebtoken::{Algorithm, EncodingKey, Header, decode_header};
+use openshell_crypto::jwt::encode;
 pub use openshell_extension_core::{
     EXTENSION_JWT_TYP, ExtensionAudience, ExtensionCallerKind, ExtensionJwtClaims,
     MAX_EXTENSION_TOKEN_TTL,
@@ -40,6 +41,10 @@ use openshell_core::jwt::{
     SystemJwtClock,
 };
 use openshell_core::sandbox_generation::SandboxGenerationId;
+
+/// The method on which a sandbox renews its gateway JWT, and the only one that
+/// accepts a just-consumed bearer.
+pub const REFRESH_SANDBOX_TOKEN_PATH: &str = "/openshell.v1.OpenShell/RefreshSandboxToken";
 
 /// SPIFFE-shaped subject prefix. Embedded in the `sub` claim of every
 /// minted token so a future migration to per-sandbox certs or SPIRE can
@@ -163,7 +168,9 @@ impl SandboxSessionJwtAuthority {
         let token_metadata = identity
             .refresh_replay
             .as_ref()
-            .map(|replay| (replay.sandbox_token_id(), replay.issued_at));
+            .map(|replay| replay.sandbox_token_id().map(|id| (id, replay.issued_at)))
+            .transpose()
+            .map_err(|error| Status::internal(error.to_string()))?;
         self.mint_launch_with_metadata(
             sandbox_id,
             identity.runtime_generation.clone(),
@@ -315,7 +322,7 @@ impl Authenticator for SandboxSessionJwtAuthenticator {
         // Refresh performs its own lineage check so the immediately consumed
         // bearer can recover an already-committed successor after a lost
         // response. Every other RPC accepts only the current bearer.
-        if path != "/openshell.v1.OpenShell/RefreshSandboxToken" {
+        if path != REFRESH_SANDBOX_TOKEN_PATH {
             crate::auth::sandbox_session::authorize_persisted(&self.store, &authenticated).await?;
         }
         Ok(Authentication::Accepted(Principal::Sandbox(
