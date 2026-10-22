@@ -140,6 +140,11 @@ by `OPENSHELL_BIN`. See
 [tests/testkit/README.md](tests/testkit/README.md) for how to write and run
 tests.
 
+The `testkit-e2e` job in Branch E2E (`test:e2e` label) runs the suites under
+`tests/suites/sandbox` against a Docker-backed gateway with
+`mise run e2e:testkit`. The same task works locally. It isn't part of the Core
+E2E result yet.
+
 ### Python E2E (`e2e/python/`)
 
 `mise run e2e:python` builds `openshell/e2e-python:dev` from

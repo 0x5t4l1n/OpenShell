@@ -315,6 +315,22 @@ jobs:
       image-tag: ${{ github.sha }}
       runner: linux-arm64-cpu8
 
+  # Run suites written on testkit (tests/testkit) against a Docker-backed
+  # gateway. Not part of the Core E2E result yet.
+  testkit-e2e:
+    needs: [pr_metadata, build-binaries, build-images]
+    if: needs.pr_metadata.outputs.should_run == 'true' && needs.pr_metadata.outputs.run_core_e2e == 'true'
+    permissions:
+      actions: read
+      contents: read
+      packages: read
+    uses: ./.github/workflows/e2e-docker-test.yml
+    with:
+      image-tag: ${{ github.sha }}
+      runner: linux-arm64-cpu8
+      suite-matrix: >-
+        [{"suite":"testkit","cmd":"mise run --no-deps --skip-deps e2e:testkit","apt_packages":"openssh-client","python_proto":false,"mcp":false}]
+
   podman-e2e:
     needs: [pr_metadata, build-binaries, build-images]
     if: needs.pr_metadata.outputs.should_run == 'true' && needs.pr_metadata.outputs.run_core_e2e == 'true'

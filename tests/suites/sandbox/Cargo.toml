@@ -1,0 +1,8 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# End-to-end suites for sandbox behavior, written on testkit. Each member is
+# one suite crate; tests run against whatever gateway the environment registers.
+[workspace]
+resolver = "2"
+members = ["lifecycle"]

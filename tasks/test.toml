@@ -152,6 +152,10 @@ hide = true
 description = "Run Rust CLI e2e tests against a Docker-backed gateway"
 run = "e2e/rust/e2e-docker.sh"
 
+["e2e:testkit"]
+description = "Run the testkit suites against a Docker-backed gateway"
+run = "e2e/with-docker-gateway.sh cargo test --locked --manifest-path tests/suites/sandbox/Cargo.toml --workspace -- --test-threads 1 --nocapture"
+
 ["e2e:oci-image"]
 description = "Run the shared OCI image feature suite against a Docker-backed gateway"
 run = "OPENSHELL_TEST_CONTAINER_ENGINE=docker e2e/with-docker-gateway.sh cargo test --locked --manifest-path tests/suites/features/Cargo.toml -p openshell-test-feature-oci-image -- --test-threads 1 --nocapture"
