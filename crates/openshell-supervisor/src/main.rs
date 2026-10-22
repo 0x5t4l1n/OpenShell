@@ -64,9 +64,24 @@ struct Args {
     #[arg(long, required_if_eq("mode", "shared"))]
     gateway_endpoint: Option<String>,
 
-    /// Shared supervisor listen address, also used for TCP health probes.
+    /// Shared supervisor TCP health listener: it accepts and closes probe
+    /// connections and carries no control traffic.
     #[arg(long, required_if_eq("mode", "shared"))]
     address: Option<std::net::SocketAddr>,
+
+    /// File holding the supervisor token the gateway issues for the shared
+    /// supervisor's assignment stream. Re-read on every connection attempt,
+    /// so a renewed token takes effect without a restart.
+    #[arg(long, required_if_eq("mode", "shared"))]
+    token_file: Option<PathBuf>,
+
+    /// Listener for routed runtime-initiated Sandbox Protocol connections.
+    #[arg(long, required_if_eq("mode", "shared"))]
+    runtime_listen: Option<std::net::SocketAddr>,
+
+    /// Private directory for shared-host sandbox instance files.
+    #[arg(long, required_if_eq("mode", "shared"))]
+    session_root: Option<PathBuf>,
 
     /// Supervisor responsibility to run.
     #[arg(long, value_enum, default_value_t)]
@@ -389,18 +404,16 @@ fn main() -> Result<()> {
 
     let args = Args::parse();
     if args.mode == SupervisorMode::Shared {
-        let address = args
-            .address
-            .ok_or_else(|| miette::miette!("--address is required for --mode=shared"))?;
-        let gateway_endpoint = args
-            .gateway_endpoint
-            .as_deref()
-            .ok_or_else(|| miette::miette!("--gateway-endpoint is required for --mode=shared"))?;
-        return shared::run(address, gateway_endpoint);
+        return shared::run(args);
     }
-    if args.gateway_endpoint.is_some() || args.address.is_some() {
+    if args.gateway_endpoint.is_some()
+        || args.address.is_some()
+        || args.token_file.is_some()
+        || args.runtime_listen.is_some()
+        || args.session_root.is_some()
+    {
         return Err(miette::miette!(
-            "--gateway-endpoint and --address require --mode=shared"
+            "shared supervisor options require --mode=shared"
         ));
     }
     validate_role_arguments(&args)?;
@@ -576,7 +589,7 @@ fn main() -> Result<()> {
                     auth_bundle,
                     admitted_isolation_backend: Some(admitted_backend),
                     main_exit_marker: args.main_exit_marker,
-                    trace_context: openshell_supervisor::TraceContext::from_environment(),
+                    trace_context: openshell_supervisor::trace_context_from_environment(),
                     provider_workload_api_socket: std::env::var_os(
                         openshell_core::sandbox_env::PROVIDER_SPIFFE_WORKLOAD_API_SOCKET,
                     )

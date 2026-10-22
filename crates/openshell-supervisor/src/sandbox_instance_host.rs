@@ -19,14 +19,16 @@
 
 use std::collections::HashMap;
 use std::future::Future;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
-use miette::Result;
+use miette::{IntoDiagnostic as _, Result, WrapErr as _};
 use openshell_core::grpc_client::GatewayCredentials;
 use openshell_ocsf::OcsfJsonSettings;
+use openshell_supervisor_control::{SandboxInstancePhaseReport, SandboxInstanceStatusReport};
 use openshell_supervisor_network::policy_local::{DenialLogSource, SandboxInstanceDenialLog};
 use openshell_supervisor_process::log_push::LogSink;
 use tokio::sync::watch;
@@ -90,36 +92,6 @@ impl std::io::Write for SandboxInstanceDenialWriter {
     }
 }
 
-/// Observable lifecycle of one hosted sandbox instance.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum SandboxInstancePhase {
-    /// Startup has not yet produced an accepted gateway session.
-    Starting,
-    /// The workload started and the gateway accepted supervision at least once.
-    Supervising,
-    /// The owner asked the instance to stop.
-    Stopping,
-    /// Supervision ended with the workload's exit status.
-    Exited(i32),
-    /// Startup or supervision failed; the workload is no longer supervised.
-    Failed(String),
-}
-
-impl SandboxInstancePhase {
-    #[must_use]
-    pub fn is_terminal(&self) -> bool {
-        matches!(self, Self::Exited(_) | Self::Failed(_))
-    }
-}
-
-/// Current state of one hosted sandbox instance.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct SandboxInstanceStatus {
-    pub phase: SandboxInstancePhase,
-    /// Gateway supervision is currently accepted for this instance.
-    pub ready: bool,
-}
-
 /// Body of a hosted sandbox instance, constructed on its own runtime.
 pub type SandboxInstanceBody = Box<
     dyn FnOnce(SandboxInstanceControls) -> Pin<Box<dyn Future<Output = Result<i32>>>>
@@ -127,41 +99,84 @@ pub type SandboxInstanceBody = Box<
         + 'static,
 >;
 
-/// The hosted sandbox instance registration was rejected.
+/// Trusted identity of one sandbox instance asking to be hosted.
+pub struct SandboxInstanceAdmission {
+    /// Unique key for this generation within the host. It also names the
+    /// instance's private directory, so it must be one path component.
+    pub key: String,
+    /// Digest of the launch material. Admitting the same digest under an
+    /// occupied key again is idempotent.
+    pub fingerprint: [u8; 32],
+    pub sandbox_id: String,
+}
+
+/// Outcome of an accepted admission.
+#[derive(Debug, PartialEq, Eq)]
+pub enum SandboxInstanceAdmitted {
+    Created,
+    /// The identical admission is already hosted.
+    Unchanged,
+}
+
+/// The hosted sandbox instance admission was rejected.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum SandboxInstanceHostError {
-    #[error("a sandbox instance with this key is already hosted")]
-    Duplicate,
+    #[error("sandbox instance key must be a single path component")]
+    InvalidKey,
+    #[error("key is already hosted with different launch material")]
+    Conflict,
+    #[error("key is still being removed")]
+    Removing,
+    #[error("prepare sandbox instance files: {0}")]
+    Files(String),
     #[error("start sandbox instance thread: {0}")]
     Thread(String),
 }
 
+/// Final status of one removal, shared by every remover.
+type RemovalReport = watch::Receiver<Option<SandboxInstanceStatusReport>>;
+
 struct HostedSandboxInstance {
     /// Distinguishes this instance from a later one that reuses its key.
     serial: u64,
+    fingerprint: [u8; 32],
+    sandbox_id: String,
     stop: watch::Sender<bool>,
     abort: watch::Sender<bool>,
-    phase: watch::Receiver<SandboxInstancePhase>,
+    phase: watch::Receiver<SandboxInstancePhaseReport>,
     ready: watch::Receiver<bool>,
     thread: Option<std::thread::JoinHandle<()>>,
-    /// Final status of the removal in progress, shared by every remover.
-    removal: Option<watch::Receiver<Option<SandboxInstanceStatus>>>,
+    /// The removal in progress, or the report of one that could not delete
+    /// the instance's private files and so kept its key.
+    removal: Option<RemovalReport>,
 }
 
 impl HostedSandboxInstance {
-    fn status(&self) -> SandboxInstanceStatus {
+    /// Status of the instance hosted under `key`, which is its route.
+    fn status(&self, key: &str) -> SandboxInstanceStatusReport {
+        if let Some(reported) = self
+            .removal
+            .as_ref()
+            .and_then(|report| report.borrow().clone())
+        {
+            return reported;
+        }
         let phase = self.phase.borrow().clone();
         // The runner always reports a terminal phase, even while unwinding;
         // a closed channel without one still means supervision has ended.
         if !phase.is_terminal() && self.phase.has_changed().is_err() {
-            return SandboxInstanceStatus {
-                phase: SandboxInstancePhase::Failed(
-                    "sandbox instance thread ended unexpectedly".to_string(),
-                ),
+            return SandboxInstanceStatusReport {
+                route: key.to_string(),
+                sandbox_id: self.sandbox_id.clone(),
+                phase: SandboxInstancePhaseReport::Failed {
+                    error: "sandbox instance thread ended unexpectedly".to_string(),
+                },
                 ready: false,
             };
         }
-        SandboxInstanceStatus {
+        SandboxInstanceStatusReport {
+            route: key.to_string(),
+            sandbox_id: self.sandbox_id.clone(),
             phase,
             ready: *self.ready.borrow(),
         }
@@ -170,127 +185,199 @@ impl HostedSandboxInstance {
 
 type Instances = Arc<Mutex<HashMap<String, HostedSandboxInstance>>>;
 
+/// Wakes observers of the registry whenever any instance's status changes.
+#[derive(Clone)]
+struct ChangeNotifier(Arc<watch::Sender<u64>>);
+
+impl ChangeNotifier {
+    fn notify(&self) {
+        self.0.send_modify(|changes| *changes += 1);
+    }
+}
+
 fn lock(instances: &Instances) -> MutexGuard<'_, HashMap<String, HostedSandboxInstance>> {
     instances
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
-/// Runs and stops sandbox instances, each on its own bound runtime.
-#[derive(Default)]
+/// The one registry of hosted sandbox instances.
+///
+/// Each entry owns its admission fingerprint and sandbox identity, its
+/// runtime thread, phase, and stop signals, and a private directory under the
+/// host root. Everything else an instance owns, including its gateway
+/// credentials and runtime route, lives on its runtime and ends with it. A
+/// key stays reserved from admission until one removal has stopped the
+/// runtime, revoked its credentials, and deleted its private directory.
 pub struct SandboxInstanceHost {
     instances: Instances,
     next_serial: AtomicU64,
+    root: PathBuf,
+    changes: ChangeNotifier,
 }
 
 impl SandboxInstanceHost {
-    #[must_use]
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Start `body` on a new runtime bound to `bindings`.
-    ///
-    /// The bindings' gateway credentials are revoked once the instance's
-    /// runtime has stopped, so nothing can reuse them after the instance ends.
+    /// Host instances whose private directories live under `root`.
     ///
     /// # Errors
     ///
-    /// Returns [`SandboxInstanceHostError::Duplicate`] when `key` is already hosted,
-    /// including an instance that ended but has not been removed.
-    pub fn start(
+    /// Fails when `root` cannot be prepared as a private directory.
+    pub fn new(root: PathBuf) -> Result<Self> {
+        prepare_private_dir(&root)?;
+        Ok(Self {
+            instances: Arc::default(),
+            next_serial: AtomicU64::new(0),
+            root,
+            changes: ChangeNotifier(Arc::new(watch::Sender::new(0))),
+        })
+    }
+
+    /// Notified whenever an instance is admitted, changes phase or readiness,
+    /// or is removed. The value only counts changes.
+    #[must_use]
+    pub fn changes(&self) -> watch::Receiver<u64> {
+        self.changes.0.subscribe()
+    }
+
+    /// Admit a sandbox instance and start the runtime `launch` prepares in
+    /// the instance's new, empty private directory.
+    ///
+    /// The bindings' gateway credentials are revoked once the instance's
+    /// runtime has stopped, so nothing can reuse them after the instance ends.
+    /// `launch` runs while the registry is locked, so concurrent admissions
+    /// of one key cannot both start; it must not call back into the host.
+    ///
+    /// # Errors
+    ///
+    /// Rejects an occupied key with different launch material or one still
+    /// being removed, and fails when the instance cannot be prepared or
+    /// started. A failed admission leaves no instance and no private files.
+    pub fn admit<E: From<SandboxInstanceHostError>>(
         &self,
-        key: &str,
-        bindings: SandboxInstanceBindings,
-        body: SandboxInstanceBody,
-    ) -> std::result::Result<(), SandboxInstanceHostError> {
-        let mut instances = lock(&self.instances);
-        if instances.contains_key(key) {
-            return Err(SandboxInstanceHostError::Duplicate);
+        admission: SandboxInstanceAdmission,
+        launch: impl FnOnce(
+            &Path,
+        )
+            -> std::result::Result<(SandboxInstanceBindings, SandboxInstanceBody), E>,
+    ) -> std::result::Result<SandboxInstanceAdmitted, E> {
+        let SandboxInstanceAdmission {
+            key,
+            fingerprint,
+            sandbox_id,
+        } = admission;
+        if !matches!(
+            Path::new(&key).components().collect::<Vec<_>>().as_slice(),
+            [std::path::Component::Normal(name)] if *name == key.as_str()
+        ) {
+            return Err(SandboxInstanceHostError::InvalidKey.into());
         }
-        let (stop, stop_requested) = watch::channel(false);
-        let (abort, abort_requested) = watch::channel(false);
-        let (phase_tx, phase) = watch::channel(SandboxInstancePhase::Starting);
-        let (ready_tx, ready) = watch::channel(false);
-        let thread = std::thread::Builder::new()
-            .name("openshell-instance".to_string())
-            .spawn(move || {
-                run_hosted_sandbox_instance(
-                    &bindings,
-                    body,
-                    SandboxInstanceSignals {
-                        stop_requested,
-                        abort_requested,
-                        phase: phase_tx,
-                        ready: ready_tx,
-                    },
-                );
-            })
-            .map_err(|error| SandboxInstanceHostError::Thread(error.to_string()))?;
+        let mut instances = lock(&self.instances);
+        if let Some(existing) = instances.get(&key) {
+            return if existing.removal.is_some() {
+                Err(SandboxInstanceHostError::Removing.into())
+            } else if existing.fingerprint == fingerprint {
+                Ok(SandboxInstanceAdmitted::Unchanged)
+            } else {
+                Err(SandboxInstanceHostError::Conflict.into())
+            };
+        }
+        let dir = self.root.join(&key);
+        let started = prepare_instance_dir(&dir)
+            .map_err(|error| E::from(SandboxInstanceHostError::Files(error.to_string())))
+            .and_then(|()| launch(&dir))
+            .and_then(|(bindings, body)| {
+                spawn_instance(bindings, body, self.changes.clone()).map_err(E::from)
+            });
+        let running = match started {
+            Ok(running) => running,
+            Err(error) => {
+                let _ = remove_instance_dir(&dir);
+                return Err(error);
+            }
+        };
         instances.insert(
-            key.to_string(),
+            key,
             HostedSandboxInstance {
                 serial: self.next_serial.fetch_add(1, Ordering::Relaxed),
-                stop,
-                abort,
-                phase,
-                ready,
-                thread: Some(thread),
+                fingerprint,
+                sandbox_id,
+                stop: running.stop,
+                abort: running.abort,
+                phase: running.phase,
+                ready: running.ready,
+                thread: Some(running.thread),
                 removal: None,
             },
         );
-        Ok(())
+        self.changes.notify();
+        Ok(SandboxInstanceAdmitted::Created)
     }
 
     /// Status of a hosted sandbox instance, including one that ended but has
-    /// not been removed.
+    /// not been removed. The report's route is the instance's key.
     #[must_use]
-    pub fn status(&self, key: &str) -> Option<SandboxInstanceStatus> {
+    pub fn status(&self, key: &str) -> Option<SandboxInstanceStatusReport> {
         lock(&self.instances)
             .get(key)
-            .map(HostedSandboxInstance::status)
+            .map(|instance| instance.status(key))
     }
 
-    /// Keys of every hosted sandbox instance.
+    /// Status of every hosted sandbox instance.
     #[must_use]
-    pub fn keys(&self) -> Vec<String> {
-        lock(&self.instances).keys().cloned().collect()
+    pub fn list(&self) -> Vec<SandboxInstanceStatusReport> {
+        lock(&self.instances)
+            .iter()
+            .map(|(key, instance)| instance.status(key))
+            .collect()
     }
 
-    /// Stop one sandbox instance and forget it. Other instances keep running.
+    /// Stop one sandbox instance, delete its private files, and forget it.
+    /// Other instances keep running.
     ///
     /// A supervising instance terminates its workload gracefully within
     /// `grace`; one still starting is cancelled at once, because startup has
     /// no safe intermediate state to wind down. Removal runs on its own task,
     /// so it completes even when the caller stops waiting, and concurrent
-    /// callers share it and its result. The key stays registered until the
-    /// instance's thread has finished, so the same key cannot start a second
-    /// owner while this one is stopping. Returns the final status, or `None`
-    /// when `key` is not hosted.
-    pub async fn remove(&self, key: &str, grace: Duration) -> Option<SandboxInstanceStatus> {
-        let (mut removed, phase) = self.begin_removal(key, grace)?;
+    /// callers share it and its result. The key stays reserved until the
+    /// instance's thread has finished and its private directory is gone; if
+    /// the directory cannot be deleted, the key stays reserved and the next
+    /// removal tries again. Returns the final status, or `None` when `key` is
+    /// not hosted.
+    pub async fn remove(&self, key: &str, grace: Duration) -> Option<SandboxInstanceStatusReport> {
+        let (mut removed, sandbox_id) = self.begin_removal(key, grace)?;
         // The removal task ends without a report only with its runtime.
-        removed
+        let reported = removed
             .wait_for(Option::is_some)
             .await
-            .map_or_else(|_| Some(terminal_status(&phase)), |status| status.clone())
+            .ok()
+            .and_then(|status| status.clone());
+        Some(reported.unwrap_or_else(|| SandboxInstanceStatusReport {
+            route: key.to_string(),
+            sandbox_id,
+            phase: SandboxInstancePhaseReport::Failed {
+                error: "sandbox instance removal did not finish".to_string(),
+            },
+            ready: false,
+        }))
     }
 
-    fn begin_removal(
-        &self,
-        key: &str,
-        grace: Duration,
-    ) -> Option<(
-        watch::Receiver<Option<SandboxInstanceStatus>>,
-        watch::Receiver<SandboxInstancePhase>,
-    )> {
+    /// Stop every sandbox instance, for process shutdown.
+    pub async fn remove_all(&self, grace: Duration) {
+        let keys = lock(&self.instances).keys().cloned().collect::<Vec<_>>();
+        futures::future::join_all(keys.iter().map(|key| self.remove(key, grace))).await;
+    }
+
+    fn begin_removal(&self, key: &str, grace: Duration) -> Option<(RemovalReport, String)> {
         let mut instances = lock(&self.instances);
         let instance = instances.get_mut(key)?;
-        if let Some(removed) = &instance.removal {
-            return Some((removed.clone(), instance.phase.clone()));
+        // Join a removal in progress; retry one that kept the key.
+        if let Some(removed) = &instance.removal
+            && removed.borrow().is_none()
+        {
+            return Some((removed.clone(), instance.sandbox_id.clone()));
         }
         instance.stop.send_replace(true);
-        if *instance.phase.borrow() == SandboxInstancePhase::Starting {
+        if *instance.phase.borrow() == SandboxInstancePhaseReport::Starting {
             instance.abort.send_replace(true);
         }
         let (report, removed) = watch::channel(None);
@@ -302,19 +389,15 @@ impl SandboxInstanceHost {
                 serial: instance.serial,
                 phase: instance.phase.clone(),
                 thread: instance.thread.take(),
+                dir: self.root.join(key),
                 grace,
                 report,
+                changes: self.changes.clone(),
             }
             .run(),
         );
-        Some((removed, instance.phase.clone()))
-    }
-}
-
-fn terminal_status(phase: &watch::Receiver<SandboxInstancePhase>) -> SandboxInstanceStatus {
-    SandboxInstanceStatus {
-        phase: phase.borrow().clone(),
-        ready: false,
+        self.changes.notify();
+        Some((removed, instance.sandbox_id.clone()))
     }
 }
 
@@ -323,17 +406,19 @@ struct Removal {
     instances: Instances,
     key: String,
     serial: u64,
-    phase: watch::Receiver<SandboxInstancePhase>,
+    phase: watch::Receiver<SandboxInstancePhaseReport>,
     thread: Option<std::thread::JoinHandle<()>>,
+    dir: PathBuf,
     grace: Duration,
-    report: watch::Sender<Option<SandboxInstanceStatus>>,
+    report: watch::Sender<Option<SandboxInstanceStatusReport>>,
+    changes: ChangeNotifier,
 }
 
 impl Removal {
     async fn run(mut self) {
         let finished = tokio::time::timeout(
             self.grace,
-            self.phase.wait_for(SandboxInstancePhase::is_terminal),
+            self.phase.wait_for(SandboxInstancePhaseReport::is_terminal),
         )
         .await
         .is_ok();
@@ -344,50 +429,120 @@ impl Removal {
         {
             instance.abort.send_replace(true);
         }
+        // Once the thread ends, the runtime, its route, and every task are
+        // gone and the credentials are revoked.
         if let Some(thread) = self.thread.take() {
             let _ = tokio::task::spawn_blocking(move || thread.join()).await;
         }
-        let removed = {
-            let mut instances = lock(&self.instances);
-            match instances.get(&self.key) {
-                Some(instance) if instance.serial == self.serial => instances.remove(&self.key),
-                _ => None,
-            }
+        let dir = self.dir.clone();
+        let cleanup = match tokio::task::spawn_blocking(move || remove_instance_dir(&dir)).await {
+            Ok(result) => result.map_err(|error| error.to_string()),
+            Err(error) => Err(error.to_string()),
         };
-        let status = removed.map_or_else(
-            || terminal_status(&self.phase),
-            |instance| instance.status(),
-        );
+        let mut instances = lock(&self.instances);
+        let Some(instance) = instances
+            .get(&self.key)
+            .filter(|instance| instance.serial == self.serial)
+        else {
+            return;
+        };
+        let mut status = instance.status(&self.key);
+        status.ready = false;
+        match cleanup {
+            Ok(()) => {
+                instances.remove(&self.key);
+            }
+            Err(error) => {
+                tracing::warn!(%error, "could not delete removed sandbox instance files; keeping its key reserved");
+                status.phase = SandboxInstancePhaseReport::Failed {
+                    error: format!(
+                        "sandbox instance stopped, but its private files remain: {error}"
+                    ),
+                };
+            }
+        }
         self.report.send_replace(Some(status));
+        self.changes.notify();
     }
+}
+
+/// Signals and thread of one started instance runtime.
+struct RunningInstance {
+    stop: watch::Sender<bool>,
+    abort: watch::Sender<bool>,
+    phase: watch::Receiver<SandboxInstancePhaseReport>,
+    ready: watch::Receiver<bool>,
+    thread: std::thread::JoinHandle<()>,
+}
+
+fn spawn_instance(
+    bindings: SandboxInstanceBindings,
+    body: SandboxInstanceBody,
+    changes: ChangeNotifier,
+) -> std::result::Result<RunningInstance, SandboxInstanceHostError> {
+    let (stop, stop_requested) = watch::channel(false);
+    let (abort, abort_requested) = watch::channel(false);
+    let (phase_tx, phase) = watch::channel(SandboxInstancePhaseReport::Starting);
+    let (ready_tx, ready) = watch::channel(false);
+    let credentials = bindings.gateway_credentials.clone();
+    let thread = std::thread::Builder::new()
+        .name("openshell-instance".to_string())
+        .spawn(move || {
+            run_hosted_sandbox_instance(
+                &bindings,
+                body,
+                SandboxInstanceSignals {
+                    stop_requested,
+                    abort_requested,
+                    phase: phase_tx,
+                    ready: ready_tx,
+                    changes,
+                },
+            );
+        })
+        .map_err(|error| {
+            credentials.revoke();
+            SandboxInstanceHostError::Thread(error.to_string())
+        })?;
+    Ok(RunningInstance {
+        stop,
+        abort,
+        phase,
+        ready,
+        thread,
+    })
 }
 
 struct SandboxInstanceSignals {
     stop_requested: watch::Receiver<bool>,
     abort_requested: watch::Receiver<bool>,
-    phase: watch::Sender<SandboxInstancePhase>,
+    phase: watch::Sender<SandboxInstancePhaseReport>,
     ready: watch::Sender<bool>,
+    changes: ChangeNotifier,
 }
 
 /// Reports a hosted sandbox instance's end and revokes its credentials,
 /// including when the instance thread unwinds.
 struct SandboxInstanceExit {
     credentials: GatewayCredentials,
-    phase: watch::Sender<SandboxInstancePhase>,
+    phase: watch::Sender<SandboxInstancePhaseReport>,
     ready: watch::Sender<bool>,
-    outcome: Option<SandboxInstancePhase>,
+    outcome: Option<SandboxInstancePhaseReport>,
+    changes: ChangeNotifier,
 }
 
 impl Drop for SandboxInstanceExit {
     fn drop(&mut self) {
         self.credentials.revoke();
         self.ready.send_replace(false);
-        let outcome = self.outcome.take().unwrap_or_else(|| {
-            SandboxInstancePhase::Failed(
-                "sandbox instance thread ended without reporting a result".to_string(),
-            )
-        });
+        let outcome = self
+            .outcome
+            .take()
+            .unwrap_or_else(|| SandboxInstancePhaseReport::Failed {
+                error: "sandbox instance thread ended without reporting a result".to_string(),
+            });
         self.phase.send_replace(outcome);
+        self.changes.notify();
         unbind_thread();
     }
 }
@@ -402,12 +557,14 @@ fn run_hosted_sandbox_instance(
         mut abort_requested,
         phase,
         ready,
+        changes,
     } = signals;
     let mut exit = SandboxInstanceExit {
         credentials: bindings.gateway_credentials.clone(),
         phase: phase.clone(),
         ready: ready.clone(),
         outcome: None,
+        changes: changes.clone(),
     };
     bind_thread(bindings);
     let thread_bindings = bindings.clone();
@@ -425,30 +582,38 @@ fn run_hosted_sandbox_instance(
                     let (readiness, mut accepted) = watch::channel(false);
                     let mirror_phase = phase.clone();
                     let mirror_ready = ready.clone();
+                    let mirror_changes = changes.clone();
                     let mirror = tokio::spawn(async move {
                         loop {
                             let is_ready = *accepted.borrow_and_update();
-                            mirror_ready.send_replace(is_ready);
-                            if is_ready {
-                                mirror_phase.send_if_modified(|current| {
-                                    let promote = *current == SandboxInstancePhase::Starting;
+                            let changed = mirror_ready.send_replace(is_ready) != is_ready;
+                            let promoted = is_ready
+                                && mirror_phase.send_if_modified(|current| {
+                                    let promote =
+                                        *current == SandboxInstancePhaseReport::Starting;
                                     if promote {
-                                        *current = SandboxInstancePhase::Supervising;
+                                        *current = SandboxInstancePhaseReport::Supervising;
                                     }
                                     promote
                                 });
+                            if changed || promoted {
+                                mirror_changes.notify();
                             }
                             if accepted.changed().await.is_err() {
-                                mirror_ready.send_replace(false);
+                                if mirror_ready.send_replace(false) {
+                                    mirror_changes.notify();
+                                }
                                 return;
                             }
                         }
                     });
                     let mut stop = stop_requested.clone();
                     let stop_phase = phase.clone();
+                    let stop_changes = changes.clone();
                     let shutdown = Box::pin(async move {
                         let _ = stop.wait_for(|requested| *requested).await;
-                        stop_phase.send_replace(SandboxInstancePhase::Stopping);
+                        stop_phase.send_replace(SandboxInstancePhaseReport::Stopping);
+                        stop_changes.notify();
                     });
                     let instance = body(SandboxInstanceControls {
                         shutdown,
@@ -470,85 +635,114 @@ fn run_hosted_sandbox_instance(
         Err(error) => Err(miette::miette!("build sandbox instance runtime: {error}")),
     };
     exit.outcome = Some(match outcome {
-        Ok(code) => SandboxInstancePhase::Exited(code),
-        Err(error) => SandboxInstancePhase::Failed(error.to_string()),
+        Ok(exit_code) => SandboxInstancePhaseReport::Exited { exit_code },
+        Err(error) => SandboxInstancePhaseReport::Failed {
+            error: error.to_string(),
+        },
     });
 }
 
-/// Trusted inputs for one sandbox instance hosted with others.
-pub struct SandboxInstanceSpec {
-    /// Unique key for this generation within the host.
-    pub key: String,
-    pub backend_setup: Box<dyn crate::backend_setup::BackendSetup + Send>,
-    pub config: crate::SandboxInstanceConfig,
+/// Prepare a hosted sandbox instance of `config` whose private files live in
+/// `dir`: bindings with its own gateway credentials, log push stream, and
+/// denial log, and a body that supervises it.
+///
+/// # Errors
+///
+/// Fails when the launch credentials are invalid.
+pub fn sandbox_instance_launch(
+    backend_setup: Box<dyn crate::backend_setup::BackendSetup + Send>,
+    mut config: crate::SandboxInstanceConfig,
+    dir: &Path,
+) -> Result<(SandboxInstanceBindings, SandboxInstanceBody)> {
+    // Instances must never share proxy trust files.
+    config
+        .proxy_tls
+        .directory
+        .get_or_insert_with(|| dir.to_path_buf());
+    // Log push, supervision, and renewal share these credentials.
+    let gateway_credentials = GatewayCredentials::from_auth_bundle(&config.auth_bundle)?;
+    let log_push = config
+        .sandbox_id
+        .clone()
+        .zip(config.openshell_endpoint.as_deref().map(|endpoint| {
+            openshell_core::grpc_client::GatewayEndpoint::new(endpoint, gateway_credentials.clone())
+        }));
+    let (log_tx, log_rx) =
+        tokio::sync::mpsc::channel(openshell_supervisor_process::log_push::LOG_PUSH_QUEUE_LINES);
+    let bindings = SandboxInstanceBindings {
+        gateway_credentials,
+        event_context: Arc::new(config.event_context()),
+        ocsf_json: OcsfJsonSettings::default(),
+        log_sink: log_push
+            .as_ref()
+            .map(|(sandbox_id, _)| LogSink::new(sandbox_id.as_str(), log_tx)),
+        denial_log: DenialLogSource::SandboxInstance(SandboxInstanceDenialLog::default()),
+    };
+    let instance_bindings = bindings.clone();
+    let body: SandboxInstanceBody = Box::new(move |controls| {
+        Box::pin(async move {
+            let _log_push = log_push.map(|(sandbox_id, gateway)| {
+                openshell_supervisor_process::log_push::start_log_push(gateway, sandbox_id, log_rx)
+            });
+            Box::pin(crate::run_sandbox_instance(
+                backend_setup.as_ref(),
+                config,
+                instance_bindings,
+                controls,
+            ))
+            .await
+        })
+    });
+    Ok((bindings, body))
 }
 
-impl SandboxInstanceHost {
-    /// Start a sandbox instance with its own OCSF identity, OCSF JSON
-    /// settings, log push stream, denial log, and gateway credentials.
-    ///
-    /// # Errors
-    ///
-    /// Fails when the launch credentials are invalid or the key is hosted.
-    pub fn start_sandbox_instance(&self, spec: SandboxInstanceSpec) -> Result<()> {
-        let SandboxInstanceSpec {
-            key,
-            backend_setup,
-            mut config,
-        } = spec;
-        // Instances must never share proxy trust files; give one a private
-        // directory that lives exactly as long as the instance.
-        let private_tls_dir = if config.proxy_tls.directory.is_none() {
-            let prepared = crate::prepare_network_proxy_tls_dir(None)?;
-            config.proxy_tls.directory = Some(prepared.path.clone());
-            Some(prepared)
-        } else {
-            None
-        };
-        // Log push, supervision, and renewal share these credentials.
-        let gateway_credentials = GatewayCredentials::from_auth_bundle(&config.auth_bundle)?;
-        let log_push = config
-            .sandbox_id
-            .clone()
-            .zip(config.openshell_endpoint.as_deref().map(|endpoint| {
-                openshell_core::grpc_client::GatewayEndpoint::new(
-                    endpoint,
-                    gateway_credentials.clone(),
-                )
-            }));
-        let (log_tx, log_rx) = tokio::sync::mpsc::channel(
-            openshell_supervisor_process::log_push::LOG_PUSH_QUEUE_LINES,
-        );
-        let bindings = SandboxInstanceBindings {
-            gateway_credentials,
-            event_context: Arc::new(config.event_context()),
-            ocsf_json: OcsfJsonSettings::default(),
-            log_sink: log_push
-                .as_ref()
-                .map(|(sandbox_id, _)| LogSink::new(sandbox_id.as_str(), log_tx)),
-            denial_log: DenialLogSource::SandboxInstance(SandboxInstanceDenialLog::default()),
-        };
-        let instance_bindings = bindings.clone();
-        let body: SandboxInstanceBody = Box::new(move |controls| {
-            Box::pin(async move {
-                let _private_tls_dir = private_tls_dir;
-                let _log_push = log_push.map(|(sandbox_id, gateway)| {
-                    openshell_supervisor_process::log_push::start_log_push(
-                        gateway, sandbox_id, log_rx,
-                    )
-                });
-                Box::pin(crate::run_sandbox_instance(
-                    backend_setup.as_ref(),
-                    config,
-                    instance_bindings,
-                    controls,
-                ))
-                .await
-            })
-        });
-        self.start(&key, bindings, body)
-            .map_err(|error| miette::miette!("{error}"))
+/// Create `dir` as an empty private directory, replacing files a previous
+/// process left behind.
+fn prepare_instance_dir(dir: &Path) -> Result<()> {
+    remove_instance_dir(dir)
+        .into_diagnostic()
+        .wrap_err_with(|| format!("delete stale sandbox instance files {}", dir.display()))?;
+    prepare_private_dir(dir)
+}
+
+fn remove_instance_dir(dir: &Path) -> std::io::Result<()> {
+    match std::fs::remove_dir_all(dir) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        result => result,
     }
+}
+
+#[cfg(unix)]
+pub(crate) fn prepare_private_dir(path: &Path) -> Result<()> {
+    use std::os::unix::fs::{DirBuilderExt as _, PermissionsExt as _};
+
+    match std::fs::DirBuilder::new().mode(0o700).create(path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            let metadata = std::fs::symlink_metadata(path).into_diagnostic()?;
+            if !metadata.is_dir() {
+                return Err(miette::miette!(
+                    "sandbox instance path is not a directory: {}",
+                    path.display()
+                ));
+            }
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
+                .into_diagnostic()?;
+        }
+        Err(error) => {
+            return Err(error)
+                .into_diagnostic()
+                .wrap_err_with(|| format!("create private directory {}", path.display()));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+pub(crate) fn prepare_private_dir(_path: &Path) -> Result<()> {
+    Err(miette::miette!(
+        "hosted sandbox instances require a Unix host"
+    ))
 }
 
 #[cfg(test)]
@@ -700,7 +894,10 @@ mod tests {
                 }
             })
         });
-        host.start(sandbox, bindings, body).unwrap();
+        assert_eq!(
+            admit(host, sandbox, sandbox, 0, bindings, body),
+            Ok(SandboxInstanceAdmitted::Created)
+        );
         Instance {
             identity,
             logs,
@@ -713,7 +910,7 @@ mod tests {
     async fn wait_supervising(host: &SandboxInstanceHost, key: &str) {
         tokio::time::timeout(Duration::from_secs(10), async {
             while host.status(key).map(|status| status.phase)
-                != Some(SandboxInstancePhase::Supervising)
+                != Some(SandboxInstancePhaseReport::Supervising)
             {
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
@@ -736,42 +933,154 @@ mod tests {
         }
     }
 
+    /// Admit `body` under `key`, recording `launch` in its private directory.
+    fn admit(
+        host: &SandboxInstanceHost,
+        key: &str,
+        sandbox_id: &str,
+        launch: u8,
+        bindings: SandboxInstanceBindings,
+        body: SandboxInstanceBody,
+    ) -> std::result::Result<SandboxInstanceAdmitted, SandboxInstanceHostError> {
+        host.admit(
+            SandboxInstanceAdmission {
+                key: key.to_string(),
+                fingerprint: [launch; 32],
+                sandbox_id: sandbox_id.to_string(),
+            },
+            |dir| {
+                std::fs::write(dir.join("launch"), [launch])
+                    .map_err(|error| SandboxInstanceHostError::Files(error.to_string()))?;
+                Ok((bindings, body))
+            },
+        )
+    }
+
+    fn private_host() -> (tempfile::TempDir, Arc<SandboxInstanceHost>) {
+        let root = tempfile::tempdir().unwrap();
+        let host = SandboxInstanceHost::new(root.path().join("instances")).unwrap();
+        (root, Arc::new(host))
+    }
+
     #[tokio::test(flavor = "multi_thread")]
-    async fn stopping_and_panicking_instances_keep_their_key_and_fail_closed() {
-        let host = Arc::new(SandboxInstanceHost::new());
-        let body: SandboxInstanceBody = Box::new(|controls| {
-            Box::pin(async move {
-                controls.readiness.send_replace(true);
-                controls.shutdown.await;
-                // Winding down takes time; the key must stay taken meanwhile.
-                tokio::time::sleep(Duration::from_millis(300)).await;
-                Ok(0)
+    async fn one_removal_holds_an_idempotent_admission_until_its_files_are_gone() {
+        let (root, host) = private_host();
+        let dir = root.path().join("instances").join("generation");
+        let winding_down = |code| -> SandboxInstanceBody {
+            Box::new(move |controls| {
+                Box::pin(async move {
+                    controls.readiness.send_replace(true);
+                    controls.shutdown.await;
+                    // Winding down takes time; the key must stay taken meanwhile.
+                    tokio::time::sleep(Duration::from_millis(300)).await;
+                    Ok(code)
+                })
             })
-        });
-        host.start("generation", unbound(), body).unwrap();
+        };
+        let admit_launch = |launch, code| {
+            admit(
+                &host,
+                "generation",
+                &format!("sandbox-{launch}"),
+                launch,
+                unbound(),
+                winding_down(code),
+            )
+        };
+        assert_eq!(admit_launch(1, 3), Ok(SandboxInstanceAdmitted::Created));
+        assert_eq!(admit_launch(1, 3), Ok(SandboxInstanceAdmitted::Unchanged));
+        assert_eq!(admit_launch(2, 3), Err(SandboxInstanceHostError::Conflict));
+        assert_eq!(
+            admit(
+                &host,
+                "../escape",
+                "sandbox-1",
+                1,
+                unbound(),
+                winding_down(0)
+            ),
+            Err(SandboxInstanceHostError::InvalidKey)
+        );
         wait_supervising(&host, "generation").await;
-        let removal = tokio::spawn({
-            let host = host.clone();
-            async move { host.remove("generation", Duration::from_secs(10)).await }
-        });
+
+        // A caller that gives up, such as an expired RPC, strands nothing.
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(20),
+                host.remove("generation", Duration::from_secs(10))
+            )
+            .await
+            .is_err()
+        );
         tokio::time::timeout(Duration::from_secs(10), async {
             while host.status("generation").map(|status| status.phase)
-                != Some(SandboxInstancePhase::Stopping)
+                != Some(SandboxInstancePhaseReport::Stopping)
             {
                 tokio::time::sleep(Duration::from_millis(5)).await;
             }
         })
         .await
         .expect("instance observes the stop request");
-        let replacement: SandboxInstanceBody = Box::new(|_| Box::pin(async { Ok(0) }));
-        assert_eq!(
-            host.start("generation", unbound(), replacement),
-            Err(SandboxInstanceHostError::Duplicate)
-        );
-        let stopped = removal.await.unwrap().expect("instance was hosted");
-        assert_eq!(stopped.phase, SandboxInstancePhase::Exited(0));
+        assert_eq!(admit_launch(1, 3), Err(SandboxInstanceHostError::Removing));
+        assert!(dir.join("launch").exists());
+        let removers = [(); 2].map(|()| {
+            let host = host.clone();
+            tokio::spawn(async move { host.remove("generation", Duration::from_secs(10)).await })
+        });
+        for remover in removers {
+            let status = remover.await.unwrap().expect("instance was hosted");
+            assert_eq!(status.sandbox_id, "sandbox-1");
+            assert_eq!(
+                status.phase,
+                SandboxInstancePhaseReport::Exited { exit_code: 3 }
+            );
+        }
         assert!(host.status("generation").is_none());
+        assert!(!dir.exists());
 
+        // The key is free again, and the earlier removal cannot touch its new owner.
+        assert_eq!(admit_launch(4, 4), Ok(SandboxInstanceAdmitted::Created));
+        wait_supervising(&host, "generation").await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            host.status("generation").map(|status| status.phase),
+            Some(SandboxInstancePhaseReport::Supervising)
+        );
+        assert_eq!(std::fs::read(dir.join("launch")).unwrap(), [4]);
+
+        // Files that cannot be deleted keep the key reserved until a later
+        // removal deletes them. Root ignores the permission this relies on.
+        #[cfg(unix)]
+        if !nix::unistd::geteuid().is_root() {
+            use std::os::unix::fs::PermissionsExt as _;
+
+            let instances = root.path().join("instances");
+            std::fs::set_permissions(&instances, std::fs::Permissions::from_mode(0o500)).unwrap();
+            let status = host
+                .remove("generation", Duration::from_secs(10))
+                .await
+                .unwrap();
+            assert!(
+                matches!(&status.phase, SandboxInstancePhaseReport::Failed { error } if error.contains("private files remain")),
+                "{status:?}"
+            );
+            assert_eq!(host.status("generation"), Some(status));
+            assert_eq!(admit_launch(5, 5), Err(SandboxInstanceHostError::Removing));
+            std::fs::set_permissions(&instances, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let status = host.remove("generation", Duration::from_secs(10)).await;
+        assert_eq!(
+            status.map(|status| status.phase),
+            Some(SandboxInstancePhaseReport::Exited { exit_code: 4 })
+        );
+        assert!(!dir.exists());
+        host.remove_all(Duration::from_secs(10)).await;
+        assert!(host.list().is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn panicking_instance_fails_closed_and_revokes_its_credentials() {
+        let (_root, host) = private_host();
         let credentials = GatewayCredentials::from_gateway_token("panicking-token").unwrap();
         let panicking: SandboxInstanceBody = Box::new(|controls| {
             Box::pin(async move {
@@ -780,8 +1089,11 @@ mod tests {
                 panic!("hosted sandbox instance failure");
             })
         });
-        host.start(
+        admit(
+            &host,
             "panicking",
+            "sandbox-panicking",
+            1,
             SandboxInstanceBindings {
                 gateway_credentials: credentials.clone(),
                 ..unbound()
@@ -803,8 +1115,12 @@ mod tests {
         .expect("panicking instance reports an end");
         assert_eq!(
             status,
-            SandboxInstanceStatus {
-                phase: SandboxInstancePhase::Failed("sandbox instance panicked".to_string()),
+            SandboxInstanceStatusReport {
+                route: "panicking".to_string(),
+                sandbox_id: "sandbox-panicking".to_string(),
+                phase: SandboxInstancePhaseReport::Failed {
+                    error: "sandbox instance panicked".to_string(),
+                },
                 ready: false,
             }
         );
@@ -821,72 +1137,24 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn removal_outlives_its_caller_and_reports_to_every_remover() {
-        let host = Arc::new(SandboxInstanceHost::new());
-        let winding_down = |code| -> SandboxInstanceBody {
-            Box::new(move |controls| {
-                Box::pin(async move {
-                    controls.readiness.send_replace(true);
-                    controls.shutdown.await;
-                    tokio::time::sleep(Duration::from_millis(300)).await;
-                    Ok(code)
-                })
-            })
-        };
-        host.start("generation", unbound(), winding_down(3))
-            .unwrap();
-        wait_supervising(&host, "generation").await;
-        // A caller that gives up, such as an expired RPC, strands nothing.
-        assert!(
-            tokio::time::timeout(
-                Duration::from_millis(20),
-                host.remove("generation", Duration::from_secs(10))
-            )
-            .await
-            .is_err()
-        );
-        let removers = [(); 2].map(|()| {
-            let host = host.clone();
-            tokio::spawn(async move { host.remove("generation", Duration::from_secs(10)).await })
-        });
-        for remover in removers {
-            let status = remover.await.unwrap().expect("instance was hosted");
-            assert_eq!(status.phase, SandboxInstancePhase::Exited(3));
-        }
-        assert!(host.status("generation").is_none());
-
-        // The key is free again, and the earlier removal cannot touch its new owner.
-        host.start("generation", unbound(), winding_down(4))
-            .unwrap();
-        wait_supervising(&host, "generation").await;
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        assert_eq!(
-            host.status("generation").map(|status| status.phase),
-            Some(SandboxInstancePhase::Supervising)
-        );
-        let status = host.remove("generation", Duration::from_secs(10)).await;
-        assert_eq!(
-            status.map(|status| status.phase),
-            Some(SandboxInstancePhase::Exited(4))
-        );
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
     async fn hosted_instances_keep_identity_credentials_and_lifecycle_separate() {
         let (gateway_url, captured) = capture_gateway().await;
-        let host = SandboxInstanceHost::new();
+        let (_root, host) = private_host();
         let mut alpha = start_instance(&host, &gateway_url, "sandbox-alpha");
         let mut beta = start_instance(&host, &gateway_url, "sandbox-beta");
         wait_supervising(&host, "sandbox-alpha").await;
         wait_supervising(&host, "sandbox-beta").await;
-        assert!(matches!(
-            host.start(
+        assert_eq!(
+            admit(
+                &host,
                 "sandbox-alpha",
+                "sandbox-alpha",
+                1,
                 unbound(),
                 Box::new(|_| Box::pin(async { Ok(0) })),
             ),
-            Err(SandboxInstanceHostError::Duplicate)
-        ));
+            Err(SandboxInstanceHostError::Conflict)
+        );
 
         assert_eq!((&mut alpha.identity).await.unwrap(), "sandbox-alpha");
         assert_eq!((&mut beta.identity).await.unwrap(), "sandbox-beta");
@@ -913,7 +1181,10 @@ mod tests {
             .remove("sandbox-alpha", Duration::from_secs(10))
             .await
             .expect("alpha was hosted");
-        assert_eq!(stopped.phase, SandboxInstancePhase::Exited(0));
+        assert_eq!(
+            stopped.phase,
+            SandboxInstancePhaseReport::Exited { exit_code: 0 }
+        );
         assert!(!stopped.ready);
         assert!(host.status("sandbox-alpha").is_none());
         assert_eq!(alpha.alive.recv().await, None, "alpha's tasks stopped");
@@ -937,7 +1208,7 @@ mod tests {
         );
         assert_eq!(
             host.status("sandbox-beta").map(|status| status.phase),
-            Some(SandboxInstancePhase::Supervising)
+            Some(SandboxInstancePhaseReport::Supervising)
         );
         assert!(
             beta.alive
@@ -948,7 +1219,7 @@ mod tests {
         let stopped = host.remove("sandbox-beta", Duration::from_secs(10)).await;
         assert_eq!(
             stopped.map(|status| status.phase),
-            Some(SandboxInstancePhase::Exited(0))
+            Some(SandboxInstancePhaseReport::Exited { exit_code: 0 })
         );
     }
 }
