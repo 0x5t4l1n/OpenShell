@@ -179,6 +179,17 @@ where
     Ok(violations)
 }
 
+/// Parse one middleware selector pattern. Selectors match hostnames on every
+/// port, so a `host:port` pattern would parse as a hostname that never matches
+/// and silently leave the entry unselected. Reject `:` outside IPv6 literals
+/// instead.
+fn selector_pattern(pattern: &str) -> Result<HostPattern, String> {
+    if pattern.contains(':') && pattern.parse::<std::net::Ipv6Addr>().is_err() {
+        return Err("selectors match hostnames on every port and must not contain ':'".into());
+    }
+    HostPattern::new(pattern)
+}
+
 pub fn validate(policy: &SandboxPolicy) -> Vec<PolicyViolation> {
     let mut violations = Vec::new();
     let mut orders = BTreeMap::new();
@@ -249,7 +260,7 @@ pub fn validate(policy: &SandboxPolicy) -> Vec<PolicyViolation> {
         }
         let mut selector_valid = !selector.include.is_empty();
         for pattern in selector.include.iter().chain(&selector.exclude) {
-            if let Err(reason) = HostPattern::new(pattern) {
+            if let Err(reason) = selector_pattern(pattern) {
                 selector_valid = false;
                 violations.push(PolicyViolation::InvalidMiddlewareConfig {
                     name: name.clone(),

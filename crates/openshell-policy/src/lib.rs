@@ -3293,6 +3293,58 @@ network_policies:
     }
 
     #[test]
+    fn validate_rejects_ports_in_middleware_selector_patterns() {
+        for (include, exclude) in [
+            ("api.example.com:443", None),
+            ("*.example.com:443", None),
+            ("api.example.com", Some("api.example.com:22")),
+            ("[2001:db8::1]:443", None),
+        ] {
+            let mut policy = restrictive_default_policy();
+            let mut middleware = middleware_config("openshell/regex");
+            let selector = middleware.endpoints.as_mut().unwrap();
+            selector.include = vec![include.into()];
+            selector.exclude = exclude.into_iter().map(Into::into).collect();
+            add_middleware(&mut policy, "redactor", middleware);
+
+            let errors = validate_sandbox_policy(&policy)
+                .expect_err("a selector pattern with a port")
+                .into_iter()
+                .map(|violation| violation.to_string())
+                .collect::<Vec<_>>()
+                .join("; ");
+            let pattern = exclude.unwrap_or(include);
+            assert!(
+                errors.contains(&format!("pattern '{pattern}' is invalid"))
+                    && errors.contains("must not contain ':'"),
+                "{errors}"
+            );
+        }
+
+        let mut policy = restrictive_default_policy();
+        let mut middleware = middleware_config("openshell/regex");
+        middleware.endpoints.as_mut().unwrap().include = vec!["2001:db8::1".into()];
+        add_middleware(&mut policy, "redactor", middleware);
+        validate_sandbox_policy(&policy).expect("an IPv6 literal is a host, not a port");
+
+        // The supervisor's local-file policy path runs the same check.
+        let data = serde_json::json!({
+            "network_middlewares": {
+                "redactor": {
+                    "middleware": "openshell/regex",
+                    "endpoints": {"include": ["api.example.com:443"]}
+                }
+            }
+        });
+        let violations = validate_network_middleware_json(&data).expect("parse middleware policy");
+        assert!(violations.iter().any(|violation| matches!(
+            violation,
+            PolicyViolation::InvalidMiddlewareConfig { name, reason }
+                if name == "redactor" && reason.contains("must not contain ':'")
+        )));
+    }
+
+    #[test]
     fn middleware_host_selector_matching_is_case_insensitive() {
         assert!(middleware_host_matches("*.Example.COM", "API.example.com").unwrap());
         assert!(!middleware_host_matches("*.example.com", "example.com").unwrap());
