@@ -172,23 +172,11 @@ impl ForwardedRequestHead {
         Ok(())
     }
 
-    /// Headers shown to response middleware, with the omissions of the request
-    /// preflight. A value that carries a credential placeholder reads
-    /// `[REDACTED]`, as in the response target's query.
+    /// Headers shown to response middleware, with the omissions of the HTTP
+    /// session hook request preflight.
     pub(crate) fn visible_headers(&self) -> Result<Vec<openshell_core::proto::HttpHeader>> {
         let head = self.0.committed.get().unwrap_or(&self.0.head);
-        Ok(safe_middleware_headers(head)?
-            .visible
-            .into_iter()
-            .map(|(name, value)| openshell_core::proto::HttpHeader {
-                name,
-                value: if secrets::contains_reserved_credential_marker(&value) {
-                    "[REDACTED]".to_string()
-                } else {
-                    value
-                },
-            })
-            .collect())
+        Ok(safe_middleware_headers(head)?.session_visible())
     }
 }
 
@@ -1281,12 +1269,9 @@ fn request_preflight_input(
             crate::l7::provider::BodyLength::None => Some(0),
             crate::l7::provider::BodyLength::Chunked => None,
         },
-        headers: headers
-            .visible
-            .into_iter()
-            .map(|(name, value)| openshell_core::proto::HttpHeader { name, value })
-            .collect(),
+        headers: headers.session_visible(),
         connection_nominated_headers: headers.connection_nominated,
+        credential_reference_headers: headers.credential_references,
         max_output_body_bytes: withheld_limit.map(|limit| limit as u64),
     })
 }
@@ -1950,6 +1935,26 @@ fn emit_middleware_body_unavailable(ctx: &L7EvalContext, denied: bool) {
 struct SafeMiddlewareHeaders {
     visible: Vec<(String, String)>,
     connection_nominated: Vec<String>,
+    /// Names of visible headers with a value that carries a credential
+    /// placeholder, such as `x-api-key: openshell:resolve:env:API_KEY`.
+    credential_references: Vec<String>,
+}
+
+impl SafeMiddlewareHeaders {
+    /// Headers HTTP session hooks see. They omit every header named in
+    /// `credential_references` too, as `Authorization` is always omitted, so
+    /// whether a stage sees a credential placeholder does not depend on the
+    /// header that carries it. v1 HTTP hooks keep `visible`.
+    fn session_visible(&self) -> Vec<openshell_core::proto::HttpHeader> {
+        self.visible
+            .iter()
+            .filter(|(name, _)| !self.credential_references.contains(name))
+            .map(|(name, value)| openshell_core::proto::HttpHeader {
+                name: name.clone(),
+                value: value.clone(),
+            })
+            .collect()
+    }
 }
 
 fn safe_middleware_headers(headers: &[u8]) -> Result<SafeMiddlewareHeaders> {
@@ -1961,7 +1966,7 @@ fn safe_middleware_headers(headers: &[u8]) -> Result<SafeMiddlewareHeaders> {
         .expect("validated header block has terminator");
     let connection_nominated = crate::l7::rest::connection_nominated_header_names(headers)?;
 
-    let visible = header_block
+    let visible: Vec<(String, String)> = header_block
         .split("\r\n")
         .skip(1)
         .map(|line| {
@@ -1995,9 +2000,17 @@ fn safe_middleware_headers(headers: &[u8]) -> Result<SafeMiddlewareHeaders> {
         .collect();
     let mut connection_nominated: Vec<_> = connection_nominated.into_iter().collect();
     connection_nominated.sort();
+    let mut credential_references: Vec<_> = visible
+        .iter()
+        .filter(|(_, value)| secrets::header_value_contains_reserved_credential_marker(value))
+        .map(|(name, _)| name.clone())
+        .collect();
+    credential_references.sort();
+    credential_references.dedup();
     Ok(SafeMiddlewareHeaders {
         visible,
         connection_nominated,
+        credential_references,
     })
 }
 
@@ -2163,6 +2176,43 @@ mod tests {
             .iter()
             .map(|header| (header.name.as_str(), header.value.as_str()))
             .collect()
+    }
+
+    #[test]
+    fn session_request_preflight_omits_headers_that_reference_credentials() {
+        let head = "POST /v1/items HTTP/1.1\r\n\
+                    Host: api.example.test\r\n\
+                    Content-Type: application/json\r\n\
+                    X-Api-Key: openshell:resolve:env:API_KEY\r\n\
+                    X-Upstream-Auth: Basic dXNlcjpvcGVuc2hlbGw6cmVzb2x2ZTplbnY6UEFTU1dPUkQ=\r\n\
+                    X-Api-Key: second-value\r\n\r\n";
+        let ctx = L7EvalContext {
+            host: "api.example.test".into(),
+            port: 443,
+            ..Default::default()
+        };
+
+        let input =
+            super::request_preflight_input("https", &forwarded_request(head), &ctx, "r1", None)
+                .unwrap();
+
+        // Every value of a credential-bearing name is omitted, and the name
+        // is reported so mutations cannot target it.
+        assert_eq!(
+            header_pairs(&input.headers),
+            [("content-type", "application/json")]
+        );
+        assert_eq!(
+            input.credential_reference_headers,
+            ["x-api-key", "x-upstream-auth"]
+        );
+        // v1 HTTP hooks keep their released view.
+        let v1 = safe_middleware_headers(head.as_bytes()).unwrap().visible;
+        assert!(
+            v1.iter().any(
+                |(name, value)| name == "x-api-key" && value == "openshell:resolve:env:API_KEY"
+            )
+        );
     }
 
     #[test]

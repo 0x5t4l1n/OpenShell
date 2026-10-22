@@ -169,6 +169,30 @@ pub fn apply_accumulated(
     )
 }
 
+/// Reject mutations of the headers an HTTP session hook request head omits
+/// because their values carry a credential placeholder. A stage cannot see
+/// them, so it cannot write or remove them either.
+pub fn reject_credential_reference_mutations(
+    credential_reference_headers: &[String],
+    mutations: &[HeaderMutation],
+) -> Result<(), HeaderMutationError> {
+    for mutation in mutations {
+        let name = match mutation.operation.as_ref() {
+            Some(header_mutation::Operation::Write(write)) => &write.name,
+            Some(header_mutation::Operation::Remove(remove)) => &remove.name,
+            // `apply` reports an empty mutation.
+            None => continue,
+        };
+        if credential_reference_headers
+            .iter()
+            .any(|hidden| hidden.eq_ignore_ascii_case(name))
+        {
+            return Err(HeaderMutationError::Protected { name: name.clone() });
+        }
+    }
+    Ok(())
+}
+
 fn apply_checked(
     authority: HeaderAuthority,
     existing_headers: &[HttpHeader],
@@ -770,6 +794,33 @@ mod tests {
                 assert!(matches!(error, HeaderMutationError::Protected { .. }));
             }
         }
+    }
+
+    #[test]
+    fn credential_reference_headers_reject_writes_and_removals() {
+        let hidden = ["x-api-key".to_string()];
+        for mutation in [
+            write("X-Api-Key", "replacement", ExistingHeaderAction::Overwrite),
+            remove("x-api-key"),
+        ] {
+            assert_eq!(
+                reject_credential_reference_mutations(&hidden, std::slice::from_ref(&mutation)),
+                Err(HeaderMutationError::Protected {
+                    name: match mutation.operation {
+                        Some(header_mutation::Operation::Write(write)) => write.name,
+                        Some(header_mutation::Operation::Remove(remove)) => remove.name,
+                        None => unreachable!(),
+                    },
+                })
+            );
+        }
+        assert_eq!(
+            reject_credential_reference_mutations(
+                &hidden,
+                &[write("x-trace", "one", ExistingHeaderAction::Append)]
+            ),
+            Ok(())
+        );
     }
 
     #[test]

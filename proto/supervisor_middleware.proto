@@ -381,7 +381,9 @@ message HttpRequestPreflightHead {
   HttpRequestTarget target = 1;
   // Request headers after all earlier stages' mutations, in wire order.
   // Repeated names stay separate. Credential, routing, framing, and hop-by-hop
-  // headers are omitted. Limited to 128 lines and 64 KiB encoded.
+  // headers are omitted, as is every header with a name that carries an
+  // OpenShell credential placeholder in any of its values. Limited to 128
+  // lines and 64 KiB encoded.
   repeated HttpHeader headers = 2;
 }
 
@@ -400,8 +402,6 @@ message HttpResponsePreflightHead {
   // OpenShell adds credentials or makes its own forwarding changes, such as
   // sending Accept-Encoding: identity. In wire order, with the omissions and
   // limits of HttpRequestPreflightHead.headers.
-  // A value that contains an OpenShell credential placeholder reads
-  // [REDACTED].
   repeated HttpHeader request_headers = 4;
 }
 
@@ -441,8 +441,9 @@ message HttpPreflightResult {
   // Ordered head mutations, applied to this stage's input before begin.
   // The next stage sees these and this stage's body-time mutations together.
   // Only visible end-to-end headers may change. Credential, routing, framing,
-  // and hop-by-hop headers are protected, as are Content-Encoding and
-  // response Content-Range. OpenShell does not update integrity headers such
+  // and hop-by-hop headers are protected, as are Content-Encoding, response
+  // Content-Range, and request headers omitted because they carry a credential
+  // placeholder. OpenShell does not update integrity headers such
   // as ETag, Content-MD5, or Content-Digest when a body changes: a stage that
   // changes the body removes them or writes new values, typically in its late
   // head mutations. Limited to 64

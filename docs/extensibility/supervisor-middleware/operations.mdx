@@ -65,7 +65,7 @@ Request output streams to the external service while the sandbox uploads. OpenSh
 
 Your service receives the response status, headers, and request context. It can return `continue_without_body` or choose a body mode with `inspect`.
 
-The response preflight also carries `request_headers`: the request's headers after every request stage's changes and before OpenShell adds credentials or replaces `Accept-Encoding`, with the same headers omitted as in the request preflight. A value that contains an OpenShell credential placeholder reads `[REDACTED]`. The request context's `request_id` matches the request's preflights.
+The response preflight also carries `request_headers`: the request's headers after every request stage's changes and before OpenShell adds credentials or replaces `Accept-Encoding`, with the same headers omitted as in the request preflight. The request context's `request_id` matches the request's preflights.
 
 To stop the response from reaching the sandbox, return `block_delivery` at preflight or during body inspection. If delivery has started, OpenShell aborts the response. The external service has already handled the request, so blocking delivery does not undo it. Retrying may repeat side effects.
 
@@ -115,6 +115,8 @@ A result can include an ordered list of header changes. A `write` change sets ho
 - `skip` keeps the existing values.
 
 A `remove` change removes all values for the name. OpenShell protects credential, routing, framing, connection, and content coding headers. For responses, it also protects status, authentication challenge, range, and security policy headers. Header values cannot contain control characters. Request values cannot contain OpenShell credential placeholders.
+
+A request header whose value contains an OpenShell credential placeholder, such as `X-Api-Key: openshell:resolve:env:API_KEY`, is a credential header: OpenShell omits every value of that name from the request preflight, `begin`, and `request_headers`, and your service cannot change or remove it. Legacy HTTP hooks still receive these headers.
 
 OpenShell does not update integrity headers, such as `ETag`, `Content-MD5`, `Digest`, `Content-Digest`, and `Signature`, when a stage changes a body. If your stage changes the body, remove these headers or write new values in `buffered_result` or `output_start`. A STREAM stage can read all input before it sends `output_start` if it needs the complete body to compute a value.
 

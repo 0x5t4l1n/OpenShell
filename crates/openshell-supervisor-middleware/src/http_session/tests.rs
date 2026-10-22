@@ -520,6 +520,7 @@ fn request_input(body: &[u8]) -> HttpRequestPreflightInput {
             value: "original".into(),
         }],
         connection_nominated_headers: Vec::new(),
+        credential_reference_headers: Vec::new(),
         max_output_body_bytes: None,
     }
 }
@@ -1727,5 +1728,46 @@ async fn response_preflight_carries_request_headers_within_head_limits() {
                 "{case}"
             );
         }
+    }
+}
+
+#[tokio::test]
+async fn stages_cannot_change_headers_that_reference_credentials() {
+    use HttpBodyMode::{Buffered, Stream};
+    for (case, preflight, preflight_mutation, late_mutation) in [
+        ("preflight mutation", Preflight::Continue, true, false),
+        (
+            "BUFFERED late mutation",
+            Preflight::Inspect(Buffered),
+            false,
+            true,
+        ),
+        (
+            "STREAM late mutation",
+            Preflight::Inspect(Stream),
+            false,
+            true,
+        ),
+    ] {
+        let stage = Arc::new(ScriptedStage {
+            preflight_mutation,
+            late_mutation,
+            ..ScriptedStage::new("example/a", preflight, Body::Unchanged)
+        });
+        // The caller omits the header from the head and names it instead.
+        let mut head = request_input(b"hello");
+        head.headers.clear();
+        head.credential_reference_headers = vec!["x-order".into()];
+
+        let result = run_input(vec![stage], head, b"hello").await;
+
+        assert!(!result.allowed, "{case}");
+        assert!(
+            result
+                .reason
+                .contains("cannot mutate protected header x-order"),
+            "{case}: {}",
+            result.reason
+        );
     }
 }

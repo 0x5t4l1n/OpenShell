@@ -46,6 +46,9 @@ pub struct HttpRequestPreflightInput {
     pub headers: Vec<HttpHeader>,
     /// Lowercased names nominated by the request's `Connection` fields.
     pub connection_nominated_headers: Vec<String>,
+    /// Lowercased names of headers whose values carry a credential
+    /// placeholder. `headers` omits them, and stages cannot change them.
+    pub credential_reference_headers: Vec<String>,
     /// Largest final body output the caller accepts when it withholds the
     /// output until the chain finishes. `None` when output streams to the
     /// upstream. Advertised to STREAM stages as `max_output_body_bytes`.
@@ -180,6 +183,7 @@ fn request_spec(input: &HttpRequestPreflightInput) -> PipelineSpec {
         head_authority: HeaderAuthority::SessionRequest,
         trailer_authority: HeaderAuthority::RequestTrailers,
         connection_nominated: input.connection_nominated_headers.clone(),
+        credential_reference_headers: input.credential_reference_headers.clone(),
         timeouts: PipelineTimeouts::default(),
         output_trailers: true,
     }

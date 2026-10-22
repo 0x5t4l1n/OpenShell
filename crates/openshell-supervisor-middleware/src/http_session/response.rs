@@ -348,6 +348,8 @@ impl ChainRunner {
             head_authority: HeaderAuthority::SessionResponse,
             trailer_authority: HeaderAuthority::ResponseTrailers,
             connection_nominated: input.connection_nominated_headers.clone(),
+            // Only request heads omit credential-bearing headers.
+            credential_reference_headers: Vec::new(),
             timeouts: PipelineTimeouts {
                 buffered_body: delivery.buffered_body_timeout,
                 ..PipelineTimeouts::default()

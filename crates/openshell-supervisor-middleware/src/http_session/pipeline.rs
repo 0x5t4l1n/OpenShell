@@ -340,11 +340,42 @@ pub struct PipelineSpec {
     /// Lowercased names nominated by the original message's `Connection`
     /// fields. Mutations treat them as hop-by-hop.
     pub connection_nominated: Vec<String>,
+    /// Lowercased names of request headers omitted from the head because
+    /// their values carry a credential placeholder. Mutations cannot
+    /// target them.
+    pub credential_reference_headers: Vec<String>,
     pub timeouts: PipelineTimeouts,
     /// False when the outgoing message cannot carry trailers. BUFFERED stages
     /// then always declare their output length, and the caller drops the
     /// final trailers.
     pub output_trailers: bool,
+}
+
+impl PipelineSpec {
+    /// Apply one stage's head mutations to `existing`. Mutations another
+    /// result already passed skip the per-result count and size limits.
+    fn apply_head(
+        &self,
+        existing: &[HttpHeader],
+        mutations: &[HeaderMutation],
+        already_accepted: bool,
+    ) -> Result<Vec<HttpHeader>, headers::HeaderMutationError> {
+        headers::reject_credential_reference_mutations(
+            &self.credential_reference_headers,
+            mutations,
+        )?;
+        let apply = if already_accepted {
+            headers::apply_accumulated
+        } else {
+            headers::apply
+        };
+        apply(
+            self.head_authority,
+            existing,
+            &self.connection_nominated,
+            mutations,
+        )
+    }
 }
 
 /// Body modes offered to one stage.
@@ -822,13 +853,9 @@ async fn prepare_stage(
             _ => return Err(entry_failure(entry, "preflight_result_expected")),
         };
         let diagnostics = validate_diagnostics(entry, result.diagnostics.as_ref())?;
-        let headers = headers::apply(
-            spec.head_authority,
-            input_headers,
-            &spec.connection_nominated,
-            &result.header_mutations,
-        )
-        .map_err(|error| mutation_failure(entry, &error))?;
+        let headers = spec
+            .apply_head(input_headers, &result.header_mutations, false)
+            .map_err(|error| mutation_failure(entry, &error))?;
         let mode = match result.decision {
             Some(http_preflight_result::Decision::ContinueWithoutBody(_)) => None,
             Some(http_preflight_result::Decision::Inspect(inspect)) => {
@@ -1712,13 +1739,10 @@ async fn drive_stage(
         Some(_) => return Err(entry_failure(entry, "stage_input_order_invalid").into()),
         None => return Err(StageError::LinkClosed),
     };
-    let mut begin_head = headers::apply_accumulated(
-        shared.spec.head_authority,
-        &shared.head,
-        &shared.spec.connection_nominated,
-        &upstream.header_mutations,
-    )
-    .map_err(|error| mutation_failure(entry, &error))?;
+    let mut begin_head = shared
+        .spec
+        .apply_head(&shared.head, &upstream.header_mutations, true)
+        .map_err(|error| mutation_failure(entry, &error))?;
     if active.is_none() {
         begin_head = shared
             .head_source
@@ -1934,13 +1958,10 @@ async fn drive_buffered(
         _ => return Err(entry_failure(entry, "buffered_result_expected").into()),
     };
     let diagnostics = validate_diagnostics(entry, result.diagnostics.as_ref())?;
-    let late_head = headers::apply(
-        shared.spec.head_authority,
-        &begin_head,
-        &shared.spec.connection_nominated,
-        &result.header_mutations,
-    )
-    .map_err(|error| mutation_failure(entry, &error))?;
+    let late_head = shared
+        .spec
+        .apply_head(&begin_head, &result.header_mutations, false)
+        .map_err(|error| mutation_failure(entry, &error))?;
     let trailers = headers::apply(
         shared.spec.trailer_authority,
         &trailers,
@@ -2143,13 +2164,10 @@ async fn drive_stream(
             };
             match classify_result(entry, next)? {
                 StageResult::OutputStart(start) if !started => {
-                    headers::apply(
-                        shared.spec.head_authority,
-                        &begin_head,
-                        &shared.spec.connection_nominated,
-                        &start.header_mutations,
-                    )
-                    .map_err(|error| mutation_failure(entry, &error))?;
+                    shared
+                        .spec
+                        .apply_head(&begin_head, &start.header_mutations, false)
+                        .map_err(|error| mutation_failure(entry, &error))?;
                     header_mutations.extend(start.header_mutations);
                     declared = start.output_body_bytes;
                     started = true;

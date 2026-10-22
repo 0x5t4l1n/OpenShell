@@ -7581,6 +7581,7 @@ mod tests {
              Authorization: Bearer sandbox-token\r\n\
              Cookie: session=secret\r\n\
              X-Api-Key: openshell:resolve:env:API_KEY\r\n\
+             X-Upstream-Auth: Basic dXNlcjpvcGVuc2hlbGw6cmVzb2x2ZTplbnY6UEFTU1dPUkQ=\r\n\
              X-Trace: one\r\n\
              X-Trace: two\r\n\
              Content-Length: 2\r\n\r\n{}",
@@ -7611,7 +7612,6 @@ mod tests {
                 .collect::<Vec<_>>(),
             [
                 ("content-type", "application/json"),
-                ("x-api-key", "[REDACTED]"),
                 ("x-trace", "one"),
                 ("x-trace", "two"),
             ]
