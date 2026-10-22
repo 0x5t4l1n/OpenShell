@@ -3095,7 +3095,7 @@ def test_sandbox_session_delete_passes_workspace() -> None:
 def test_sandbox_session_delete_omits_timeout_for_legacy_clients() -> None:
     from openshell.sandbox import SandboxSession
 
-    calls: list[dict[str, Any]] = []
+    calls: list[tuple[str, str, bool]] = []
 
     class LegacyClient:
         def delete(self, name, *, workspace, allow_missing=False):
