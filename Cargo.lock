@@ -4364,11 +4364,8 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.21",
  "tokio",
- "tokio-rustls",
  "tokio-stream",
- "tokio-tungstenite 0.26.2",
  "tonic",
- "tower",
  "tracing",
  "tracing-subscriber",
  "url",
@@ -5096,15 +5093,6 @@ dependencies = [
  "uuid",
  "wiremock",
  "x509-parser 0.16.0",
-]
-
-[[package]]
-name = "openshell-server-macros"
-version = "0.0.0"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn 2.0.119",
 ]
 
 [[package]]
