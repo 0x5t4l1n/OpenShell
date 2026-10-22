@@ -139,6 +139,13 @@ time or the CLI does not report it connected.
 ephemeral gateway and export `OPENSHELL_GATEWAY` and `OPENSHELL_BIN`, so a
 suite runs under them unchanged.
 
+`mise run e2e:testkit` does this for the suites in `tests/suites/conformance`.
+On CI the test runner (`tests/runner/`) does the same for a guest: it sets
+`OPENSHELL_GATEWAY` to the gateway the installer registered, `OPENSHELL_BIN` to
+the installed CLI and `OPENSHELL_TEST_CAPABILITIES` from the environment, then
+runs the plan's suites with nextest. See [TESTING.md](../../TESTING.md) and
+[tests/plans/README.md](../plans/README.md).
+
 ## Checks
 
 ```shell
