@@ -53,7 +53,7 @@ Middleware can handle three operations: HTTP requests, HTTP responses, and the t
 
 - Middleware does not inspect WebSocket binary messages or messages that the external service sends to the agent.
 - Response middleware cannot inspect the body of compressed, partial, or `Cache-Control: no-transform` responses.
-- Middleware cannot inspect traffic to endpoints that use `tls: skip`, h2c, unsupported tunnels, raw TCP, or SQL passthrough. Middleware that binds `UNINSPECTABLE_NETWORK` can [allow or refuse](/extensibility/supervisor-middleware/operations#uninspectable-traffic) such connections, but cannot see their content.
+- Middleware cannot inspect traffic to endpoints that use `tls: skip`, h2c, unsupported tunnels, raw TCP, or SQL passthrough. OpenShell [refuses or allows](/extensibility/supervisor-middleware/operations#uninspectable-traffic) such connections according to `on_error`.
 
 If your deployment requires inspection of this traffic, middleware cannot enforce that requirement today.
 

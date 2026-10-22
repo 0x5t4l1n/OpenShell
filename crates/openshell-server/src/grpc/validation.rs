@@ -13,7 +13,6 @@ use openshell_core::proto::{
     SandboxRestartPolicy, SandboxSpec, SandboxTemplate,
 };
 use openshell_core::rpc_error::invalid_argument;
-use openshell_supervisor_middleware::MiddlewareRegistry;
 use prost::Message;
 use tonic::Status;
 
@@ -1016,22 +1015,10 @@ pub(super) fn validate_object_metadata(
 
 /// Validate that a policy does not contain unsafe content.
 ///
-/// Delegates to [`openshell_policy::validate_sandbox_policy`], adds the
-/// middleware `tls: skip` rule, which needs `middleware_registry` to exempt
-/// middleware that decides about uninspectable traffic, and converts violations into a gRPC
-/// `INVALID_ARGUMENT` status.
-pub(super) fn validate_policy_safety(
-    policy: &ProtoSandboxPolicy,
-    middleware_registry: &MiddlewareRegistry,
-) -> Result<(), Status> {
-    let mut violations = openshell_policy::validate_sandbox_policy(policy)
-        .err()
-        .unwrap_or_default();
-    violations.extend(openshell_policy::middleware_tls_skip_conflicts(
-        policy,
-        |middleware| middleware_registry.decides_uninspectable_traffic(middleware),
-    ));
-    if !violations.is_empty() {
+/// Delegates to [`openshell_policy::validate_sandbox_policy`] and converts
+/// violations into a gRPC `INVALID_ARGUMENT` status.
+pub(super) fn validate_policy_safety(policy: &ProtoSandboxPolicy) -> Result<(), Status> {
+    if let Err(violations) = openshell_policy::validate_sandbox_policy(policy) {
         let messages: Vec<String> = violations.iter().map(ToString::to_string).collect();
         return Err(Status::invalid_argument(format!(
             "policy contains unsafe content: {}",
@@ -2152,7 +2139,7 @@ mod tests {
             }),
             ..Default::default()
         };
-        let err = validate_policy_safety(&policy, &MiddlewareRegistry::default()).unwrap_err();
+        let err = validate_policy_safety(&policy).unwrap_err();
         assert_eq!(err.code(), Code::InvalidArgument);
         assert!(err.message().contains("root"));
     }
@@ -2170,7 +2157,7 @@ mod tests {
             }),
             ..Default::default()
         };
-        let err = validate_policy_safety(&policy, &MiddlewareRegistry::default()).unwrap_err();
+        let err = validate_policy_safety(&policy).unwrap_err();
         assert_eq!(err.code(), Code::InvalidArgument);
         assert!(err.message().contains("traversal"));
     }
@@ -2188,7 +2175,7 @@ mod tests {
             }),
             ..Default::default()
         };
-        let err = validate_policy_safety(&policy, &MiddlewareRegistry::default()).unwrap_err();
+        let err = validate_policy_safety(&policy).unwrap_err();
         assert_eq!(err.code(), Code::InvalidArgument);
         assert!(err.message().contains("broad"));
     }
@@ -2196,7 +2183,7 @@ mod tests {
     #[test]
     fn validate_policy_safety_accepts_valid_policy() {
         let policy = openshell_policy::restrictive_default_policy();
-        assert!(validate_policy_safety(&policy, &MiddlewareRegistry::default()).is_ok());
+        assert!(validate_policy_safety(&policy).is_ok());
     }
 
     #[test]
@@ -2216,7 +2203,7 @@ mod tests {
                 ..Default::default()
             },
         );
-        let err = validate_policy_safety(&policy, &MiddlewareRegistry::default()).unwrap_err();
+        let err = validate_policy_safety(&policy).unwrap_err();
         assert_eq!(err.code(), Code::InvalidArgument);
         assert!(err.message().contains("TLD wildcard"));
     }
@@ -2242,7 +2229,7 @@ mod tests {
             },
         );
 
-        let err = validate_policy_safety(&policy, &MiddlewareRegistry::default()).unwrap_err();
+        let err = validate_policy_safety(&policy).unwrap_err();
 
         assert_eq!(err.code(), Code::InvalidArgument);
         assert!(err.message().contains("endpoint 0"));
@@ -2267,7 +2254,7 @@ mod tests {
             },
         );
 
-        let err = validate_policy_safety(&policy, &MiddlewareRegistry::default()).unwrap_err();
+        let err = validate_policy_safety(&policy).unwrap_err();
         assert_eq!(err.code(), Code::InvalidArgument);
         assert!(err.message().contains("invalid on_error"));
         assert!(err.message().contains("invalid host pattern"));

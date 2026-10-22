@@ -482,7 +482,6 @@ mod tests {
         for (mode, extra) in [
             ("deny", &[("replacement", "ignored")][..]),
             ("redact", &[("body_mode", "whole")][..]),
-            ("redact", &[("uninspectable", "allow")][..]),
             ("redact", &[("unknown", "x")][..]),
         ] {
             assert!(

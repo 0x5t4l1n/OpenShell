@@ -60,18 +60,6 @@ service HttpSessionMiddleware {
       returns (stream HttpResponseSessionResult);
 }
 
-// UninspectableNetworkMiddleware decides about connections OpenShell forwards
-// without inspecting their payload, such as tls: skip tunnels. It shares
-// SupervisorMiddleware's registration, discovery, configuration, and endpoint.
-service UninspectableNetworkMiddleware {
-  // OpenShell calls Evaluate for each selected entry whose service binds
-  // UNINSPECTABLE_NETWORK/PRE_FORWARD, in chain order, before it forwards the
-  // connection. It always fails closed: an error, a timeout, or an invalid
-  // result denies the connection regardless of on_error.
-  rpc Evaluate(EvaluateUninspectableNetworkRequest)
-      returns (EvaluateUninspectableNetworkResponse);
-}
-
 message MiddlewareDescribeRequest {
   // Gateway or supervisor protocol metadata. Middleware must reject unmet
   // requirements before accepting traffic.
@@ -131,8 +119,7 @@ message MiddlewareBinding {
   // Required for payload-bearing operations. An HTTP binding of a service that
   // requires the HTTP session hooks capability may leave this zero: OpenShell
   // then offers it no body modes, so it can only continue or deny at
-  // preflight. UNINSPECTABLE_NETWORK/PRE_FORWARD is metadata-only and must
-  // advertise zero.
+  // preflight.
   uint64 max_payload_bytes = 3;
   // Optional binding-specific RPC timeout. Empty uses the operator-configured
   // service timeout, or the 500ms platform default when that is also omitted.
@@ -269,52 +256,6 @@ enum HttpBodyUnavailableReason {
 message HttpBodyModeUnavailable {
   HttpBodyMode mode = 1;
   HttpBodyUnavailableReason reason = 2;
-}
-
-// Why the selected route cannot perform the middleware inspections.
-enum UninspectableNetworkReason {
-  UNINSPECTABLE_NETWORK_REASON_UNSPECIFIED = 0;
-  // The endpoint sets tls: skip, so OpenShell relays the TLS tunnel without
-  // terminating it.
-  UNINSPECTABLE_NETWORK_REASON_TLS_SKIP = 1;
-  // HTTP/2 with prior knowledge (h2c).
-  UNINSPECTABLE_NETWORK_REASON_H2C = 2;
-  // A tunnel protocol OpenShell does not parse.
-  UNINSPECTABLE_NETWORK_REASON_UNSUPPORTED_TUNNEL = 3;
-  // Transparent TCP forwarding before application protocol classification.
-  UNINSPECTABLE_NETWORK_REASON_RAW_TCP = 4;
-  // A SQL endpoint relayed without inspection.
-  UNINSPECTABLE_NETWORK_REASON_SQL_PASSTHROUGH = 5;
-}
-
-// A connection OpenShell will forward without inspecting its payload.
-message EvaluateUninspectableNetworkRequest {
-  // Built-in or operator-owned registration name.
-  string middleware_name = 1;
-  // request_id identifies this connection across all selected entries.
-  // Limited to 4 KiB encoded.
-  RequestContext context = 2;
-  // This entry's validated configuration. Limited to 64 KiB encoded.
-  google.protobuf.Struct config = 3;
-  // Destination host selected by network policy.
-  string host = 4;
-  // Destination TCP port.
-  uint32 port = 5;
-  UninspectableNetworkReason reason = 6;
-}
-
-enum UninspectableNetworkDecision {
-  // Missing and unknown decisions deny the connection.
-  UNINSPECTABLE_NETWORK_DECISION_UNSPECIFIED = 0;
-  // This entry lets the connection through without inspecting it. Every other
-  // selected entry, and network policy, must also allow it.
-  UNINSPECTABLE_NETWORK_DECISION_ALLOW_WITHOUT_INSPECTION = 1;
-  UNINSPECTABLE_NETWORK_DECISION_DENY = 2;
-}
-
-message EvaluateUninspectableNetworkResponse {
-  UninspectableNetworkDecision decision = 1;
-  MiddlewareDiagnostics diagnostics = 2;
 }
 
 // HTTP session hook preflight for one request stage: what is evaluated, the
@@ -975,12 +916,6 @@ enum SupervisorMiddlewareOperation {
   // hooks capability, and the deprecated v1 HttpResponsePreReturn.Evaluate
   // otherwise.
   SUPERVISOR_MIDDLEWARE_OPERATION_HTTP_RESPONSE = 3;
-  // A connection OpenShell forwards without inspecting its payload, at
-  // PRE_FORWARD. OpenShell calls UninspectableNetworkMiddleware.Evaluate.
-  // A selected entry whose service does not bind it denies such a connection
-  // unless it sets on_error: fail_open, which lets the connection through with
-  // a finding. That fail_open exception is deprecated and removed in 0.2.0.
-  SUPERVISOR_MIDDLEWARE_OPERATION_UNINSPECTABLE_NETWORK = 4;
 }
 
 // Ordered phase within a supervisor operation.
@@ -988,7 +923,6 @@ enum SupervisorMiddlewarePhase {
   SUPERVISOR_MIDDLEWARE_PHASE_UNSPECIFIED = 0;
   SUPERVISOR_MIDDLEWARE_PHASE_PRE_CREDENTIALS = 1;
   SUPERVISOR_MIDDLEWARE_PHASE_PRE_RETURN = 2;
-  SUPERVISOR_MIDDLEWARE_PHASE_PRE_FORWARD = 3;
 }
 
 // WebSocketSessionEvent is one ordered event in a stage-local stream.
@@ -1104,10 +1038,9 @@ message WebSocketSessionEventResult {
   }
 }
 
-// RequestContext identifies the sandbox evaluation.
+// RequestContext identifies the sandbox request being evaluated.
 message RequestContext {
-  // Evaluation id used to correlate middleware and supervisor logs.
-  // For uninspectable network evaluation, this identifies the connection.
+  // Request id used to correlate middleware and supervisor logs.
   string request_id = 1;
   // Sandbox id that originated the request.
   string sandbox_id = 2;

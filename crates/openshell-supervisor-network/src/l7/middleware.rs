@@ -303,55 +303,37 @@ impl HttpMiddlewareExchange {
 
 /// How traffic a middleware chain can never inspect (`tls: skip`, h2c,
 /// non-HTTP TCP, protocols without an L7 relay) must be handled for a
-/// matching chain. See [`uninspectable_traffic_decision`].
+/// matching chain.
+///
+/// This is derived from each entry's `on_error` today. A future per-config
+/// `on_uninspectable` knob could let an operator keep `fail_closed` error
+/// handling for HTTP traffic while allowing uninspectable protocols through
+/// without maintaining host excludes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UninspectableTrafficGate {
     /// No middleware matches this destination; raw relay is unaffected.
     Unrestricted,
-    /// Every entry allowed the connection, and at least one is an entry
-    /// without the uninspectable binding that sets `on_error: fail_open`:
-    /// relay raw bytes but emit a bypass detection finding. Deprecated;
-    /// removed in 0.2.0.
+    /// Every matching entry is `fail_open`: relay raw bytes but emit a bypass
+    /// detection finding.
     BypassWithFinding,
-    /// An entry denied the connection or failed.
+    /// At least one matching entry is `fail_closed`: deny, the middleware
+    /// must be able to see the traffic for it to flow.
     Deny,
-    /// Every entry allowed the connection.
-    Allowed,
 }
 
-/// Decide about traffic a matching middleware chain cannot inspect.
-///
-/// Entries whose service binds `UNINSPECTABLE_NETWORK/PRE_FORWARD` decide
-/// through `UninspectableNetworkMiddleware.Evaluate`, and any failure denies.
-/// Other entries follow their `on_error`.
-pub async fn uninspectable_traffic_decision(
-    runner: &openshell_supervisor_middleware::ChainRunner,
+pub fn uninspectable_traffic_gate(
     chain: &[openshell_supervisor_middleware::ChainEntry],
-    ctx: &L7EvalContext,
-    reason: openshell_core::proto::UninspectableNetworkReason,
 ) -> UninspectableTrafficGate {
     if chain.is_empty() {
         return UninspectableTrafficGate::Unrestricted;
     }
-    let input = openshell_supervisor_middleware::UninspectableTrafficInput {
-        context: middleware_request_context(ctx, &uuid::Uuid::new_v4().to_string()),
-        host: ctx.host.clone(),
-        port: ctx.port,
-        reason,
-    };
-    let outcome = runner.evaluate_uninspectable(chain, input).await;
-    for event in uninspectable_decision_events(ctx, reason, &outcome) {
-        ocsf_emit!(event);
-    }
-    if !outcome.allowed {
-        UninspectableTrafficGate::Deny
-    } else if outcome.invocations.iter().any(|invocation| {
-        invocation.outcome
-            == openshell_supervisor_middleware::UninspectableInvocationOutcome::LegacyBypass
-    }) {
+    if chain
+        .iter()
+        .all(|entry| entry.on_error == openshell_supervisor_middleware::OnError::FailOpen)
+    {
         UninspectableTrafficGate::BypassWithFinding
     } else {
-        UninspectableTrafficGate::Allowed
+        UninspectableTrafficGate::Deny
     }
 }
 
@@ -376,80 +358,6 @@ pub fn middleware_request_context(
             }
         }),
     }
-}
-
-/// OCSF events for one uninspectable-traffic decision. Carries no service
-/// text.
-pub(super) fn uninspectable_decision_events(
-    ctx: &L7EvalContext,
-    reason: openshell_core::proto::UninspectableNetworkReason,
-    outcome: &openshell_supervisor_middleware::UninspectableOutcome,
-) -> Vec<openshell_ocsf::OcsfEvent> {
-    use openshell_supervisor_middleware::UninspectableInvocationOutcome;
-    let traffic = reason
-        .as_str_name()
-        .trim_start_matches("UNINSPECTABLE_NETWORK_REASON_")
-        .to_ascii_lowercase();
-    let mut events: Vec<_> = outcome
-        .invocations
-        .iter()
-        .map(|invocation| {
-            let (action, disposition, severity, status, name) = match invocation.outcome {
-                UninspectableInvocationOutcome::AllowWithoutInspection => (
-                    ActionId::Allowed,
-                    DispositionId::Allowed,
-                    SeverityId::Informational,
-                    StatusId::Success,
-                    "allow_without_inspection",
-                ),
-                UninspectableInvocationOutcome::LegacyBypass => (
-                    ActionId::Allowed,
-                    DispositionId::Allowed,
-                    SeverityId::Medium,
-                    StatusId::Success,
-                    "legacy_bypass",
-                ),
-                UninspectableInvocationOutcome::Deny => (
-                    ActionId::Denied,
-                    DispositionId::Blocked,
-                    SeverityId::Medium,
-                    StatusId::Failure,
-                    "deny",
-                ),
-                UninspectableInvocationOutcome::Failed => (
-                    ActionId::Denied,
-                    DispositionId::Blocked,
-                    SeverityId::High,
-                    StatusId::Failure,
-                    "evaluation_failed",
-                ),
-            };
-            let reason_code = invocation.reason_code.as_deref().unwrap_or("-");
-            let failure = invocation.failure_reason.as_deref().unwrap_or("-");
-            NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
-                .activity(ActivityId::Other)
-                .activity_name("Uninspectable traffic middleware")
-                .action(action)
-                .disposition(disposition)
-                .severity(severity)
-                .status(status)
-                .dst_endpoint(Endpoint::from_domain(&ctx.host, ctx.port))
-                .firewall_rule(&ctx.policy_name, "supervisor-middleware")
-                .unmapped("middleware_config", invocation.config_name.as_str())
-                .unmapped(
-                    "middleware_implementation",
-                    invocation.implementation.as_str(),
-                )
-                .unmapped("uninspectable_traffic", traffic.as_str())
-                .message(format!(
-                    "MIDDLEWARE_UNINSPECTABLE {name} config={} implementation={} traffic={traffic} reason_code={reason_code} failure={failure}",
-                    invocation.config_name, invocation.implementation,
-                ))
-                .build()
-        })
-        .collect();
-    events.extend(middleware_finding_events(&outcome.findings));
-    events
 }
 
 /// Emit the detection finding for traffic a matching middleware chain cannot
@@ -2788,52 +2696,6 @@ mod tests {
                 safe_middleware_headers(headers).is_err(),
                 "middleware must reject malformed header fields"
             );
-        }
-    }
-    #[test]
-    fn connection_audit_distinguishes_approval_denial_and_evaluation_failure() {
-        use super::uninspectable_decision_events;
-        use openshell_ocsf::SeverityId;
-        use openshell_supervisor_middleware::{
-            UninspectableInvocation, UninspectableInvocationOutcome as Outcome,
-            UninspectableOutcome,
-        };
-        let ctx = L7EvalContext {
-            host: "example.test".into(),
-            port: 443,
-            policy_name: "policy".into(),
-            ..Default::default()
-        };
-        for (outcome, expected, severity) in [
-            (
-                Outcome::AllowWithoutInspection,
-                "allow_without_inspection",
-                SeverityId::Informational,
-            ),
-            (Outcome::LegacyBypass, "legacy_bypass", SeverityId::Medium),
-            (Outcome::Deny, "deny", SeverityId::Medium),
-            (Outcome::Failed, "evaluation_failed", SeverityId::High),
-        ] {
-            let events = uninspectable_decision_events(
-                &ctx,
-                openshell_core::proto::UninspectableNetworkReason::TlsSkip,
-                &UninspectableOutcome {
-                    invocations: vec![UninspectableInvocation {
-                        config_name: "guard".into(),
-                        implementation: "registration".into(),
-                        outcome,
-                        reason_code: None,
-                        failure_reason: None,
-                    }],
-                    ..Default::default()
-                },
-            );
-            assert_eq!(events.len(), 1);
-            assert_eq!(events[0].class_uid(), 4001);
-            assert_eq!(events[0].base().severity, severity);
-            let json = serde_json::to_string(&events).unwrap();
-            assert!(json.contains(&format!("MIDDLEWARE_UNINSPECTABLE {expected} ")));
-            assert!(!json.contains("fail_open"));
         }
     }
 }

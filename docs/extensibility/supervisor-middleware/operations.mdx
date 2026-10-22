@@ -17,7 +17,6 @@ A middleware service handles one or more operations, such as HTTP requests or We
 | `HTTP_REQUEST` | `PRE_CREDENTIALS` | After network policy allows a request, before OpenShell injects provider credentials. | `HttpSessionMiddleware.EvaluateRequest`, or v1 `EvaluateHttpRequest` |
 | `HTTP_RESPONSE` | `PRE_RETURN` | After the external service responds, before the sandbox receives the response. | `HttpSessionMiddleware.EvaluateResponse`, or v1 `HttpResponsePreReturn.Evaluate` |
 | `WEBSOCKET_MESSAGE` | `PRE_CREDENTIALS` | When the sandbox opens a WebSocket connection, and for each text message it sends. | `EvaluateWebSocketSession` |
-| `UNINSPECTABLE_NETWORK` | `PRE_FORWARD` | Before OpenShell forwards a connection it cannot inspect, such as a `tls: skip` tunnel. | `UninspectableNetworkMiddleware.Evaluate` |
 
 Your service declares each operation it supports as a binding, an operation and its phase, in its `Describe` manifest. OpenShell calls your service only for the operations it declares.
 
@@ -234,15 +233,9 @@ A denied message closes the connection with code `1008`. When middleware fails, 
 
 ## Uninspectable Traffic
 
-OpenShell cannot inspect connections to `tls: skip` endpoints, h2c, unsupported tunnels, raw TCP, or SQL passthrough. To decide whether such a connection may proceed, bind `UNINSPECTABLE_NETWORK` at `PRE_FORWARD` with `max_payload_bytes: 0`, and serve `UninspectableNetworkMiddleware.Evaluate` on the same endpoint as `SupervisorMiddleware`. This binding can be the only one in your manifest.
+OpenShell cannot pass connections to `tls: skip` endpoints, h2c, unsupported tunnels, raw TCP, or SQL passthrough to middleware. Middleware selects them by host like any other connection. If a selected entry is `fail_closed`, OpenShell refuses the connection. If every selected entry sets `on_error: fail_open`, OpenShell lets it through and records a finding.
 
-Before it forwards such a connection, OpenShell calls `Evaluate` once for each selected entry, in chain order. The request carries the entry's configuration, the destination host and port, the reason, and `context`, whose `request_id` identifies the connection. Return `ALLOW_WITHOUT_INSPECTION` to let the connection through or `DENY` to refuse it. Every selected entry must allow the connection. For `tls: skip`, OpenShell decides before it accepts the `CONNECT` request, so a refusal returns `403`.
-
-This hook always fails closed. An unimplemented RPC, an error, a timeout, or an invalid result refuses the connection, regardless of `on_error`.
-
-A selected entry whose service does not bind `UNINSPECTABLE_NETWORK` refuses such connections, and the gateway rejects a policy in which it can select a `tls: skip` endpoint. If that entry sets `on_error: fail_open`, OpenShell instead lets the connection through and records a finding. This exception is deprecated and will be removed in 0.2.0. Add the binding to keep allowing these connections.
-
-Gateways and supervisors that predate this hook reject a manifest that binds it. Upgrade them before you add the binding.
+The gateway also rejects a policy in which a `fail_closed` entry can select a `tls: skip` endpoint. To allow such connections to a host, exclude the host from the entry's selector.
 
 ## Limits
 

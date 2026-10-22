@@ -17,4 +17,4 @@ dependency only.
 
 ## Connections without inspection
 
-Before the supervisor forwards a connection it cannot inspect (`tls: skip`, transparent TCP, h2c, unsupported tunnels, SQL passthrough), `uninspectable_traffic_decision` evaluates the matching middleware chain. Entries whose service binds `UNINSPECTABLE_NETWORK/PRE_FORWARD` decide through `UninspectableNetworkMiddleware.Evaluate`, and any failure denies. Other entries follow `on_error`: `fail_closed` denies, and `fail_open` relays the connection with a bypass finding. That `fail_open` exception is deprecated and removed in 0.2.0. For `tls: skip`, the decision runs before `200 Connection Established`, so a denial is a `403`.
+Before the supervisor forwards a connection it cannot inspect (`tls: skip`, transparent TCP, h2c, unsupported tunnels, SQL passthrough), `uninspectable_traffic_gate` checks the matching middleware chain. Any `fail_closed` entry denies the connection, and an all-`fail_open` chain relays it with a bypass finding. For `tls: skip`, the gate runs before `200 Connection Established`, so a denial is a `403`.

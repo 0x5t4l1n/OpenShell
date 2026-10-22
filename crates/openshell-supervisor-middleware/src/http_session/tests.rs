@@ -807,63 +807,6 @@ async fn each_stage_sees_only_earlier_stages_complete_header_mutations() {
     );
 }
 
-/// HTTP session hook service with only a response binding.
-struct ResponseOnlyStage;
-
-#[tonic::async_trait]
-impl InProcessMiddleware for ResponseOnlyStage {
-    async fn describe(&self) -> MiddlewareManifest {
-        MiddlewareManifest {
-            name: "example/response-only".into(),
-            ..session_manifest(vec![
-                binding(SupervisorMiddlewareOperation::HttpResponse),
-                MiddlewareBinding {
-                    operation: SupervisorMiddlewareOperation::UninspectableNetwork as i32,
-                    phase: SupervisorMiddlewarePhase::PreForward as i32,
-                    ..Default::default()
-                },
-            ])
-        }
-    }
-
-    async fn validate_config(
-        &self,
-        _middleware_name: &str,
-        _config: &prost_types::Struct,
-    ) -> miette::Result<()> {
-        Ok(())
-    }
-
-    async fn evaluate_http_request(
-        &self,
-        _request: HttpRequestView<'_>,
-    ) -> miette::Result<HttpRequestResult> {
-        Err(miette::miette!(
-            "HTTP session hook response-only test stage"
-        ))
-    }
-}
-
-#[tokio::test]
-async fn handwritten_default_callback_refuses_even_when_fail_open() {
-    let runner = ChainRunner::new(Arc::new(ResponseOnlyStage));
-    let mut entry = chain_entry("example/response-only", 0);
-    entry.on_error = OnError::FailOpen;
-    let outcome = runner
-        .evaluate_uninspectable(
-            &[entry],
-            crate::UninspectableTrafficInput {
-                context: RequestContext::default(),
-                host: "example.test".into(),
-                port: 443,
-                reason: openshell_core::proto::UninspectableNetworkReason::TlsSkip,
-            },
-        )
-        .await;
-    assert!(!outcome.allowed);
-    assert_eq!(outcome.reason, "middleware_failed: evaluation_failed");
-}
-
 fn scripted(name: &'static str, preflight: Preflight, body: Body) -> Arc<ScriptedStage> {
     Arc::new(ScriptedStage::new(name, preflight, body))
 }

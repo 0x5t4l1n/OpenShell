@@ -24,9 +24,7 @@ pub async fn validate_policy(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use openshell_core::extension_protocol::{
-        ExtensionFamily, extension_metadata, http_session_middleware_metadata,
-    };
+    use openshell_core::extension_protocol::http_session_middleware_metadata;
     use openshell_core::proto::{
         HttpRequestResult, MiddlewareBinding, MiddlewareEndpointSelector, MiddlewareManifest,
         NetworkMiddlewareConfig, SupervisorMiddlewareOperation, SupervisorMiddlewarePhase,
@@ -52,18 +50,9 @@ mod tests {
                         SupervisorMiddlewareOperation::HttpResponse => {
                             SupervisorMiddlewarePhase::PreReturn
                         }
-                        SupervisorMiddlewareOperation::UninspectableNetwork => {
-                            SupervisorMiddlewarePhase::PreForward
-                        }
                         _ => SupervisorMiddlewarePhase::PreCredentials,
                     } as i32,
-                    max_payload_bytes: if *operation
-                        == SupervisorMiddlewareOperation::UninspectableNetwork
-                    {
-                        0
-                    } else {
-                        1024
-                    },
+                    max_payload_bytes: 1024,
                     ..Default::default()
                 })
                 .collect();
@@ -78,18 +67,7 @@ mod tests {
             MiddlewareManifest {
                 name: self.name.into(),
                 bindings,
-                extension: Some(
-                    if self.operations == [SupervisorMiddlewareOperation::UninspectableNetwork] {
-                        extension_metadata(
-                            ExtensionFamily::SupervisorMiddleware,
-                            self.name,
-                            "test",
-                            [],
-                        )
-                    } else {
-                        http_session_middleware_metadata(self.name, "test")
-                    },
-                ),
+                extension: Some(http_session_middleware_metadata(self.name, "test")),
                 ..Default::default()
             }
         }
@@ -128,11 +106,6 @@ mod tests {
         services.push(Arc::new(TestMiddleware {
             name: "example/response-guard",
             operations: &[SupervisorMiddlewareOperation::HttpResponse],
-            websocket: false,
-        }));
-        services.push(Arc::new(TestMiddleware {
-            name: "example/connection-guard",
-            operations: &[SupervisorMiddlewareOperation::UninspectableNetwork],
             websocket: false,
         }));
         MiddlewareRegistry::connect_services(services, Vec::new())
@@ -270,48 +243,6 @@ mod tests {
             .expect_err("unregistered middleware must fail");
         assert_eq!(error.code(), tonic::Code::InvalidArgument);
         assert!(error.message().contains("not registered"));
-    }
-
-    #[tokio::test]
-    async fn tls_skip_rule_exempts_middleware_that_binds_uninspectable_network() {
-        use openshell_core::proto::{NetworkEndpoint, NetworkPolicyRule, NetworkTlsMode};
-        let registry = registry().await;
-        let legacy = openshell_supervisor_middleware_builtins::BUILTIN_REGEX;
-        for (implementation, on_error, accepted) in [
-            (legacy, "fail_open", true),
-            (legacy, "fail_closed", false),
-            (legacy, "", false),
-            ("example/connection-guard", "fail_closed", true),
-            ("example/guard", "", false),
-            ("example/response-guard", "", false),
-        ] {
-            let mut policy = policy(vec![(
-                "guard",
-                entry(implementation, 0, "*.example.com", on_error),
-            )]);
-            policy.network_policies.insert(
-                "tls".into(),
-                NetworkPolicyRule {
-                    name: "tls".into(),
-                    endpoints: vec![NetworkEndpoint {
-                        host: "api.example.com".into(),
-                        port: 443,
-                        tls: NetworkTlsMode::Skip as i32,
-                        ..Default::default()
-                    }],
-                    ..Default::default()
-                },
-            );
-            let conflicts =
-                openshell_policy::middleware_tls_skip_conflicts(&policy, |middleware| {
-                    registry.decides_uninspectable_traffic(middleware)
-                });
-            assert_eq!(
-                conflicts.is_empty(),
-                accepted,
-                "{implementation}/{on_error}: {conflicts:?}"
-            );
-        }
     }
 
     #[tokio::test]

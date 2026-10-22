@@ -548,7 +548,7 @@ network rules allow, in ascending `order`.
 
 Host patterns match the same way as endpoint hosts, up to 32 patterns per
 configuration. A `fail_closed` configuration cannot apply to an endpoint with
-`tls: skip` unless its service uses HTTP session hooks. Two configurations whose
+`tls: skip`. Two configurations whose
 host patterns may overlap must use the same HTTP hook version for the operations
 both handle. Refer to [Supervisor Middleware
 Configuration](/extensibility/supervisor-middleware/configure#mix-http-hook-versions).

@@ -21,9 +21,8 @@
 //! - STREAM carries a request body larger than any BUFFERED limit;
 //! - STREAM delivers server-sent events one by one;
 //! - a preflight rejection never contacts the upstream;
-//! - the guard refuses `tls: skip` tunnels in every body mode;
-//! - a policy that mixes HTTP hook versions on one destination is rejected at
-//!   `policy set`.
+//! - a policy that mixes HTTP hook versions on one destination, or in which
+//!   the guard selects a `tls: skip` endpoint, is rejected at `policy set`.
 
 use std::io::Write as _;
 use std::path::PathBuf;
@@ -413,56 +412,11 @@ async fn write_chunk(stream: &mut TcpStream, data: &[u8]) -> std::io::Result<()>
     stream.flush().await
 }
 
-/// Raw TCP echo server for the `tls: skip` endpoint.
-struct EchoServer {
-    port: u16,
-    observed: Arc<Mutex<Vec<u8>>>,
-    task: JoinHandle<()>,
-}
-
-impl EchoServer {
-    async fn start() -> Self {
-        let listener = TcpListener::bind(("0.0.0.0", 0))
-            .await
-            .expect("bind echo server");
-        let port = listener.local_addr().expect("echo address").port();
-        let observed = Arc::new(Mutex::new(Vec::new()));
-        let task_observed = Arc::clone(&observed);
-        let task = tokio::spawn(async move {
-            while let Ok((mut stream, _)) = listener.accept().await {
-                let observed = Arc::clone(&task_observed);
-                tokio::spawn(async move {
-                    let mut buffer = [0_u8; 4096];
-                    while let Ok(read) = stream.read(&mut buffer).await {
-                        if read == 0 {
-                            break;
-                        }
-                        observed.lock().unwrap().extend_from_slice(&buffer[..read]);
-                        if stream.write_all(&buffer[..read]).await.is_err() {
-                            break;
-                        }
-                    }
-                });
-            }
-        });
-        Self {
-            port,
-            observed,
-            task,
-        }
-    }
-}
-
-impl Drop for EchoServer {
-    fn drop(&mut self) {
-        self.task.abort();
-    }
-}
-
 struct PolicyCase<'a> {
     mode: &'a str,
     body_mode: &'a str,
-    /// Port of a `tls: skip` endpoint the attachment also selects.
+    /// Port of a `tls: skip` endpoint the attachment also selects, which the
+    /// gateway rejects.
     tls_skip_port: Option<u16>,
     /// Also attach `openshell/regex` (v1 HTTP hooks) to the same host.
     mixed: bool,
@@ -579,11 +533,9 @@ fn workload_script(upstream_port: u16, case: &PolicyCase<'_>) -> String {
 import gzip
 import http.client
 import json
-import socket
 
 HOST = "{SANDBOX_HOST}"
 PORT = {upstream_port}
-TLS_SKIP_PORT = {tls_skip_port}
 STREAM = {stream}
 
 def call(method, path, body=None, headers=None):
@@ -637,25 +589,8 @@ if STREAM:
         "rest": rest.decode("utf-8"),
     }}
 
-if TLS_SKIP_PORT:
-    payload = bytes([0x00, 0xff, 0x13, 0x37]) + b"prototype-secret"
-    try:
-        with socket.create_connection((HOST, TLS_SKIP_PORT), timeout=30) as sock:
-            sock.sendall(payload)
-            echoed = b""
-            while len(echoed) < len(payload):
-                chunk = sock.recv(len(payload) - len(echoed))
-                if not chunk:
-                    break
-                echoed += chunk
-        results["tls_skip"] = echoed.hex()
-    except OSError as error:
-        results["tls_skip"] = "error: " + type(error).__name__
 print(json.dumps(results, sort_keys=True))
 "#,
-        tls_skip_port = case
-            .tls_skip_port
-            .map_or_else(|| "None".to_string(), |port| port.to_string()),
         stream = if case.body_mode == "stream" {
             "True"
         } else {
@@ -695,13 +630,6 @@ fn assert_platform_error(result: &Value, name: &str, status: u64, error: &str) -
     body
 }
 
-fn tls_skip_payload() -> Vec<u8> {
-    [0x00, 0xff, 0x13, 0x37]
-        .into_iter()
-        .chain(*b"prototype-secret")
-        .collect()
-}
-
 fn should_run() -> Option<String> {
     let required = std::env::var(REQUIRE_ENV).as_deref() == Ok("1");
     let skip = |reason: &str| {
@@ -736,17 +664,15 @@ async fn http_session_hook_content_guard_runs_against_the_gateway_and_supervisor
     };
     let guard = ContentGuard::start(&binary).await;
     let upstream = Upstream::start().await;
-    let echo = EchoServer::start().await;
     let registration = GatewayRegistration::apply(guard.port).await;
 
-    // BUFFERED redaction in both directions, a preflight rejection, and a
-    // `tls: skip` tunnel denied by default.
+    // BUFFERED redaction in both directions and a preflight rejection.
     let redact = run_workload(
         &upstream,
         &PolicyCase {
             mode: "redact",
             body_mode: "buffered",
-            tls_skip_port: Some(echo.port),
+            tls_skip_port: None,
             mixed: false,
         },
     )
@@ -791,12 +717,6 @@ async fn http_session_hook_content_guard_runs_against_the_gateway_and_supervisor
             .all(|target| !target.contains("prototype-secret")),
         "a preflight rejection never contacts the upstream"
     );
-    assert_ne!(
-        redact["tls_skip"],
-        hex::encode(tls_skip_payload()),
-        "the guard denies uninspectable traffic: {redact}"
-    );
-    assert!(echo.observed.lock().unwrap().is_empty());
 
     // BUFFERED denial in both directions.
     let echo_bodies_before = upstream.bodies("/echo").len();
@@ -822,14 +742,13 @@ async fn http_session_hook_content_guard_runs_against_the_gateway_and_supervisor
         "a denied request body never reaches the upstream"
     );
 
-    // STREAM: a large upload, server-sent events one by one, and an allowed
-    // `tls: skip` tunnel.
+    // STREAM: a large upload and server-sent events one by one.
     let stream = run_workload(
         &upstream,
         &PolicyCase {
             mode: "redact",
             body_mode: "stream",
-            tls_skip_port: Some(echo.port),
+            tls_skip_port: None,
             mixed: false,
         },
     )
@@ -857,12 +776,6 @@ async fn http_session_hook_content_guard_runs_against_the_gateway_and_supervisor
         stream["events"]["rest"], "data: two\n\n",
         "the first event reached the sandbox before the second was sent: {stream}"
     );
-    assert_ne!(
-        stream["tls_skip"],
-        hex::encode(tls_skip_payload()),
-        "the guard denies uninspectable traffic in STREAM mode: {stream}"
-    );
-    assert!(echo.observed.lock().unwrap().is_empty());
 
     // A policy that runs both HTTP hook versions for one destination is rejected.
     let base = write_policy(
@@ -915,6 +828,39 @@ async fn http_session_hook_content_guard_runs_against_the_gateway_and_supervisor
     assert!(
         message.contains("separate their endpoint selectors"),
         "the rejection says how to fix the policy:\n{output}"
+    );
+
+    // The guard is fail-closed and cannot inspect a `tls: skip` tunnel, so a
+    // policy in which it selects one is rejected.
+    let tls_skip = write_policy(
+        upstream.port,
+        &PolicyCase {
+            mode: "redact",
+            body_mode: "buffered",
+            tls_skip_port: Some(find_free_port()),
+            mixed: false,
+        },
+    );
+    let (output, exit_code) = run_cli(&[
+        "policy",
+        "set",
+        &sandbox.name,
+        "--policy",
+        tls_skip.path().to_str().expect("UTF-8 policy path"),
+    ])
+    .await;
+    assert_ne!(
+        exit_code, 0,
+        "a policy in which the guard selects a tls: skip endpoint is rejected:\n{output}"
+    );
+    let message = output
+        .replace('│', " ")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert!(
+        message.contains("tls: skip endpoint"),
+        "the rejection names the tls: skip endpoint:\n{output}"
     );
     sandbox.cleanup().await;
 

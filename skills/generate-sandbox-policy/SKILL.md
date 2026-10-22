@@ -231,7 +231,7 @@ Add `network_middlewares` only when the user asks to inspect, transform, redact,
 - Entries whose endpoint selectors may overlap must use the same HTTP hook version for the operations both handle. The built-in `openshell/regex` uses v1 HTTP hooks, so do not let its selector overlap an HTTP session hook service that inspects requests.
 - Assign unique `order` values across the complete policy. Lower values run first, and at most 10 configs may be selected.
 - Match the narrowest destination hosts possible with `endpoints.include`; use `exclude` when a broad selector has trusted exceptions.
-- Do not select `tls: skip` endpoints with fail-closed middleware unless its service binds `UNINSPECTABLE_NETWORK/PRE_FORWARD`, because the supervisor cannot inspect that traffic. Such a service allows or refuses each connection without seeing its content. A `fail_open` entry without the binding lets the traffic through with a finding; that exception is deprecated and removed in 0.2.0.
+- Do not select fail-closed middleware for `tls: skip` endpoints because the supervisor cannot inspect that traffic.
 
 ### Mapping Paths to Glob Patterns (when building explicit rules)
 
@@ -403,7 +403,7 @@ Before presenting the policy to the user, verify correctness **and** flag breadt
 - [ ] `rules` list is not empty when present
 - [ ] Every middleware config has a non-empty `middleware` name and non-empty `endpoints.include`
 - [ ] Middleware `order` values are unique and no selected chain exceeds 10 stages
-- [ ] No fail-closed middleware selector can cover a `tls: skip` endpoint unless its service binds `UNINSPECTABLE_NETWORK/PRE_FORWARD`
+- [ ] No fail-closed middleware selector can cover a `tls: skip` endpoint
 - [ ] No HTTP session hook middleware entry uses `on_error: fail_open`
 - [ ] Middleware entries with overlapping selectors use the same HTTP hook version for each HTTP operation they share
 - [ ] Any required WebSocket control advertises `WEBSOCKET_MESSAGE/PRE_CREDENTIALS`, and the user understands that V1 does not inspect binary messages
@@ -432,7 +432,7 @@ Evaluate the generated policy for overly broad access and **include warnings in 
 
 | Condition | Warning to show |
 |-----------|----------------|
-| **L4-only** (no `protocol`, or `protocol: tcp`) | "This policy allows all application methods and paths. An omitted protocol uses explicit-proxy behavior and applies no method or path rules. With default TLS handling, the proxy terminates detected TLS and checks the authority of the HTTP requests it parses, but other CONNECT payloads, such as HTTP/2 prior knowledge or non-HTTP hook versions, can pass through a raw relay; `tls: skip` also bypasses termination and parsing. `protocol: tcp` enables policy DNS and transparent TCP only on a runtime that advertises the complete substrate (currently Docker and Podman); its hostname constrains connection routing, not application authority, so compatible shared infrastructure may expose other tenants or services. Consider `protocol: rest` with a preset if you want HTTP method-level or authority control." |
+| **L4-only** (no `protocol`, or `protocol: tcp`) | "This policy allows all application methods and paths. An omitted protocol uses explicit-proxy behavior and applies no method or path rules. With default TLS handling, the proxy terminates detected TLS and checks the authority of the HTTP requests it parses, but other CONNECT payloads, such as HTTP/2 prior knowledge or non-HTTP protocols, can pass through a raw relay; `tls: skip` also bypasses termination and parsing. `protocol: tcp` enables policy DNS and transparent TCP only on a runtime that advertises the complete substrate (currently Docker and Podman); its hostname constrains connection routing, not application authority, so compatible shared infrastructure may expose other tenants or services. Consider `protocol: rest` with a preset if you want HTTP method-level or authority control." |
 | **`access: full`** | "This policy allows all HTTP methods (including DELETE) on all paths. If you don't need DELETE, `read-write` is safer. If you only need to read, `read-only` is the most restrictive option." |
 | **`access: full` + `enforcement: audit`** | "Full access in audit mode provides no actual restriction — all traffic flows through. This is effectively a monitoring-only policy." |
 | **`access: read-write`** when user hasn't confirmed write need | "This policy allows POST, PUT, and PATCH on all paths. If you only need to read data, `read-only` is more restrictive." |

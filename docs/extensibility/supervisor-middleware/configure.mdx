@@ -183,7 +183,7 @@ Middleware that uses HTTP session hooks always fails closed. The gateway rejects
 
 A denial from middleware always blocks traffic, regardless of `on_error`. Middleware decisions also stay enforced when the endpoint uses `enforcement: audit`. To observe traffic without blocking it, have your middleware allow the traffic and report findings.
 
-`on_error` does not extend what middleware can inspect. The [current limitations](/extensibility/supervisor-middleware#current-limitations) apply under both settings. An entry can select a `tls: skip` endpoint only if its service binds `UNINSPECTABLE_NETWORK`, so that it [decides](/extensibility/supervisor-middleware/operations#uninspectable-traffic) whether to allow such connections, or if the entry sets `on_error: fail_open`. The `fail_open` exception is deprecated and will be removed in 0.2.0.
+`on_error` does not extend what middleware can inspect. The [current limitations](/extensibility/supervisor-middleware#current-limitations) apply under both settings. With the default behavior, an entry cannot select a `tls: skip` endpoint, because OpenShell cannot inspect that traffic.
 
 ## Operate Middleware Services
 

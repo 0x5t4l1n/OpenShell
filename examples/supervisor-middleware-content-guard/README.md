@@ -12,7 +12,7 @@ This configured-literal guard applies the same case-sensitive terms to HTTP requ
 
 The guard implements [HTTP session hooks](../../docs/extensibility/supervisor-middleware/operations.mdx) (`HttpSessionMiddleware.EvaluateRequest` and `HttpSessionMiddleware.EvaluateResponse`) only. Its manifest requires the `openshell.supervisor-middleware.http-session` capability. Gateways and supervisors that predate HTTP session hooks do not support it, so they refuse the service at startup. The example released with v0.1.2 is the v1 HTTP hook reference.
 
-The guard serves `SupervisorMiddleware`, `HttpSessionMiddleware`, and `UninspectableNetworkMiddleware` on the same endpoint. `SupervisorMiddleware` handles discovery, configuration, and WebSocket sessions.
+The guard serves `HttpSessionMiddleware` and `SupervisorMiddleware` on the same endpoint. `SupervisorMiddleware` handles discovery, configuration, and WebSocket sessions.
 
 > [!WARNING]
 > This intentionally simple implementation demonstrates the supervisor middleware service contract. It is not a complete or reliable content guard and must not be used as a security control. It matches case-sensitive literal bytes in HTTP bodies and WebSocket text messages, merges overlapping literal match ranges before redaction, and does not address encodings, transformations, normalization, binary WebSocket messages, upstream-to-client WebSocket messages, or adversarial inputs that a production content guard must handle.
@@ -106,7 +106,7 @@ At preflight, the guard selects its configured `body_mode`, BUFFERED by default,
 - The guard denies a request whose path or query contains a configured term at preflight with reason code `content_match`. This happens before the guard receives body bytes or OpenShell contacts the upstream. Earlier middleware may already have processed the body.
 - A message with an empty or absent body continues without inspection.
 - When OpenShell offers no body mode, such as for an encoded request or response, or a partial or `no-transform` response, the guard rejects the message with reason code `cannot_inspect`.
-- The guard binds `UNINSPECTABLE_NETWORK/PRE_FORWARD`, so OpenShell asks it through `UninspectableNetworkMiddleware.Evaluate` before forwarding a connection it cannot inspect, such as a `tls: skip` tunnel. The guard cannot see their content, so it denies them with reason code `uninspectable_traffic`.
+- The guard never sees connections OpenShell cannot inspect. OpenShell denies h2c, raw TCP, and other uninspectable connections to hosts the guard selects, and the gateway rejects a policy in which the guard can select a `tls: skip` endpoint.
 
 Redact mode replaces matching spans. Deny mode rejects the message with reason code `content_match`. In STREAM mode, a response whose head has already reached the sandbox is aborted instead.
 

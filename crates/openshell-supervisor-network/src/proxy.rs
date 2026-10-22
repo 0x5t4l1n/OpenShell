@@ -1237,12 +1237,7 @@ async fn handle_transparent_tcp_connection(
             endpoint_observation: None,
         },
     );
-    let middleware_gate = middleware_uninspectable_gate(
-        &opa_engine,
-        &ctx,
-        openshell_core::proto::UninspectableNetworkReason::RawTcp,
-    )
-    .await?;
+    let middleware_gate = middleware_uninspectable_gate(&opa_engine, &ctx)?;
     if middleware_gate == crate::l7::middleware::UninspectableTrafficGate::Deny {
         crate::l7::middleware::emit_middleware_uninspectable(&ctx, "transparent tcp", true);
         return Ok(());
@@ -1710,22 +1705,16 @@ fn unsupported_l7_tunnel_protocol_detail(
 
 /// Gate for traffic that would bypass L7 inspection entirely: query the
 /// middleware chain matching this destination and process identity, and
-/// decide whether raw relay is allowed. Under v1 HTTP hooks, uninspectable
-/// traffic is denied when any matching entry is `fail_closed`, and an
-/// all-`fail_open` chain passes it through with a bypass detection finding.
-/// HTTP session hook middleware decides itself at an uninspectable preflight.
-async fn middleware_uninspectable_gate(
+/// decide whether raw relay is allowed. Uninspectable traffic is denied when
+/// any matching entry is `fail_closed`; an all-`fail_open` chain passes it
+/// through with a bypass detection finding.
+fn middleware_uninspectable_gate(
     opa_engine: &OpaEngine,
     ctx: &crate::l7::relay::L7EvalContext,
-    reason: openshell_core::proto::UninspectableNetworkReason,
 ) -> Result<crate::l7::middleware::UninspectableTrafficGate> {
     let input = crate::l7::middleware::middleware_network_input(ctx);
     let (chain, _generation) = opa_engine.query_middleware_chain_with_generation(&input)?;
-    if chain.is_empty() {
-        return Ok(crate::l7::middleware::UninspectableTrafficGate::Unrestricted);
-    }
-    let runner = opa_engine.middleware_runner()?;
-    Ok(crate::l7::middleware::uninspectable_traffic_decision(&runner, &chain, ctx, reason).await)
+    Ok(crate::l7::middleware::uninspectable_traffic_gate(&chain))
 }
 
 async fn peek_tunnel_protocol<C>(client: &mut C) -> Result<Option<TunnelProtocol>>
@@ -2986,19 +2975,11 @@ async fn handle_mediated_connection(
         },
     );
 
-    // Decide about a `tls: skip` tunnel before `200 Connection Established`,
-    // so a denial is a plain 403. Policy validation rejects fail-closed
-    // middleware without the uninspectable binding overlapping `tls: skip`
-    // endpoints, so for those this gate is defense in depth. Middleware that
-    // binds UNINSPECTABLE_NETWORK decides here.
+    // Gate a `tls: skip` tunnel before `200 Connection Established`, so a
+    // denial is a plain 403. Policy validation rejects fail-closed middleware
+    // overlapping `tls: skip` endpoints; this runtime gate is defense in depth.
     if effective_tls_skip {
-        match middleware_uninspectable_gate(
-            &opa_engine,
-            &ctx,
-            openshell_core::proto::UninspectableNetworkReason::TlsSkip,
-        )
-        .await?
-        {
+        match middleware_uninspectable_gate(&opa_engine, &ctx)? {
             crate::l7::middleware::UninspectableTrafficGate::Deny => {
                 crate::l7::middleware::emit_middleware_uninspectable(&ctx, "tls-skip tunnel", true);
                 respond(
@@ -3020,8 +3001,7 @@ async fn handle_mediated_connection(
                     false,
                 );
             }
-            crate::l7::middleware::UninspectableTrafficGate::Unrestricted
-            | crate::l7::middleware::UninspectableTrafficGate::Allowed => {}
+            crate::l7::middleware::UninspectableTrafficGate::Unrestricted => {}
         }
     }
 
@@ -3252,16 +3232,7 @@ async fn handle_mediated_connection(
             }
         }
     } else {
-        let middleware_gate = middleware_uninspectable_gate(
-            &opa_engine,
-            &ctx,
-            if tunnel_protocol == TunnelProtocol::H2cPriorKnowledge {
-                openshell_core::proto::UninspectableNetworkReason::H2c
-            } else {
-                openshell_core::proto::UninspectableNetworkReason::UnsupportedTunnel
-            },
-        )
-        .await?;
+        let middleware_gate = middleware_uninspectable_gate(&opa_engine, &ctx)?;
         let requirement = inspection_requirement(should_inspect_l7, middleware_gate);
         if let Some(protocol_detail) =
             unsupported_l7_tunnel_protocol_detail(tunnel_protocol, requirement)
@@ -9585,12 +9556,6 @@ network_middlewares:
     on_error: fail_closed
     endpoints:
       include: ["{upstream_ip}"]
-  connection:
-    middleware: test/connection-guard
-    order: 1
-    on_error: fail_closed
-    endpoints:
-      include: ["{upstream_ip}"]
 network_policies:
   allow-upstream:
     name: allow-upstream
@@ -9606,10 +9571,8 @@ network_policies:
             OpaEngine::from_strings(include_str!("../data/sandbox-policy.rego"), &data)
                 .expect("load policy"),
         );
-        let mut services = openshell_supervisor_middleware_builtins::services();
-        services.push(uninspectable_tests::denying_service());
         let registry = openshell_supervisor_middleware::MiddlewareRegistry::connect_services(
-            services,
+            openshell_supervisor_middleware_builtins::services(),
             Vec::new(),
         )
         .await
@@ -10392,14 +10355,6 @@ network_policies:
         assert_eq!(
             inspection_requirement(true, UninspectableTrafficGate::Deny),
             InspectionRequirement::L7Route
-        );
-        assert_eq!(
-            inspection_requirement(true, UninspectableTrafficGate::Allowed),
-            InspectionRequirement::L7Route
-        );
-        assert_eq!(
-            inspection_requirement(false, UninspectableTrafficGate::Allowed),
-            InspectionRequirement::None
         );
         assert_eq!(
             inspection_requirement(false, UninspectableTrafficGate::Deny),
@@ -14633,16 +14588,6 @@ network_policies:
         connect_target: &str,
         budget: std::time::Duration,
     ) -> (bool, Vec<u8>, Vec<String>) {
-        drive_connect_through_handler_with_middleware(endpoint_yaml, connect_target, budget, None)
-            .await
-    }
-
-    async fn drive_connect_through_handler_with_middleware(
-        endpoint_yaml: &str,
-        connect_target: &str,
-        budget: std::time::Duration,
-        middleware: Option<openshell_supervisor_middleware::ChainRunner>,
-    ) -> (bool, Vec<u8>, Vec<String>) {
         const POLICY_REGO: &str = include_str!("../data/sandbox-policy.rego");
 
         // Allow the current test binary — the in-process client's
@@ -14658,17 +14603,7 @@ network_policies:
 "#,
             exe = exe.display(),
         );
-        let data = if middleware.is_some() {
-            format!(
-                "{data}\nnetwork_middlewares:\n  guard:\n    middleware: test/connection-guard\n    on_error: fail_open\n    endpoints:\n      include: [\"203.0.113.10\"]\n"
-            )
-        } else {
-            data
-        };
         let engine = Arc::new(OpaEngine::from_strings(POLICY_REGO, &data).expect("load policy"));
-        if let Some(runner) = middleware {
-            engine.set_middleware_runner_for_tests(runner);
-        }
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let proxy_port = listener.local_addr().unwrap().port();
@@ -14889,24 +14824,6 @@ network_policies:
             "an explicit loopback endpoint must fail declared-endpoint validation; got: {response:?}"
         );
         assert_eq!(denial_stages, ["ssrf"]);
-    }
-
-    #[tokio::test]
-    async fn tls_skip_callback_denial_precedes_connect_success_and_payload() {
-        if !cfg!(target_os = "linux") {
-            return;
-        }
-        let (completed, response, _) = drive_connect_through_handler_with_middleware(
-            "      - { host: \"203.0.113.10\", port: 443, tls: skip }\n",
-            "203.0.113.10:443",
-            std::time::Duration::from_secs(2),
-            Some(uninspectable_tests::denying_runner()),
-        )
-        .await;
-        assert!(completed);
-        let response = String::from_utf8(response).unwrap();
-        assert!(response.starts_with("HTTP/1.1 403 Forbidden"), "{response}");
-        assert!(!response.contains("200 Connection Established"));
     }
 
     /// A real `tls: skip` policy path through the handler is exempt from the
@@ -15598,6 +15515,3 @@ network_policies:
     #[path = "token_grants.rs"]
     mod token_grants;
 }
-
-#[cfg(test)]
-mod uninspectable_tests;
