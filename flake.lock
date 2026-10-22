@@ -20,11 +20,11 @@
     },
     "nixpkgs": {
       "locked": {
-        "lastModified": 1792514193,
-        "narHash": "sha256-q8qbDVZy0GmabhCOnQTqFVho1hgJd85GePju462d7mc=",
+        "lastModified": 1787135253,
+        "narHash": "sha256-RD2kNWCG+Bjo6h+JVjWVNntZs2GtRoeY2xHjts/FNkA=",
         "owner": "NixOS",
         "repo": "nixpkgs",
-        "rev": "7bfe60fe75d8c7171b95e6ec2d610d4778cc549b",
+        "rev": "ffb3c9b700e759be2ef13237c9d8f953b32a1e46",
         "type": "github"
       },
       "original": {
@@ -50,11 +50,28 @@
         "type": "github"
       }
     },
+    "nixpkgs-uv": {
+      "locked": {
+        "lastModified": 1792514193,
+        "narHash": "sha256-q8qbDVZy0GmabhCOnQTqFVho1hgJd85GePju462d7mc=",
+        "owner": "NixOS",
+        "repo": "nixpkgs",
+        "rev": "7bfe60fe75d8c7171b95e6ec2d610d4778cc549b",
+        "type": "github"
+      },
+      "original": {
+        "owner": "NixOS",
+        "repo": "nixpkgs",
+        "rev": "7bfe60fe75d8c7171b95e6ec2d610d4778cc549b",
+        "type": "github"
+      }
+    },
     "root": {
       "inputs": {
         "flake-utils": "flake-utils",
         "nixpkgs": "nixpkgs",
         "nixpkgs-test-guest": "nixpkgs-test-guest",
+        "nixpkgs-uv": "nixpkgs-uv",
         "rust-overlay": "rust-overlay",
         "treefmt-nix": "treefmt-nix"
       }
