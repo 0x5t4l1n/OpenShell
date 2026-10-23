@@ -95,7 +95,7 @@ jobs:
           cache-targets: "true"
           # Other mirrors cannot restore this branch's cache, so saving it only
           # evicts the main cache they do restore.
-          save-if: "false"
+          save-if: "true"
           cache-bin: "false"
       - name: Lint Windows-supported crates
         run: mise run --skip-tools windows:lint:${{ matrix.arch }}
