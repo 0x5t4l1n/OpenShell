@@ -187,6 +187,7 @@ impl TestSetup {
             ),
             sandbox_bearer: self.auth.sandbox_bearer_slot().unwrap(),
             takeover: None,
+            supervisor_recovery_timeout_secs: None,
         }
     }
 }
@@ -707,6 +708,7 @@ async fn shared_startup_uses_selected_backend_through_readiness_and_shutdown() {
             // The binary loads the proxy trust directory from its environment.
             proxy_tls: openshell_supervisor_network::run::ProxyTlsFiles::from_environment(),
             takeover: None,
+            supervisor_recovery_timeout_secs: None,
         };
         let bindings = crate::SandboxInstanceBindings::dedicated(
             &config,
