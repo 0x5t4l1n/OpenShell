@@ -20,15 +20,18 @@ authorize the new one.
 
 ## Static credential delivery
 
-Provider environment entries carry placement from the owning credential's
-profile declaration. The gateway withholds individual entries without usable
-placement and reports `CredentialsWithheld`. Placement participates in both
-ordinary credential identity and stable handle derivation, so changing it
-revokes incompatible retained workload references.
+Existing polling and configuration-push environments keep their original wire
+shape, delivery behavior, identities, and stable-handle derivation. The gateway
+adds placement-only `ProviderProfileCredential` entries to the existing runtime
+credential map under `static-env:<ENV_KEY>`, for actually delivered static keys.
+Entries are matched to their owning provider binding and contain no token grant,
+refresh configuration, or credential values. The supervisor infers enforcement
+from the auth metadata; the gateway does not enforce placement.
 
-Polling supervisors must advertise placement enforcement before receiving static
-material. Configuration push requires the same capability for the entire session;
-older supervisors fall back to polling and its credential withholding checks.
+Older supervisors ignore entries without token grants. An older gateway omits
+these entries, so newer supervisors retain legacy behavior. Metadata travels in
+the same captured environment snapshot; no separate service, capability gate,
+or additional lookup is needed.
 
 ## Operator credential export
 
