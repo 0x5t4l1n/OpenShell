@@ -10,14 +10,6 @@ position: 3
 
 Install OpenShell on a local workstation or Kubernetes.
 
-For native Windows x64 or ARM64, use the
-[`windows` development and release branch](https://github.com/NVIDIA/OpenShell/tree/windows)
-and its [Windows build and runtime guide](https://github.com/NVIDIA/OpenShell/blob/windows/WINDOWS.md).
-That implementation uses Microsoft MXC and remains on `windows` even when this
-documentation is published from `main`. The installer and release channels
-below cover Linux/macOS, including experimental Linux use inside WSL 2;
-they do not install native Windows binaries.
-
 ## Install OpenShell
 
 Install the CLI, policy prover, and a local gateway with one command:
@@ -256,6 +248,13 @@ systemctl --user enable --now snap.openshell.user-gateway.service
 ```
 
 For an installation upgraded from a legacy system gateway, use `sudo systemctl reset-failed snap.openshell.system-gateway.service` and `sudo snap restart openshell.system-gateway` instead.
+
+## Windows
+
+Native Windows x64 and ARM64 use MXC. Build from the
+[`windows` branch](https://github.com/NVIDIA/OpenShell/tree/windows) and follow
+its [Windows guide](https://github.com/NVIDIA/OpenShell/blob/windows/WINDOWS.md).
+The shell installer above does not install native Windows binaries.
 
 ## Kubernetes
 
