@@ -26,3 +26,13 @@ HTTP client; a token acquired for one sandbox is never served to another.
 Without a Workload API socket, token grants fail closed. A process hosting
 several instances serves `/v1/denials` from a per-instance
 `SandboxInstanceDenialLog` instead of the shared shorthand log files.
+
+## Static credential placement
+
+Static credential substitution checks the credential's declared request location
+before writing upstream. HTTP placement violations return a safe 403 response;
+WebSocket violations close the connection with policy denial. Both paths emit a
+domain event and a detection finding without credential values or placeholders.
+Body and WebSocket rewrite flags do not override static placement. SigV4 signing
+uses the endpoint-scoped resolver's trusted signing-only access instead of a
+workload-selected request location.

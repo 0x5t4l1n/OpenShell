@@ -18,6 +18,18 @@ Retries reuse that generation and session, including after gateway restart.
 Credential renewal retains both; credentials for an older launch cannot
 authorize the new one.
 
+## Static credential delivery
+
+Provider environment entries carry placement from the owning credential's
+profile declaration. The gateway withholds individual entries without usable
+placement and reports `CredentialsWithheld`. Placement participates in both
+ordinary credential identity and stable handle derivation, so changing it
+revokes incompatible retained workload references.
+
+Polling supervisors must advertise placement enforcement before receiving static
+material. Configuration push requires the same capability for the entire session;
+older supervisors fall back to polling and its credential withholding checks.
+
 ## Operator credential export
 
 `GetProviderCredentials` exports selected profile-declared runtime environment
