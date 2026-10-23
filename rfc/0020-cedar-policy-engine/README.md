@@ -131,6 +131,7 @@ This RFC does not restate Cedar; see:
 | Attached providers | Grant access to their endpoints and supply credentials | Supply credentials only; your policy must allow the endpoints |
 | Gateway-wide configuration applied to every sandbox (`openshell policy set --global`), policy templates | Supported | YAML only |
 | Format of a sandbox | — | Fixed for its lifetime; recreate to switch |
+| Gateway and runtime versions | Any | Both must support Cedar; the CLI and SDKs refuse to send a Cedar policy to a gateway that does not advertise it, and the gateway withholds a Cedar policy from a runtime that cannot interpret it |
 | View the policy | `openshell policy get` | `openshell policy get` prints the Cedar text, then middleware and endpoint settings; `--full` adds provider credential rules |
 
 Validation happens three times with the same checks: in the CLI before the
@@ -383,7 +384,9 @@ DNS resolves the same hosts. Request rules work on wildcard hosts too: an
 == 443` conditions inspects every matching host, as a YAML wildcard endpoint
 with rules does. Exact and glob entries that select one host combine their
 paths, and conflicting inspection on an equally specific path is rejected at
-load, as YAML rejects overlapping endpoints.
+load, as YAML rejects overlapping endpoints. A host selector, exact or glob,
+is limited to 253 bytes, the length of a DNS name; a longer one is rejected
+at load.
 
 #### Path rules and deny rules
 
@@ -435,7 +438,9 @@ when { context.path like("/repos/*/*/rulesets", "/") };
 `hasTag` before `getTag`. When a key repeats (`?tag=a&tag=b`), OpenShell
 evaluates the request once per combination of values and allows it only if no
 evaluation is denied and one `permit` allows every evaluation, which is what
-YAML's allow and deny matchers do. More than 4,096 combinations is denied.
+YAML's allow and deny matchers do. More than 4,096 combinations of the values
+of the keys that deciding policies read is denied; keys that only staged
+policies read do not count (see [Audit mode](#audit-mode)).
 
 #### MCP
 
@@ -495,7 +500,11 @@ method of the selected revision, `extension` otherwise). Two things YAML does
 implicitly are explicit here: the server-to-client receive stream and client
 response frames need their own permit, and the accepted MCP revisions are an
 endpoint setting rather than part of the policy. Calls not sent with `POST`
-are denied before evaluation, as in YAML.
+are denied before evaluation, as in YAML. A Cedar MCP endpoint reports
+endpoint status (`openshell sandbox get`) as a YAML one does, under the
+identity of its configured selector: the host or host glob, port, and path of
+the `@protocol("mcp")` policy, or of the provider or `endpoint_settings` entry
+that selects it, never the host a request happened to use.
 
 #### GraphQL
 
@@ -648,7 +657,11 @@ A *staged* policy is different: `@enforcement("staged")` marks a policy that
 never takes part in a decision and never changes a path's mode. OpenShell
 compares the decision with and without it and logs each request whose
 decision it would change, so a new `forbid` can be observed before it is
-enforced:
+enforced. The comparison cannot alter the enforced decision: the query keys a
+staged policy reads do not count toward the 4,096-combination limit of the
+deciding policies, the comparison has its own budget, and an evaluation error
+or an exceeded budget in the comparison skips it and keeps the enforced
+result (the same error in a deciding policy still fails the request closed):
 
 ```cedar
 @enforcement("staged")
@@ -729,11 +742,11 @@ through their engines with the calls the proxy makes, comparing decisions,
 selected inspection, policy DNS eligibility and records, admitted token-grant
 owners, endpoint settings, address admission, and whole relay exchanges.
 
-Of the 1,338 unit tests in that crate, 260 test a YAML policy decision. 258
+Of the unit tests in that crate, 260 test a YAML policy decision. 258
 have a Cedar equivalent in the harness. The remaining two need a Cedar
 language change (a binary glob matched against ancestors) or test data the
-YAML loader rejects. On Linux the harness runs 2,909 cases, counting the
-rows generated per example and per glob pattern: 2,904 agree, and 5 are
+YAML loader rejects. On Linux the harness runs 2,911 cases, counting the
+rows generated per example and per glob pattern: 2,906 agree, and 5 are
 recorded differences that the harness fails on if the engines start to
 agree (the harness prints this tally, so the numbers are reproducible). An
 evaluation error on either side fails a case unless the case allows it, and
@@ -798,7 +811,9 @@ both engines hand to the proxy (endpoint configs, policy DNS records,
 middleware configs) is typed Rust; the Rego engine converts its output into
 those types at one boundary, and nothing from the Rego library appears on the
 Cedar path. A format switch on a live sandbox is rejected because the engine
-is fixed at startup.
+is fixed at startup. Limits that belong to the sandbox rather than to an
+engine, such as the WebSocket message-assembly budget, are shared by every
+tunnel of either engine and survive reloads.
 
 **Accept only what can be enforced exactly.** Cedar decides `NetworkConnect`
 and `HttpRequest` at request time, but Landlock grants, which endpoints the
@@ -809,7 +824,11 @@ whose meaning the artifacts could not reproduce: a conditional file permit, a
 `destination_ip` test in a form whose ranges cannot be read, an `HttpRequest`
 policy with no endpoint in its scope. The alternative, loading the policy and
 enforcing an approximation, would make the analyzed policy and the enforced
-behavior differ, which is the problem this RFC exists to remove.
+behavior differ, which is the problem this RFC exists to remove. The analysis
+itself is bounded by its input: host selectors are limited to a DNS name's
+length, literal hosts are compared directly, and host-glob overlap is checked
+in space linear in the pattern length, so the largest policy the gateway
+accepts cannot exhaust its memory at validation.
 
 **Policy and configuration are separate files.** Middleware and endpoint
 settings do not grant or deny anything; they configure how allowed traffic is
@@ -851,6 +870,19 @@ symbolic-compiler, and Lean specification support, in `ai-openshell/cedar`,
 additive, so gateway storage, revision history, and policy hashing are
 unchanged and stored YAML policies decode exactly as before.
 
+**Cedar support is negotiated, never assumed.** Additive fields cut both
+ways: a gateway without Cedar support would decode a Cedar policy as an empty
+YAML policy, accept it, and let attached providers open their endpoints,
+whatever the Cedar text forbids. Two flags close that gap, following the
+`supports_stable_placeholder` precedent. `HealthResponse.supports_cedar_policy`
+tells a client whether the gateway interprets Cedar; the CLI and the Rust,
+Python, Go, and TypeScript SDKs check it and refuse to send a Cedar policy to
+a gateway that does not advertise it, before any sandbox is created or policy
+changed. `GetSandboxConfigRequest.supports_cedar_policy` tells the gateway
+whether the sandbox runtime fetching a configuration interprets Cedar; a
+Cedar policy requested without it is answered with `Unimplemented` rather
+than an empty policy, so an older runtime cannot start a Cedar sandbox open.
+
 **Decisions before and after DNS.** A connection is authorized before the
 destination resolves, so address conditions are evaluated twice: once with
 `destination_ip` absent, treating address conjuncts as satisfied, and again
@@ -867,29 +899,46 @@ middleware alone keeps Cedar's generation so it does not close tunnels.
 
 ## Implementation plan
 
-The proposal is implemented on `vishwa/cedar-openshell` as one commit on
-`main`. It contains the schema and engine crates
-(`openshell-policy-cedar-schema`, `openshell-policy-cedar`), the proto fields,
-CLI, gateway, and supervisor integration, the `PolicyEngine` enum, the
-middleware file with `endpoint_settings`, credentials-only providers with
-token-grant admission, the `cedar` feature flag on `openshell-policy`, Go SDK
-fields, the parity harness, the `e2e/cedar` suite and its CI matrix entry,
-Cedar versions of every example and e2e policy, the Cedar policies
-documentation page, and the crate README.
+The proposal is implemented on `vishwa/cedar-openshell`, under review as
+[pull request #4565](https://github.com/NVIDIA/OpenShell/pull/4565). It
+contains the schema and engine crates (`openshell-policy-cedar-schema`,
+`openshell-policy-cedar`), the proto fields and capability flags, CLI,
+gateway, and supervisor integration, the `PolicyEngine` enum, the middleware
+file with `endpoint_settings`, credentials-only providers with token-grant
+admission, the `cedar` feature flag on `openshell-policy`, Cedar fields and
+capability checks in the Rust, Python, Go, and TypeScript SDKs, the parity
+harness, the `e2e/cedar` suite and its CI matrix entry, Cedar versions of
+every example and e2e policy, the Cedar policies documentation page, the
+crate README, and the public `openshell-cli` and `generate-sandbox-policy`
+skills.
+
+A panel review of the pull request found six defects and one documentation
+gap, each since fixed with a regression test: host-glob overlap analysis
+that could allocate memory quadratic in selector length; no capability
+negotiation, so an older gateway read a Cedar policy as empty YAML; a
+`resource.protocol` check that also matched other `resource` attributes and
+let a REST permit decide GraphQL requests; a per-tunnel rather than
+sandbox-wide WebSocket budget; staged policies that could change an enforced
+decision through the query budget or an evaluation error; Cedar MCP endpoints
+missing from endpoint status; and public skills that round-tripped every
+policy through YAML. The review also recommended splitting the change into
+four pull requests (shared runtime refactor, standalone engine, feature
+integration, remaining examples); that is a maintainers' decision and is
+listed below.
 
 Remaining steps:
 
-- Move this draft to `rfc/0020-cedar-policy-engine/README.md`, set its
-  state to `review`, and open the RFC pull request.
+- Decide whether to land the pull request whole or split it as the review
+  recommends.
 - Keep `ai-openshell/cedar` moving with the Cedar team: track delimited
   `like` upstream (cedar-policy/rfcs#115) and bump the pin as features land.
 - Rename the Rust input types of `openshell-policy-cedar` after the schema
   actions (`NetworkRequest` to a `NetworkConnect` request type, `L7Request`
   to an `HttpRequest` one), so the code stops inviting the question answered
   above.
-- Extend `e2e/cedar` to token grants, endpoint settings, `@path`, WebSocket,
-  query parameters, native TCP, `destination_ip`, and `binary_aliases`,
-  which today are covered by unit and parity tests.
+- Extend `e2e/cedar` to endpoint settings, `@path`, WebSocket, query
+  parameters, native TCP, `destination_ip`, and `binary_aliases`, which
+  today are covered by unit and parity tests.
 - Decide the open questions below that affect the schema before the RFC is
   accepted, since schema changes after release are breaking for Cedar
   authors.
@@ -899,16 +948,22 @@ Remaining steps:
 
 Verification so far: unit tests and `clippy -D warnings` pass on macOS and
 Linux with `openshell-policy` built with and without `cedar`; pre-commit,
-`cargo deny`, the docs build, and Go SDK CI pass; `mise run e2e:cedar` passes
-its 26 checks against a Docker gateway; the parity harness passes (2,909
-cases on Linux, 2,904 agreeing, 5 recorded differences; the 13 symlink cases
-are ignored on macOS);
-the example parity module passes (166 tests); and the quickstart, content
-guard, and MCP conformance examples run end to end in both formats. On the pull request, CI ran the `cedar` and `mcp-cedar` end-to-end suites,
-the Docker, Podman, and VM matrices, and the Windows MSVC lane, all passing.
-Not yet verified against a live gateway: native TCP, WebSocket, address
-ranges, symlinked binaries, and token grants beyond what the Cedar e2e suite
-and the parity harness cover.
+`cargo deny`, the docs build, and the Go, TypeScript, and Python SDK checks
+pass; `mise run e2e:cedar` passes its 39 checks against a Docker gateway,
+including a provider attached through the gateway (attachment alone grants
+no access, an explicit permit injects the credential, a denied request never
+reaches the upstream, and a rotated credential reaches it); the parity
+harness passes (2,911 cases on Linux, 2,906 agreeing, 5 recorded
+differences; the 13 symlink cases are ignored on macOS); the
+example parity module passes (166 tests); and the quickstart, content guard,
+and MCP conformance examples run end to end in both formats. Mixed versions
+are covered by unit tests: a Cedar policy sent to a gateway without support
+is refused by the CLI and each SDK, and a Cedar configuration fetched by a
+runtime without support is refused by the gateway. On the pull request, CI
+ran the `cedar` and `mcp-cedar` end-to-end suites, the Docker, Podman,
+Kubernetes, and VM matrices, and the Windows MSVC lane, all passing. Not yet
+verified against a live gateway: native TCP, WebSocket, address ranges, and
+symlinked binaries beyond what the parity harness covers.
 
 ## Risks
 
@@ -926,8 +981,15 @@ and the parity harness cover.
 - **Expressiveness.** Filesystem rules are unconditional subtree grants;
   every `HttpRequest` policy names its endpoint or its host glob; GraphQL
   field globs cannot be written; MCP streams need explicit permits; address
-  conditions must be top-level conjuncts; query evaluation is capped at
-  4,096 combinations. Each fails closed and is reported.
+  conditions must be top-level conjuncts; host selectors are limited to 253
+  bytes; query evaluation is capped at 4,096 combinations. Each fails closed
+  and is reported.
+- **Mixed versions.** Cedar needs the gateway and the sandbox runtime
+  upgraded together. The CLI and SDKs refuse a gateway that does not
+  advertise Cedar support, and the gateway refuses a runtime that does not,
+  so the failure is a refused command or a sandbox that does not start, never
+  a sandbox running with less than its policy. Operators upgrading a fleet
+  see Cedar sandboxes fail on runtimes that are still old.
 - **Providers do not open access.** Authors used to attaching a provider and
   getting its endpoints must now write the permits. Forgetting the
   `HttpRequest` policy for a credentialed endpoint refuses the connection.
