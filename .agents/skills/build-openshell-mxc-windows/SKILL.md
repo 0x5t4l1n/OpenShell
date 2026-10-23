@@ -245,6 +245,8 @@ switch ($arch.ToString()) {
     "X64" {
         mise run --skip-tools windows:ci
         mise run --skip-tools windows:test:mxc-real:x64
+        mise run --skip-tools windows:e2e:mxc
+        if ($LASTEXITCODE -ne 0) { throw "MXC E2E validation failed or was incomplete." }
     }
     "Arm64" {
         mise run --skip-tools windows:check:arm64
@@ -253,12 +255,17 @@ switch ($arch.ToString()) {
         mise run --skip-tools windows:test:unsupported:arm64
         mise run --skip-tools windows:test:mxc-real:arm64
         mise run --skip-tools windows:artifacts
+        mise run --skip-tools windows:e2e:mxc
+        if ($LASTEXITCODE -ne 0) { throw "MXC E2E validation failed or was incomplete." }
     }
     default {
         throw "Unsupported Windows host architecture for OpenShell MSVC validation: $arch"
     }
 }
 ```
+
+Full validation requires an MXC-capable host. E2E exits nonzero when any
+required runtime scenario fails or skips.
 
 On x64 hosts, `windows:ci` is the full current CI contract and runs in this
 order:
