@@ -97,13 +97,13 @@ jobs:
 
   release-notes:
     name: Preview Release Notes
-    needs: build
+    needs: [resolve, build]
     permissions:
       contents: read
       pull-requests: read
     uses: ./.github/workflows/release-notes.yml
     with:
-      release-tag: ${{ inputs.tag || github.ref_name }}
+      release-tag: ${{ needs.resolve.outputs.tag }}
       advisory: true
     secrets:
       LLM_INFERENCE_API_KEY: ${{ secrets.LLM_INFERENCE_API_KEY }}
