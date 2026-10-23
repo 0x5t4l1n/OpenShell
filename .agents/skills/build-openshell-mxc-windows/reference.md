@@ -36,16 +36,24 @@ For host-native full validation, detect architecture first:
 $arch = [System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture
 if ($arch -eq [System.Runtime.InteropServices.Architecture]::Arm64) {
     mise run --skip-tools windows:check:arm64
+    if ($LASTEXITCODE -ne 0) { throw "windows:check:arm64 failed." }
     mise run --skip-tools windows:build:arm64
+    if ($LASTEXITCODE -ne 0) { throw "windows:build:arm64 failed." }
     mise run --skip-tools windows:test:arm64
+    if ($LASTEXITCODE -ne 0) { throw "windows:test:arm64 failed." }
     mise run --skip-tools windows:test:unsupported:arm64
+    if ($LASTEXITCODE -ne 0) { throw "windows:test:unsupported:arm64 failed." }
     mise run --skip-tools windows:test:mxc-real:arm64
+    if ($LASTEXITCODE -ne 0) { throw "windows:test:mxc-real:arm64 failed." }
     mise run --skip-tools windows:artifacts
+    if ($LASTEXITCODE -ne 0) { throw "windows:artifacts failed." }
     mise run --skip-tools windows:e2e:mxc
     if ($LASTEXITCODE -ne 0) { throw "MXC E2E validation failed or was incomplete." }
 } else {
     mise run --skip-tools windows:ci
+    if ($LASTEXITCODE -ne 0) { throw "windows:ci failed." }
     mise run --skip-tools windows:test:mxc-real:x64
+    if ($LASTEXITCODE -ne 0) { throw "windows:test:mxc-real:x64 failed." }
     mise run --skip-tools windows:e2e:mxc
     if ($LASTEXITCODE -ne 0) { throw "MXC E2E validation failed or was incomplete." }
 }
