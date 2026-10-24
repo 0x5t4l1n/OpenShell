@@ -78,27 +78,42 @@ impl DynamicStringAllowlist {
             .is_ok_and(|result| result.is_ok())
     }
 
+    /// Add entries from `additional` into the allowlist without replacing the
+    /// existing set.
+    ///
+    /// Unlike [`Self::replace`], `merge` does **not** mark the allowlist as
+    /// synced.  Call [`Self::mark_synced`] explicitly once the authoritative
+    /// source has been fully consumed, so that [`Self::wait_synced`] and
+    /// [`Self::is_synced`] report the correct state.
     pub fn merge(&self, additional: &BTreeSet<String>) {
         self.write_guard().extend(additional.iter().cloned());
     }
 
+    /// Read the current set.  The returned guard holds a shared lock; drop it
+    /// promptly to avoid blocking writers.
     pub fn read(&self) -> std::sync::RwLockReadGuard<'_, BTreeSet<String>> {
         self.read_guard()
     }
 
+    /// Return `true` if `namespace` is present in the allowlist.
     #[must_use]
     pub fn contains(&self, namespace: &str) -> bool {
         self.read_guard().contains(namespace)
     }
 
+    /// Insert a single entry.  Returns `true` if the entry was not already
+    /// present.  Does **not** mark the allowlist as synced.
     pub fn insert(&self, name: String) -> bool {
         self.write_guard().insert(name)
     }
 
+    /// Remove a single entry.  Returns `true` if the entry was present.
     pub fn remove(&self, name: &str) -> bool {
         self.write_guard().remove(name)
     }
 
+    /// Return a cheap clone of the underlying `Arc<RwLock<…>>` for callers
+    /// that need direct access to the inner set.
     #[must_use]
     pub fn shared(&self) -> Arc<RwLock<BTreeSet<String>>> {
         Arc::clone(&self.inner)
