@@ -115,6 +115,17 @@ impl HostPattern {
                 if label == "**" {
                     return Ok(HostLabelPattern::Recursive);
                 }
+                // `**` is only valid as an entire label. A label containing `**`
+                // as a substring (e.g. `api**`) is ambiguous because the glob
+                // crate silently treats it as a single-label wildcard while the
+                // documented semantics reserve `**` for multi-label matching.
+                // Reject it loud so callers get consistent behaviour.
+                if label.contains("**") {
+                    return Err(format!(
+                        "host pattern label {label:?} contains '**' as a substring; \
+                         '**' is only valid as a complete label (e.g. '**.example.com')"
+                    ));
+                }
                 let pattern = glob::Pattern::new(label)
                     .map_err(|error| format!("invalid host pattern: {error}"))?;
                 Ok(HostLabelPattern::Label {
