@@ -1635,6 +1635,32 @@ mod tests {
     }
 
     #[test]
+    fn forward_spec_parse_bracketed_ipv6_and_port() {
+        // A user may supply an already-bracketed IPv6 address (the form OpenSSH
+        // itself uses in -L arguments). The parser must accept it, preserve the
+        // brackets in bind_addr, and round-trip correctly through Display.
+        let spec = ForwardSpec::parse("[::1]:8080").unwrap();
+        assert_eq!(spec.bind_addr, "[::1]");
+        assert_eq!(spec.port, 8080);
+        // ssh_forward_arg must not double-bracket an already-bracketed literal.
+        assert_eq!(spec.ssh_forward_arg(), "[::1]:8080:127.0.0.1:8080");
+        // Display round-trip: non-default bind_addr is included in output.
+        assert_eq!(spec.to_string(), "[::1]:8080");
+    }
+
+    #[test]
+    fn forward_spec_parse_max_port_boundary() {
+        // Port 65535 is the highest valid u16 value and must be accepted.
+        let spec = ForwardSpec::parse("65535").unwrap();
+        assert_eq!(spec.port, 65535);
+        assert_eq!(spec.bind_addr, ForwardSpec::DEFAULT_BIND_ADDR);
+
+        let spec = ForwardSpec::parse("0.0.0.0:65535").unwrap();
+        assert_eq!(spec.port, 65535);
+        assert_eq!(spec.bind_addr, "0.0.0.0");
+    }
+
+    #[test]
     fn ssh_forward_command_matches_exact_l_argument() {
         let command =
             "ssh -o ProxyCommand=openshell ssh-proxy --sandbox sbx-1 -N -L 80:127.0.0.1:80 sandbox";
